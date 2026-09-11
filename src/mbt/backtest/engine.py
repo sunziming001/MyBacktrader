@@ -21,7 +21,7 @@ import pandas as pd
 
 from mbt.data.market import MarketData
 from mbt.rules import SHIPPED_RULES_PATH, RuleTable
-from mbt.universe import UniverseRules, build_universe
+from mbt.universe import build_universe
 
 from .costs import AStockBroker, AStockCommissionInfo
 from .sizing import EqualWeightSizer
@@ -156,7 +156,6 @@ def run_portfolio_backtest(
     max_positions=None,
     rules=None,
     universe_rules=None,
-    universe=True,
     sizer=None,
     sizer_options=None,
     commission=0.0,
@@ -179,14 +178,14 @@ def run_portfolio_backtest(
         rules: 规则表，``RuleTable`` 或 TOML 路径。默认取出厂表。
         universe_rules: 股票池的准入规则（:class:`~mbt.universe.UniverseRules`）。
             ``None`` 时用出厂设定（排除次新股、纳入四个板块）。
-        universe: 是否施加股票池约束，默认 ``True``。**只有单标的入口会传 ``False``**，
-            理由见 :func:`run_backtest`——那不是给策略用的越池开关：组合回测里股票池
-            始终生效，撮合层强制池外不可买。要放宽条件请改 ``universe_rules``，
-            而不是关掉它。
-        sizer: 仓位分配，传一个 ``backtrader.Sizer`` **子类**（不是实例）。``None`` 时用
-            :class:`~mbt.backtest.sizing.EqualWeightSizer`（把剩余资金摊给剩余仓位）。
-            要沿用 backtrader 的默认（每次固定股数）请传 ``bt.sizers.FixedSize``。
-        sizer_options: 传给 ``sizer`` 的关键字参数。
+
+            **股票池没有开关**：本函数一律建池、一律由撮合层强制「池外不可买」。要放宽
+            只能改这里的准入规则（如 ``min_bars=0``），而不是绕过它——能绕开的开关迟早
+            会被打开然后忘记关。
+        sizer: 持仓分配，传一个 ``backtrader.Sizer`` **子类**（不是实例）。``None`` 时用
+            :class:`~mbt.backtest.sizing.EqualWeightSizer`（等权：把可用资金摊给剩余的
+            持仓名额，见该类的说明）。要沿用 backtrader 的默认（每次固定股数）请传
+            ``bt.sizers.FixedSize``。        sizer_options: 传给 ``sizer`` 的关键字参数。
         commission: 手续费率。``commission_mode`` 的约定同 :func:`run_backtest`。
         order_expiry_ticks: 标的连续多少个交易日无 K 线后挂单失效。
 
@@ -218,10 +217,49 @@ def run_portfolio_backtest(
 
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 
-    universe_mask = None
-    if universe:
-        universe_mask = build_universe(markets, rules=universe_rules, rule_table=table)
+    return _drive_engine(
+        markets,
+        strategy,
+        table=table,
+        universe_mask=build_universe(markets, rules=universe_rules, rule_table=table),
+        cash=cash,
+        max_positions=max_positions,
+        sizer=sizer,
+        sizer_options=sizer_options,
+        commission=commission,
+        commission_min=commission_min,
+        commission_mode=commission_mode,
+        slippage=slippage,
+        order_expiry_ticks=order_expiry_ticks,
+        strategy_params=strategy_params,
+    )
 
+
+def _drive_engine(
+    markets,
+    strategy,
+    *,
+    table,
+    universe_mask,
+    cash,
+    max_positions,
+    sizer,
+    sizer_options,
+    commission,
+    commission_min,
+    commission_mode,
+    slippage,
+    order_expiry_ticks,
+    strategy_params,
+):
+    """把行情、掩码与费用装进引擎跑一次，取回产物。
+
+    组合入口与单标的入口都走这里——AC 要求「单标的回测是组合回测的退化情形，不存在第二套
+    代码路径」，故装配引擎的活只有这一处。
+
+    ``universe_mask=None`` 表示**不设股票池闸门**。只有 :func:`run_backtest` 会给 ``None``，
+    理由见那里的说明；这是内部分支，不是对外可选项——组合入口一律建池，没有参数能关掉它。
+    """
     tradability = build_tradability(markets)
 
     cerebro = bt.Cerebro()
@@ -291,13 +329,15 @@ def run_backtest(
 ):
     """对**单一标的**的价格表跑一次回测。
 
-    它是 :func:`run_portfolio_backtest` 的**退化情形**（最大持仓数为 1），不存在第二套
-    引擎路径。为了不改变既有行为，它有两处刻意的设定：
+    它是 :func:`run_portfolio_backtest` 的**退化情形**（最大持仓数为 1），走**同一个**
+    :func:`_drive_engine`，不存在第二套引擎路径。为了不改变既有行为，它有两处刻意的设定：
 
     - ``sizer`` 保持 backtrader 的默认（每次 1 股）而非组合入口的等权分配——改变它会让
       既有回测的期末资金全部改变，而那是既有黄金值的根基；
-    - ``universe=False``：单标的入口拿到的是一张价格表，其品种与准入资格无从判定，
-      故不施加股票池约束（撮合层的其他约束照常）。
+    - **不设股票池闸门**。调用方已经显式点名了标的，没有「池」可言——对着一个被点名的
+      标的再判一次「它够不够格进池」，会把「回测这一只」变成「回测这一只，前提是它自己
+      不反对」。这不是可绕过的开关：它只是本入口内部的选择，组合入口一律建池且没有参数
+      能关掉（连 ``universe_rules`` 都只用于放宽条件）。
 
     要组合级行为请用 :func:`run_portfolio_backtest`。
 
@@ -352,29 +392,24 @@ def run_backtest(
 
     market = MarketData(symbol=symbol, prices=prices, events=())
 
-    return run_portfolio_backtest(
+    table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
+
+    return _drive_engine(
         [market],
         strategy,
+        table=table,
+        # 单标的入口不设股票池闸门，理由见本函数的说明。
+        universe_mask=None,
         cash=cash,
         max_positions=1,
-        rules=rules,
-        # 单标的入口**不施加股票池**：调用方已经显式点名了标的，没有「池」可言——
-        # 对着一个被点名的标的再判一次「它够不够格进池」会把「回测这一只」变成
-        # 「回测这一只，前提是它自己不反对」。
-        #
-        # 这不是给策略用的越池开关：组合入口的股票池始终由撮合层强制。而且它也不构成
-        # 新的漏洞——ST 判定本就依赖规则表登记期间，出厂表不登记，故不论走哪个入口都
-        # 判不出 ST（该局限已在 README 与 ADR-0002 显式登记）。
-        universe=False,
-        # 于是「上市多久」这类准入条件也不该在这一层被判定。
-        universe_rules=UniverseRules(min_bars=0),
-        # 单标的入口沿用 backtrader 的默认 sizer（每次 1 股），以保住既有黄金值。
-        # 组合入口的默认是等权分配，那是新行为，不去改既有回测的期末资金。
+        # 沿用 backtrader 的默认 sizer（每次 1 股），以保住既有黄金值。组合入口的默认是
+        # 等权分配，那是新行为，不去改既有回测的期末资金。
         sizer=bt.sizers.FixedSize,
         sizer_options={"stake": 1},
         commission=commission,
         commission_min=commission_min,
         commission_mode=commission_mode,
         slippage=slippage,
-        **strategy_params,
+        order_expiry_ticks=5,
+        strategy_params=strategy_params,
     )
