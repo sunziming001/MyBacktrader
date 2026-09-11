@@ -8,13 +8,17 @@
 ## ⚠️ 当前状态：仍在施工，产出**不可用于策略判断**
 
 本项目正在按票据逐张推进。当前已完成**端到端最窄切片**（票据
-[#2](https://github.com/sunziming001/MyBacktrader/issues/2)）与交易制度约束
-（票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4) 收尾中），
+[#2](https://github.com/sunziming001/MyBacktrader/issues/2)）、交易制度约束
+（票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4)）与**权息解密与复权视图**
+（票据 [#3](https://github.com/sunziming001/MyBacktrader/issues/3)），
 **还不是一个可用的回测工具**。具体地，它目前：
 
-- **不做复权**（待票据 [#3](https://github.com/sunziming001/MyBacktrader/issues/3)）。解析器返回原始价，
-  除权除息造成的价格跳空会原样进入回测，因而会得到错误的收益。
-- **A 股交易制度约束已基本实现**（票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4) 收尾中）：
+- **复权视图已实现**（票据 [#3](https://github.com/sunziming001/MyBacktrader/issues/3)）：自研解密本地权息
+  文件 `gbbq`（不引入运行期第三方解析库，见 ADR-0008），按标准除权除息公式算出复权因子，
+  提供**后复权**（回测用）与**前复权**（展示用）两种视图，事件按**评估日**过滤以防前视偏差。
+  但**回测不会自动复权**——`run_backtest` 用的就是传给它的价格，要复权须显式套用后复权视图
+  （见「用法」）。该票据另行承接的**行情异常检测尚未实现**（见下）。
+- **A 股交易制度约束已实现**（票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4)）：
   - **费用侧已完成**：手续费、**印花税**（仅卖出方）、**过户费**、**经手费**、**证管费**、
     滑点，且费率按**成交日**查制度规则表（2023-08-28 印花税减半与经手费下调、
     2022-04-29 过户费降费等变更因此生效）。经手费与证管费是否叠加由
@@ -23,8 +27,6 @@
     **停牌/无成交量不可成交**，且不可成交时挂单**保留至下一可交易日**；
     涨跌停判定按标的当日**板块与 ST 状态**取限幅，并区分方向——涨停一字买不进但卖得出，
     跌停一字卖不出但买得到。
-  - **尚缺**：行情异常检测——它已**移出 #4、并入票据 [#3](https://github.com/sunziming001/MyBacktrader/issues/3)**，
-    因为区分「公司行为（除权送转）」与「坏数据」必须知道复权信息（见下）。
   - **出厂规则表已落地**：`src/mbt/rules/a_share.toml`，覆盖 2015–2026 的涨跌幅、
     ST 限幅、印花税、过户费、经手费、证管费，每条数值都带出处。**但 ST 限幅目前实际选不中**（见下）。
 - **没有选股能力**（待票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)），
@@ -32,12 +34,12 @@
 
 用当前代码得出的任何收益数字都只能视为**管道连通性的证据**，不能作为策略好坏的依据。
 
-> **与 ADR-0002 的冲突已收窄到一处，但那一处不在本票范围内**：[ADR-0002](docs/adr/0002-a-share-trading-constraints.md)
-> 决策「回测从第一天就实现 A 股交易制度约束」。费用与撮合现已落地；剩余的行情**异常检测**
-> （ADR-0005）经实测判定**无法先于复权完成**——同批数据里 460 次超 10% 的日间变动中 444 次
-> 合法，照字面「涨跌幅超限即报错」会把正常交易日全数误报，故已移入票据
-> [#3](https://github.com/sunziming001/MyBacktrader/issues/3)。在异常检测落地之前，
-> `run_backtest` 对坏数据会**沉默接受**，故其输出仍不得用于策略优劣的判断。
+> **与 ADR-0002 的冲突收窄到一处，且这一处现已具备实施前提**：[ADR-0002](docs/adr/0002-a-share-trading-constraints.md)
+> 决策「回测从第一天就实现 A 股交易制度约束」。费用、撮合与复权均已落地；剩余的行情**异常检测**
+> （ADR-0005）此前无法先于复权完成——同批数据里 460 次超 10% 的日间变动中 444 次合法，
+> 照字面「涨跌幅超限即报错」会把正常交易日全数误报。**复权落地后已能区分「除权除息」与
+> 「坏数据」，故它现在可实施了**，但仍**尚未实现**：在它落地之前，`run_backtest` 对坏数据
+> 会**沉默接受**，其输出仍不得用于策略优劣的判断。
 
 > **ST 状态的已知局限（本工具当前最大的制度盲区）**：涨跌幅限制需要知道标的当日是否 ST
 > （沪深主板 ST 为 5%，自 2026-07-06 起上调为 10%；创业板 ST 自 2020-08-24 起为 20%），
@@ -89,6 +91,7 @@ from mbt.backtest import run_backtest
 from mbt.data import TdxDataSource
 
 prices = TdxDataSource(r"D:\Tools\tdx\vipdoc").daily("sh600000")
+# 原始价：此处仅演示管道连通；真实回测请先套用后复权视图，见下文「复权」。
 
 
 class BuyAndHold(bt.Strategy):
@@ -116,6 +119,33 @@ result.trades        # 成交明细：每笔成交一行
 result.final_value   # 期末总资产
 ```
 
+### 复权（回测前应做）
+
+`run_backtest` **不会自动复权**——它用的就是传给它的价格。除权日不复权会在回测里留下
+假跳空，故**回测应传后复权视图**：
+
+```python
+from mbt.data import GbbqDataSource, TdxDataSource, backward_adjusted
+
+prices = TdxDataSource(r"D:\Tools\tdx\vipdoc").daily("sh600000")
+# 权息文件位于 T0002\hq_cache\，不在 vipdoc 之内，故单独注入路径
+events = GbbqDataSource(r"D:\Tools\tdx\T0002\hq_cache\gbbq").events("sh600000")
+
+prices = backward_adjusted(prices, events)   # 后复权：回测用
+# forward_adjusted(prices, events)           # 前复权：只用于展示（最新价不变）
+
+result = run_backtest(prices, symbol="sh600000", strategy=BuyAndHold)
+```
+
+- 两种视图都**用时计算**，不落盘任何已复权的价格序列（ADR-0003）——前复权价会随未来每一次
+  除权整体重算，存下来就不可复现。
+- 事件按**评估日**过滤，默认取序列末根 K 线；「已公告、未除权」的未来事件一律不纳入（ADR-0006）。
+- **序列之外的除权事件不参与**：要算它的因子，需要的前收盘价不在序列里；而它对整条序列
+  只贡献一个常数倍数。故后复权视图的绝对尺度是相对于**序列首根**的，不必与行情软件一致
+  ——与行情软件可比的是前复权视图。
+- 解密为**自研**，不引入运行期第三方解析库；与独立 oracle（`pytdx`）对账全表 199,800 条
+  逐字段一致，该 oracle **仅作测试对照**、不是依赖（ADR-0008）。
+
 ### 交易制度规则表
 
 制度参数以「生效日期 × 板块」的规则表建模，查表按**成交日**取当日生效的那一条
@@ -135,6 +165,8 @@ result.final_value   # 期末总资产
 .venv\Scripts\python.exe -m pytest -m "not realmdata"   # 不依赖本机数据
 ```
 
-测试自足：所有 fixture 都提交在 `tests/fixtures/` 下，不依赖本机通达信安装路径。
+测试自足：所有 fixture 都提交在 `tests/fixtures/` 下，不依赖本机通达信安装路径——
+含日线 `.day` 与权息 `gbbq` 的**真实文件切片**，后者另附 `pytdx` 生成的 `records_oracle.csv`
+逐字段对账（oracle 只在开发期跑过，运行测试只读这份固化结果）。
 标记为 `realmdata` 的测试使用本机真实数据验证格式假设，数据缺席时自动跳过
-（可用 `MBT_TDX_ROOT` 指定路径）。
+（可用 `MBT_TDX_ROOT` 指定 `vipdoc` 路径、`MBT_TDX_GBBQ` 指定 `gbbq` 文件路径）。

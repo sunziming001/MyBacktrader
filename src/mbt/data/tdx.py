@@ -14,6 +14,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .errors import MarketDataError
+
 #: 单条日线记录的字节数。
 DAY_RECORD_SIZE = 32
 
@@ -33,15 +35,6 @@ DAY_DTYPE = np.dtype(
 
 #: 价格字段的缩放：文件中存的是「价格 × 100」的整数。
 PRICE_SCALE = 100.0
-
-
-class MarketDataError(Exception):
-    """行情数据不可信。
-
-    缺口纪律（ADR-0005）：缺失跳过、**异常报错**、永不填充。异常在这里意味着
-    「文件内容与预期不符，不能继续」，而不是「这个标的今天没有数据」——
-    后者是正常状态（停牌），只表现为没有记录。
-    """
 
 
 class TdxDataSource:

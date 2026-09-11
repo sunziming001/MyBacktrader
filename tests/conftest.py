@@ -13,11 +13,29 @@ TESTS_DIR = Path(__file__).parent
 #: 通达信数据源 fixture 根目录。测试把它当作「本机数据源根路径」注入。
 FIXTURE_ROOT = TESTS_DIR / "fixtures" / "tdx"
 
+#: 权息事件文件 fixture：sh600000 与 sz000001 两段**真实记录**的逐字节拼接（见其生成说明）。
+GBBQ_FIXTURE = TESTS_DIR / "fixtures" / "gbbq" / "gbbq"
+
+#: 独立 oracle（pytdx）对上述记录的解读结果，仅作对照。
+GBBQ_ORACLE = TESTS_DIR / "fixtures" / "gbbq" / "records_oracle.csv"
+
 
 @pytest.fixture
 def fixture_root():
     """通达信数据源 fixture 根目录。"""
     return FIXTURE_ROOT
+
+
+@pytest.fixture
+def gbbq_file():
+    """gbbq 权息事件文件 fixture 路径。"""
+    return GBBQ_FIXTURE
+
+
+@pytest.fixture
+def gbbq_oracle():
+    """独立 oracle 产出的对照表路径。"""
+    return GBBQ_ORACLE
 
 
 @pytest.fixture
