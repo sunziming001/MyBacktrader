@@ -22,8 +22,9 @@
     涨跌停判定按标的当日**板块与 ST 状态**取限幅，并区分方向——涨停一字买不进但卖得出，
     跌停一字卖不出但买得到。
   - **尚缺**：行情异常检测——它已**移出 #4、并入票据 [#3](https://github.com/sunziming001/MyBacktrader/issues/3)**，
-    因为区分「公司行为（除权送转）」与「坏数据」必须知道复权信息（见下），
-    以及**出厂规则表**——所以现在必须显式传 `rules=`，见下方示例。
+    因为区分「公司行为（除权送转）」与「坏数据」必须知道复权信息（见下）。
+  - **出厂规则表已落地**：`src/mbt/rules/a_share.toml`，覆盖 2015–2026 的涨跌幅、
+    ST 限幅、印花税、过户费，每条数值都带出处。**但 ST 限幅目前实际选不中**（见下）。
 - **没有选股能力**（待票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)），
   也不会评估基准、回撤等指标。
 
@@ -36,10 +37,14 @@
 > [#3](https://github.com/sunziming001/MyBacktrader/issues/3)。在异常检测落地之前，
 > `run_backtest` 对坏数据会**沉默接受**，故其输出仍不得用于策略优劣的判断。
 
-> **ST 状态的已知局限**：涨跌幅限制需要知道标的当日是否 ST（主板 ST 为 5%），
+> **ST 状态的已知局限（本工具当前最大的制度盲区）**：涨跌幅限制需要知道标的当日是否 ST
+> （沪深主板 ST 为 5%，自 2026-07-06 起上调为 10%；创业板 ST 自 2020-08-24 起为 20%），
 > 但本地价格数据不含股票名称，无法回溯历史上的 ST 状态。规则表因此以
-> `[[st_period]]` 显式登记 ST 期间，**未登记即视为非 ST**。这是宁漏不错的取舍：
-> 漏登记会让限幅偏大（放过本不该成交的交易），而不是凭空造出停牌。
+> `[[st_period]]` 显式登记 ST 期间，**未登记即视为非 ST**。
+>
+> 出厂表**不登记任何 ST 期间**，故那些 ST 限幅行目前**永远不会被选中**——一律按非 ST 取值。
+> 这是宁漏不错的取舍：漏登记会让限幅偏大（放过本不该成交的交易），而不是凭空造出停牌。
+> 等到带生效日期的 ST 名称历史到位，出厂表里的 ST 限幅即自动生效。
 > 详见 [`docs/research/tdx-halt-and-limit-representation.md`](docs/research/tdx-halt-and-limit-representation.md)。
 
 完整的范围与验收标准见规格 [issue #1](https://github.com/sunziming001/MyBacktrader/issues/1)。
@@ -75,8 +80,8 @@ class BuyAndHold(bt.Strategy):
             self.buy()
 
 
-# 出厂规则表尚未落地（票据 #4 切片 8），故当前必须显式传入规则表路径。
-# 该文件写好后此参数可省略。
+# 出厂规则表已落地（src/mbt/rules/a_share.toml），故 rules 可省略；此处显式传入
+# 只是示范「可注入自定义规则表」这一测试缝。
 result = run_backtest(
     prices,
     symbol="sh600000",
@@ -98,12 +103,12 @@ result.final_value   # 期末总资产
 制度参数以「生效日期 × 板块」的规则表建模，查表按**成交日**取当日生效的那一条
 （ADR-0002）。规则表是**可配置数据文件**，新制度到来时不必改代码：
 
-- 出厂表：`src/mbt/rules/a_share.toml`——**尚未落地**，其数值须逐条查证出处
-  （票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4) 切片 8）。
-  目前传入不存在的路径会**明确报错**，而不是退回某个默认限幅（ADR-0005）。
+- 出厂表：`src/mbt/rules/a_share.toml`——已落地，**每条数值都带出处**
+  （2015–2026 的涨跌幅、ST 限幅、印花税、过户费），逐条来源与不确定项见
+  `docs/research/a-share-trading-rules.md`。数值改动请连同出处一起改。
 - 测试缝：`run_backtest(..., rules=<路径>)` 可注入任意规则表，测试因此指向
-  `tests/fixtures/rules/` 下的夹具，不依赖出厂数值。撮合约束的回归样本见
-  `tests/test_trading_constraints.py`，用的是仓库内的真实行情 fixture。
+  `tests/fixtures/rules/` 下的夹具，不依赖出厂数值。出厂表自身由
+  `tests/test_shipped_rules.py` 按变更日边界逐条锁定。
 
 ## 测试
 
