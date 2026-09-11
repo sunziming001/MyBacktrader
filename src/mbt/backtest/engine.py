@@ -20,7 +20,9 @@ import backtrader as bt
 import pandas as pd
 
 from mbt.data.market import MarketData
+from mbt.data.panel import assemble_panel
 from mbt.rules import SHIPPED_RULES_PATH, RuleTable
+from mbt.screen import SCREEN_FIELDS
 from mbt.universe import build_universe
 
 from .costs import AStockBroker, AStockCommissionInfo
@@ -34,7 +36,7 @@ DEFAULT_RULES_PATH = SHIPPED_RULES_PATH
 TRADE_COLUMNS = ("date", "size", "price", "value", "commission")
 
 #: 未成交而终结的订单的列。**留痕**用：挂单失效、拒单、保证金不足都要能事后查到。
-REJECT_COLUMNS = ("date", "symbol", "size", "status")
+REJECT_COLUMNS = ("date", "symbol", "size", "status", "reason")
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ class _RejectionRecorder(bt.Analyzer):
                         getattr(order.data, "_mbt_symbol", None),
                         order.created.size,
                         order.getstatusname(),
+                        getattr(order, "_mbt_reject_reason", ""),
                     ),
                     strict=True,
                 )
@@ -156,6 +159,7 @@ def run_portfolio_backtest(
     max_positions=None,
     rules=None,
     universe_rules=None,
+    screen=None,
     sizer=None,
     sizer_options=None,
     commission=0.0,
@@ -182,6 +186,10 @@ def run_portfolio_backtest(
             **股票池没有开关**：本函数一律建池、一律由撮合层强制「池外不可买」。要放宽
             只能改这里的准入规则（如 ``min_bars=0``），而不是绕过它——能绕开的开关迟早
             会被打开然后忘记关。
+        screen: 选股规则（:class:`~mbt.screen.Screen`）。给了它就与股票池**一同**构成
+            买入闸门，且选股结果单独挂在 broker 上供策略查看（``broker.selection_mask``）。
+            两种闸门分开检查，故 ``BacktestResult.rejected`` 里的 ``reason`` 能说清是
+            「出池了」还是「今天没选它」。
         sizer: 持仓分配，传一个 ``backtrader.Sizer`` **子类**（不是实例）。``None`` 时用
             :class:`~mbt.backtest.sizing.EqualWeightSizer`（等权：把可用资金摊给剩余的
             持仓名额，见该类的说明）。要沿用 backtrader 的默认（每次固定股数）请传
@@ -192,15 +200,20 @@ def run_portfolio_backtest(
     返回:
         :class:`BacktestResult`。
 
-    ## 策略如何读到两张掩码
+    **策略如何读到三张掩码**
 
-    引擎把两张 boolean 标的宽表挂到 broker 上，策略可以随时查：
+    引擎把三张 boolean 标的宽表挂到 broker 上，策略可以随时查：
 
     - ``self.broker.tradability_mask``：当日**是否具备成交条件**。停牌日为 ``False``，
       而此时 ``self.dataX.close[0]`` 返回的是**陈旧价**——读价格做决策前必须先查它，
       否则会基于几个月前的价格下单（见 ADR-0006）。
-    - ``self.broker.universe_mask``：当日**是否在股票池内**。撮合层已强制「池外不可买」，
-      这张表是给策略自己判断用的（例如察觉自己的持仓已掉出池子）。
+    - ``self.broker.universe_mask``：当日**是否在股票池内**。
+    - ``self.broker.selection_mask``：当日**是否被选股规则选中**（未给 ``screen`` 时为
+      ``None``）。它与股票池**分开**给，因为两者的处置不同：出池要清仓，只是没被选中
+      则未必——合成一道闸门虽然等价，却把这份信息抹掉了。
+
+    三者中前两张加上选股结果都会由**撮合层**强制（买入侧），策略读它们是为了自己做决定，
+    不是替代约束。
 
     示例::
 
@@ -217,11 +230,32 @@ def run_portfolio_backtest(
 
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 
+    # 复权在**这一处**统一做，且只做一次。于是选股用的面板、股票池、可交易掩码与撮合
+    # 全都落在**同一条**价格序列上。
+    #
+    # 这不是洁癖：若面板取原始价而撮合取后复权价，同一个选股规则就在两个不同的序列上被
+    # 评估——除权日的假跳空会进到动量、均线一类信号里（ADR-0003 明确否决「不复权直接用」
+    # 正是为此），而成交却发生在复权后的序列上。那种错误不会报错，只会让选出来的标的与
+    # 实际能成交的价格不是一回事。
+    adjusted = [
+        MarketData(symbol=market.symbol, prices=market.backward_adjusted(), events=())
+        for market in markets
+    ]
+
+    universe_mask = build_universe(adjusted, rules=universe_rules, rule_table=table)
+
+    selection_mask = None
+    if screen is not None:
+        selection_mask = screen.apply(
+            assemble_panel(adjusted, SCREEN_FIELDS), universe_mask=universe_mask
+        ).selected
+
     return _drive_engine(
-        markets,
+        adjusted,
         strategy,
         table=table,
-        universe_mask=build_universe(markets, rules=universe_rules, rule_table=table),
+        universe_mask=universe_mask,
+        selection_mask=selection_mask,
         cash=cash,
         max_positions=max_positions,
         sizer=sizer,
@@ -241,6 +275,7 @@ def _drive_engine(
     *,
     table,
     universe_mask,
+    selection_mask,
     cash,
     max_positions,
     sizer,
@@ -257,17 +292,18 @@ def _drive_engine(
     组合入口与单标的入口都走这里——AC 要求「单标的回测是组合回测的退化情形，不存在第二套
     代码路径」，故装配引擎的活只有这一处。
 
-    ``universe_mask=None`` 表示**不设股票池闸门**。只有 :func:`run_backtest` 会给 ``None``，
-    理由见那里的说明；这是内部分支，不是对外可选项——组合入口一律建池，没有参数能关掉它。
+    ``markets`` 必须是**已复权**的行情（调用方负责）。引擎在这里不再自己复权，正是为了让
+    选股面板与撮合共用同一条序列——这一点由 :func:`run_portfolio_backtest` 保证。
+
+    ``universe_mask=None`` 表示**不设股票池闸门**，``selection_mask=None`` 表示**不设选股
+    闸门**。后者只有组合入口在给了 ``screen`` 时才有，前者只有 :func:`run_backtest` 会给
+    ``None``（理由见那里的说明）。两处都是内部分支，不对使用者暴露开关。
     """
     tradability = build_tradability(markets)
 
     cerebro = bt.Cerebro()
     for market in markets:
-        # 复权在引擎内部做：组合场景下漏掉复权的代价是每个除权日一个假跳空，
-        # 比单标的更容易被忽略，故不让调用方记着这件事。
-        prices = market.backward_adjusted()
-        data = bt.feeds.PandasData(dataname=prices)
+        data = bt.feeds.PandasData(dataname=market.prices)
         data._mbt_symbol = market.symbol
         data._name = market.symbol
         cerebro.adddata(data)
@@ -282,6 +318,7 @@ def _drive_engine(
         rules=table,
         tradability=tradability,
         universe=universe_mask,
+        selection=selection_mask,
         max_positions=max_positions,
         order_expiry_ticks=order_expiry_ticks,
     )
@@ -395,11 +432,14 @@ def run_backtest(
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 
     return _drive_engine(
+        # 本入口无复权事件，故 ``prices`` 原样就是「已复权」的序列（调用方若传的是
+        # `backward_adjusted()` 的结果，那正是所期望的；见参数说明）。
         [market],
         strategy,
         table=table,
         # 单标的入口不设股票池闸门，理由见本函数的说明。
         universe_mask=None,
+        selection_mask=None,
         cash=cash,
         max_positions=1,
         # 沿用 backtrader 的默认 sizer（每次 1 股），以保住既有黄金值。组合入口的默认是

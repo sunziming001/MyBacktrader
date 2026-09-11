@@ -95,6 +95,7 @@ class AStockBroker(bt.brokers.BackBroker):
     - **T+1**：本单在当日**不合法**，故 ``reject()`` 终结，不拖到次日。
     - **股票池外买入**：资格问题不会因等待而消失，故 ``reject()`` 终结并留痕。
       **卖出不受限**——持仓可能因调仓或数据变化掉出池子，禁卖会把持仓卡死。
+    - **未被选股规则选中**：同上，买入被拒、卖出不受限。
     - **长期无 K 线**：标的停牌超过 ``order_expiry_ticks`` 个交易日即 ``reject()``。
       「保留至下一可交易日」在单标的下是「下一天」，停牌数月时就变成「另一笔交易」。
 
@@ -122,6 +123,8 @@ class AStockBroker(bt.brokers.BackBroker):
         ("tradability", None),
         #: boolean 标的宽表：股票池。给出时，池外标的的**买入**被拒、卖出不受限。
         ("universe", None),
+        #: boolean 标的宽表：当日**选股结果**。给出时，未被选中的买入被拒、卖出不受限。
+        ("selection", None),
         #: 标的连续多少个交易日无 K 线后，挂单失效。默认 5。
         ("order_expiry_ticks", 5),
         #: 最大持仓**标的数**。``None`` 表示不限。
@@ -160,6 +163,12 @@ class AStockBroker(bt.brokers.BackBroker):
         （例如察觉自己的持仓已掉出池子）。"""
         return self.p.universe
 
+    @property
+    def selection_mask(self):
+        """当日**候选集**的布尔标的宽表。与 ``universe_mask`` 分开给，因为策略要能分辨
+        「它出池了」与「今天没选它」——后者只是今天不利，不等于该清仓。"""
+        return self.p.selection
+
     # --- 费用：注入成交日与标的 ---
 
     def getcommissioninfo(self, data):
@@ -176,16 +185,21 @@ class AStockBroker(bt.brokers.BackBroker):
     def _try_exec(self, order):
         if order.issell() and not self._t1_allows(order):
             # T+1：当日买入的股份当日不可卖。交易所就是拒单，故不得留到次日。
-            return self._reject(order)
+            return self._reject(order, "T+1：当日买入的股份当日不可卖")
 
         if order.isbuy() and self._mask_says(self.p.universe, order) is False:
             # 股票池外买入：资格问题不会因等待而消失，故拒单而不是保留挂单。
-            return self._reject(order)
+            return self._reject(order, "不在股票池内")
+
+        if order.isbuy() and self._mask_says(self.p.selection, order) is False:
+            # 当日未被选股规则选中。与出池分开报，因为两者的处置不同：出池要清仓，
+            # 没被选中只是今天不买。
+            return self._reject(order, "未被选股规则选中")
 
         if order.isbuy() and self._at_position_limit(order):
             # 已持满最大持仓数时，对**新标的**的买入被拒；对已有持仓加仓不受限，
             # 因为那不会增加持仓的标的数。
-            return self._reject(order)
+            return self._reject(order, "已达最大持仓只数")
 
         if not self._tradeable_today(order):
             return  # 保留挂单：仍 alive 的订单会被引擎放回队列，下一根再试
@@ -202,7 +216,11 @@ class AStockBroker(bt.brokers.BackBroker):
         held = sum(1 for position in self.positions.values() if position.size)
         return held >= limit
 
-    def _reject(self, order):
+    def _reject(self, order, reason: str):
+        # 拒单理由挂在订单上，供 `_RejectionRecorder` 收进 `BacktestResult.rejected`。
+        # 「为什么没成交」是排查回测结果时最先要问的问题，只记一个 Rejected 不够。
+        # 故意**不给**默认值：每个拒单点都该说得出理由。
+        order._mbt_reject_reason = reason
         order.reject()
         self.notify(order)
         # 订单已终结，它的计数没有留存价值；不清理会让这张表随回测长度无界增长。
@@ -335,7 +353,7 @@ class AStockBroker(bt.brokers.BackBroker):
 
         # 「超过 N 个交易日」是**严格大于**：第 N 个无 K 线的交易日仍算在容忍期内。
         if days > self.p.order_expiry_ticks:
-            self._reject(order)
+            self._reject(order, f"标的连续 {days} 个交易日无 K 线，挂单失效")
             return True
         return False
 

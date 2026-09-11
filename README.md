@@ -57,8 +57,13 @@
     默认排除次新股（`mbt.universe`）。撮合层**强制**池外不可买、**卖出不受限**。
   - **品种判定**（`mbt.data.instrument_type`）按市场 + 代码前缀区分股票 / 指数 / 可转债 /
     基金 / 其他；判不出归「其他」而**不报错**（错在「不收」这个安全方向）。
-- **没有选股能力**（待票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)），
-  也不会评估基准、回撤等指标。
+- **选股规则已实现**（票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)）：
+  `mbt.screen.Screen` = **过滤器 + 排序 + 取前 N**，产物是与股票池同形的 boolean 标的宽表
+  （`ScreenResult.selected`），故「今天买哪些」既能独立取用（`ScreenResult.candidates(on)`
+  按优劣返回清单），也能直接作为回测的入场过滤器（`run_portfolio_backtest(screen=...)`）
+  ——同一条件不必写两遍（ADR-0001）。规则是纯函数：**不管持仓**（那是策略与引擎的事），
+  也没有反转排序方向的开关（因子一律「越大越靠前」）。
+- **不会评估基准、回撤等指标**（待票据 [#10](https://github.com/sunziming001/MyBacktrader/issues/10)）。
 
 用当前代码得出的任何收益数字都只能视为**管道连通性的证据**，不能作为策略好坏的依据。
 
