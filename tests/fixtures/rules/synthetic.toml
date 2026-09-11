@@ -1,0 +1,62 @@
+# 合成规则表——**仅供测试查表机制**，数值是编造的，不是真实制度数据。
+#
+# 出厂规则表在 src/mbt/rules/a_share.toml，那里的每条数值都带出处。
+# 测试指向本文件（测试缝 S3），因此改制度时机制测试不受影响。
+
+schema_version = 1
+
+# 主板在测试区间内变更过一次限幅，用于验证「按成交日取当日生效规则」
+[[price_limit]]
+board = "主板"
+effective_from = 2015-01-01
+limit = 0.10
+
+[[price_limit]]
+board = "主板"
+effective_from = 2023-06-01
+limit = 0.12
+
+# 创业板另有自己的生效日期，用于验证规则不跨板块串用
+[[price_limit]]
+board = "创业板"
+effective_from = 2015-01-01
+limit = 0.10
+
+[[price_limit]]
+board = "创业板"
+effective_from = 2020-08-24
+limit = 0.20
+
+# 印花税只有卖出方缴纳，仅按日期取值
+[[stamp_duty]]
+effective_from = 2015-01-01
+sell_rate = 0.001
+
+[[stamp_duty]]
+effective_from = 2023-08-28
+sell_rate = 0.0005
+
+# 过户费按板块与日期双向取值：深主板在测试区间内由「不收」变为「收」
+[[transfer_fee]]
+board = "沪主板"
+effective_from = 2015-01-01
+rate = 0.00002
+sides = "both"
+
+[[transfer_fee]]
+board = "深主板"
+effective_from = 2015-01-01
+rate = 0.0
+sides = "none"
+
+[[transfer_fee]]
+board = "沪主板"
+effective_from = 2022-04-29
+rate = 0.00001
+sides = "both"
+
+[[transfer_fee]]
+board = "深主板"
+effective_from = 2022-04-29
+rate = 0.00001
+sides = "both"

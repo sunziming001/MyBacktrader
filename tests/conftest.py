@@ -21,6 +21,12 @@ def fixture_root():
 
 
 @pytest.fixture
+def synthetic_rules():
+    """合成规则表路径——只用于测试查表机制，数值非真实制度数据（测试缝 S3）。"""
+    return TESTS_DIR / "fixtures" / "rules" / "synthetic.toml"
+
+
+@pytest.fixture
 def make_prices():
     """工厂：由收盘价序列构造最小 OHLCV 宽表。
 

@@ -12,6 +12,8 @@ dependencies = [
     "backtrader==1.9.78.123",
     "pandas==2.3.3",
     "numpy==2.2.6",
+    # Python 3.11 起 tomllib 进标准库；本项目 pin 在 3.10，故需此纯 Python 依赖
+    "tomli==2.0.1",
 ]
 
 [project.optional-dependencies]
