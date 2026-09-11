@@ -2,7 +2,7 @@
 
 两条约定在此落地：
 
-1. 输出是**纯 ``bool``** 的宽表，缺失一律取 ``False``，语义是「不合格」。这不是额外代码，
+1. 输出是**纯 ``bool``** 的标的宽表，缺失一律取 ``False``，语义是「不合格」。这不是额外代码，
    而是**数值比较的天然结果**——``nan > x`` 与 ``x > nan`` 都返回 ``False``。刻意不把缺失
    先填成某个数：填了就替数据「表了态」，而本项目宁可漏判也不凭空造出合格（ADR-0005）。
 2. 判断只在**已知**上成立。窗口不足时不给乐观答案——``min_periods=n`` 让前 n-1 根为缺失，
@@ -16,13 +16,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from mbt.signals._wide import check_wide
-from mbt.signals.indicators import rolling_max, sma
-
-
-def _prior_average(values: pd.DataFrame, n: int) -> pd.DataFrame:
-    """前 n 根的均值，**不含当根**。``shift(1)`` 就是这一层的时点保证所在。"""
-    return values.rolling(n, min_periods=n).mean().shift(1)
+from mbt.signals._symbol_frame import check_symbol_frame
+from mbt.signals.indicators import rolling_max, sma, volume_ratio
 
 
 def new_high(prices: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -30,12 +25,12 @@ def new_high(prices: pd.DataFrame, n: int) -> pd.DataFrame:
 
     用 ``>`` 而非 ``>=``：恰好等于前高不是「创」新高。
     """
-    return check_wide(prices) > rolling_max(prices, n).shift(1)
+    return check_symbol_frame(prices) > rolling_max(prices, n).shift(1)
 
 
 def above_ma(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     """站上均线：当根收盘高于 n 日均线（含当根）。这是一个**状态**。"""
-    return check_wide(prices) > sma(prices, n)
+    return check_symbol_frame(prices) > sma(prices, n)
 
 
 def ma_cross_up(prices: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -44,21 +39,21 @@ def ma_cross_up(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     昨日的均线必须**已知**，否则「上穿」会退化成「第一次算得出均线」——那不是穿越，
     只是窗口刚好填满，把它当信号会在每只次新股的同一位置凭空点火。
     """
-    prices = check_wide(prices)
+    prices = check_symbol_frame(prices)
     ma = sma(prices, n)
     return (prices > ma) & ma.shift(1).notna() & (prices.shift(1) <= ma.shift(1))
 
 
 def rising_streak(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     """连续上涨 n 日：最近 n 个交易日**每一次**收盘都高于前一日（故需要 n+1 根 K 线）。"""
-    prices = check_wide(prices)
+    prices = check_symbol_frame(prices)
     return (prices.diff() > 0).rolling(n, min_periods=n).sum() == n
 
 
 def volume_surge(volumes: pd.DataFrame, k: float, n: int) -> pd.DataFrame:
     """放量 k 倍：当根成交量**严格高于**前 n 日均量的 k 倍。
 
-    基准取**前 n 根**（见 ``_prior_average``）而非含当根：含当根会把当根的放量本身算进
-    基准，于是放量越猛基准越高、信号越难触发——正好与「放量」的语义相反。
+    它由 :func:`~mbt.signals.indicators.volume_ratio` 实现，故「基准取前 n 根」这条口径
+    只有一处定义，不会与成交量比漂移。要连续的比值（而非是/否）请直接用后者。
     """
-    return check_wide(volumes) > _prior_average(volumes, n) * k
+    return volume_ratio(volumes, n) > k

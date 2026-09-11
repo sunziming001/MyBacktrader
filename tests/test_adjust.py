@@ -27,7 +27,7 @@ PREV_BAR = pd.Timestamp("2026-07-15")
 
 
 def _frame(closes, start="2024-01-02"):
-    """只含收盘价的极简宽表；adjust 不涉及撮合，故无需真实振幅。"""
+    """只含收盘价的极简字段宽表；adjust 不涉及撮合，故无需真实振幅。"""
     index = pd.bdate_range(start, periods=len(closes))
     return pd.DataFrame(
         {

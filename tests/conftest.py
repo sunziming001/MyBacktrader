@@ -58,7 +58,7 @@ def limit_rules():
 
 @pytest.fixture
 def make_prices():
-    """工厂：由收盘价序列构造最小 OHLCV 宽表。
+    """工厂：由收盘价序列构造最小 OHLCV **字段宽表**（一个标的一份）。
 
     为让行为可手算，默认令 open = high = low = close，即每根 K 线无振幅。
 
@@ -124,8 +124,8 @@ def make_source(tmp_path, day_bytes):
 
 
 @pytest.fixture
-def wide():
-    """工厂：由 ``{标的: 序列}`` 构造信号层的宽表输入（``日期 × 标的``）。
+def symbol_frame():
+    """工厂：由 ``{标的: 序列}`` 构造信号层的**标的宽表**输入（``日期 × 标的``）。
 
     缺失值请显式写成 ``float("nan")``——本工厂**不填充**，也不接受 ``None``：
     信号层把缺失当正常状态处理，填充会在测试里先把这条纪律破坏掉。
@@ -134,5 +134,36 @@ def wide():
     def _make(values, start="2024-01-02"):
         idx = pd.bdate_range(start, periods=len(next(iter(values.values()))))
         return pd.DataFrame(values, index=idx)
+
+    return _make
+
+
+@pytest.fixture
+def make_market():
+    """工厂：由**字段宽表**构造 :class:`MarketData`，不碰磁盘、也不跑越界检查。
+
+    ``MarketData`` 是 frozen dataclass 且字段公开，故测试可以直接构造它——无需 mock，
+    也无需在临时目录里摆一个真实 ``.day`` 文件（后者是解析层的测试才需要的）。
+    """
+
+    def _make(symbol, prices):
+        from mbt.data import MarketData
+
+        return MarketData(symbol=symbol, prices=prices, events=())
+
+    return _make
+
+
+@pytest.fixture
+def panel(symbol_frame):
+    """工厂：由 ``{字段: {标的: 序列}}`` 构造 :class:`Panel`（字段自动对齐）。
+
+    字段间的**错位**要测时请自行构造数据帧再直接调 ``Panel(...)``——本工厂刻意只造合法的。
+    """
+
+    def _make(fields):
+        from mbt.data import Panel
+
+        return Panel({name: symbol_frame(values) for name, values in fields.items()})
 
     return _make

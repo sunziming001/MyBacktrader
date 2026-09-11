@@ -108,7 +108,7 @@ def find_anomalies(prices, symbol: str, rules: RuleTable, events=()) -> list[Ano
     """找出价格表中所有**越出当日涨跌停带**且**无公司行为可解释**的 K 线。
 
     参数:
-        prices: 原始价宽表，须含 ``high`` / ``low`` / ``close``，索引为升序日期索引。
+        prices: 原始价字段宽表，须含 ``high`` / ``low`` / ``close``，索引为升序日期索引。
         symbol: 标的符号，用于按板块与 ST 状态取限幅。
         rules: 规则表。
         events: 该标的的除权除息事件（如 ``GbbqDataSource.events(symbol)``）。

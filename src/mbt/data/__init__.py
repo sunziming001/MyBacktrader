@@ -21,6 +21,7 @@ from .anomaly import Anomaly, find_anomalies, require_no_anomalies
 from .errors import MarketDataError
 from .gbbq import GbbqDataSource, GbbqError, GbbqRecord
 from .market import MarketData, load_market_data
+from .panel import Panel, assemble_panel
 from .tdx import TdxDataSource
 
 __all__ = [
@@ -31,8 +32,10 @@ __all__ = [
     "GbbqRecord",
     "MarketData",
     "MarketDataError",
+    "Panel",
     "TdxDataSource",
     "adjustment_factors",
+    "assemble_panel",
     "backward_adjusted",
     "combined_reference_price",
     "find_anomalies",
