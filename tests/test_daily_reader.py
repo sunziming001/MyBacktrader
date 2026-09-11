@@ -48,3 +48,53 @@ def test_prices_are_raw_not_adjusted(fixture_root):
     assert df.loc["2026-07-15", "close"] == 9.31
     assert df.loc["2026-07-16", "open"] == 8.92
     assert df.loc["2026-07-16", "close"] == 8.85
+
+
+def test_halt_day_is_absent_and_not_filled(fixture_root):
+    """停牌日完全没有记录，且不得用前值填充。
+
+    2026-04-22 是全市场交易日（已在 ``sh600000`` 等大盘股上交叉验证），而
+    ``sz000609`` 缺该日——即当天停牌。相邻两日俱在，可证是缺一天而非区间缺失。
+    """
+    df = TdxDataSource(fixture_root).daily("sz000609")
+
+    assert pd.Timestamp("2026-04-22") not in df.index
+    assert pd.Timestamp("2026-04-21") in df.index
+    assert pd.Timestamp("2026-04-23") in df.index
+    # 若被填充，这两日之间会多出一条等于前收的记录
+    assert len(df) == 16
+
+
+def test_limit_up_one_word_board_is_preserved(fixture_root):
+    """连续涨停一字板保留为 o==h==l==c 且成交量>0。
+
+    票据 04 要据此判定「涨停买不进、跌停卖不出」；若解析器把这种 K 线抹平或
+    补上振幅，该判定就失去依据。
+    """
+    df = TdxDataSource(fixture_root).daily("sz000609")
+
+    for day in ("2026-04-20", "2026-04-21", "2026-04-23", "2026-04-30"):
+        row = df.loc[day]
+        assert row["open"] == row["high"] == row["low"] == row["close"], day
+        assert row["volume"] > 0, day
+
+
+def test_one_fixture_spans_a_limit_regime_change(fixture_root):
+    """``sh600243`` 同一文件内跨了一次限幅变更——制度规则表必须按日期查表。
+
+    2025-03-20 是 +10.06% 的涨停一字（主板 10% 限幅），2025-04-23 是 −4.86% 的
+    跌停一字（约 5% 限幅，该标的此时已带 ST）。若把限幅写成常量，其中一根必被误判。
+    该文件同时含停牌空档 2025-04-22。
+    """
+    df = TdxDataSource(fixture_root).daily("sh600243")
+
+    up = df.loc["2025-03-20"]
+    assert up["open"] == up["high"] == up["low"] == up["close"] == 3.61
+    assert df.loc["2025-03-19", "close"] == 3.28
+
+    down = df.loc["2025-04-23"]
+    assert down["open"] == down["high"] == down["low"] == down["close"] == 2.35
+    assert df.loc["2025-04-21", "close"] == 2.47
+
+    assert pd.Timestamp("2025-04-22") not in df.index
+    assert len(df) == 30
