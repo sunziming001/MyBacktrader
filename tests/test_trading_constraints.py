@@ -181,3 +181,54 @@ def test_sell_on_a_later_day_is_allowed(fixture_root, limit_rules):
     trades = result.trades
     assert len(trades) == 2, "买入次日卖出必须成交"
     assert list(trades["size"]) == [100, -100]
+
+
+# --- 涨跌停价的舍入约定 ---
+
+
+def test_limit_price_rounds_in_decimal_half_up_not_binary():
+    """涨跌停价 = 前收盘价 × (1 ± 限幅)，按**十进制**四舍五入到分。
+
+    这三条是实测得到的分歧样本：市场实际触及的价位全部落在十进制一侧。内建
+    ``round()`` 走二进制浮点，在恰好半分处会少一分。见
+    ``docs/research/tdx-halt-and-limit-representation.md``。
+    """
+    from mbt.backtest.costs import _limit_price
+
+    assert _limit_price(14.45, 0.10, -1) == 13.01, "round(14.45 * 0.9, 2) 会错给 13.00"
+    assert _limit_price(15.25, 0.10, -1) == 13.73, "round(15.25 * 0.9, 2) 会错给 13.72"
+    assert _limit_price(5.35, 0.10, +1) == 5.89, "round(5.35 * 1.1, 2) 会错给 5.88"
+
+
+def test_sell_is_blocked_when_the_bar_closes_at_the_decimal_limit_price(limit_rules):
+    """跌停一字的价格是十进制算出的 13.01，不是 ``round`` 的 13.00。
+
+    差这一分就漏判一字板：若判不出限价，13.01 这根一字板上的卖单会当天成交——
+    一笔现实中卖不掉的成交。
+    """
+    prices = pd.DataFrame(
+        {
+            "open": [14.45, 14.45, 13.01, 13.20],
+            "high": [14.45, 14.45, 13.01, 13.20],
+            "low": [14.45, 14.45, 13.01, 13.20],
+            "close": [14.45, 14.45, 13.01, 13.20],
+            "volume": [1000] * 4,
+        },
+        index=pd.bdate_range("2024-01-02", periods=4),
+    )
+
+    class BuyThenSell(bt.Strategy):
+        def next(self):
+            if len(self) == 1:
+                self.buy(size=100)
+            elif len(self) == 2 and self.position:
+                self.sell(size=100)
+
+    result = run_backtest(
+        prices, symbol="sh600000", strategy=BuyThenSell, cash=100_000.0, rules=limit_rules
+    )
+
+    sells = result.trades[result.trades["size"] < 0]
+    assert len(sells) == 1
+    assert sells.iloc[0]["date"] == pd.Timestamp("2024-01-05"), "跌停一字必须挡住卖单"
+    assert sells.iloc[0]["price"] == 13.20
