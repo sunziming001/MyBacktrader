@@ -28,6 +28,7 @@ from .tdx import TdxDataSource
 __all__ = [
     "AdjustmentEvent",
     "Anomaly",
+    "DilutionVerdict",
     "GbbqDataSource",
     "GbbqError",
     "GbbqRecord",
