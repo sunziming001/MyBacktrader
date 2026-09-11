@@ -1,0 +1,9 @@
+"""回测层：引擎协议、撮合与产物。
+
+引擎（backtrader）被隔离在本层之后，数据层与信号层不得依赖它（ADR-0007）。
+"""
+
+from . import _btcompat  # noqa: F401  导入即应用 Python 3.10 兼容修补
+from .engine import BacktestResult, run_backtest
+
+__all__ = ["BacktestResult", "run_backtest"]

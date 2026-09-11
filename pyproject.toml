@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mbt"
+version = "0.1.0"
+description = "基于 Backtrader 与通达信数据的 A 股策略回测与选股工具"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    # 精确 pin：backtrader 上游自 2023-04 起停更，任何版本变化都值得一次人工确认（ADR-0007）
+    "backtrader==1.9.78.123",
+    "pandas==2.3.3",
+    "numpy==2.2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "ruff==0.8.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "realmdata: 依赖本机真实通达信数据的测试；数据缺席时自动跳过",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
