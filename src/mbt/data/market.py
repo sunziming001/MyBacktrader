@@ -36,6 +36,7 @@ import pandas as pd
 from ..rules import RuleTable
 from .adjust import AdjustmentEvent, backward_adjusted, forward_adjusted
 from .anomaly import require_no_anomalies
+from .dilution import DilutionVerdict, resolve_dilution
 from .gbbq import GbbqDataSource
 from .tdx import TdxDataSource
 
@@ -50,12 +51,17 @@ class MarketData:
     属性:
         symbol: 标的符号，形如 ``sh600000``。
         prices: **原始**价字段宽表，交易日为索引。
-        events: 该标的的全部除权除息事件（含序列之外的），按权息文件的原始顺序。
+        events: **判定后**、参与价格复权的除权除息事件（含序列之外的）。
+            判为「未稀释」者已丢掉其稀释成分、只保留现金分红（见
+            :mod:`mbt.data.dilution`）。
+        verdicts: 逐条事件的判定记录，含低置信标记。默认空元组——直接构造
+            ``MarketData`` 的调用方（如测试）不必提供。
     """
 
     symbol: str
     prices: pd.DataFrame
     events: tuple[AdjustmentEvent, ...]
+    verdicts: tuple[DilutionVerdict, ...] = ()
 
     def backward_adjusted(self, as_of: dt.date | dt.datetime | None = None) -> pd.DataFrame:
         """**后复权**视图：回测用。首根 K 线价格不变，除权日不再有假跳空。
@@ -101,7 +107,12 @@ def load_market_data(
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 
     prices = TdxDataSource(tdx_root).daily(symbol)
-    events = tuple(GbbqDataSource(gbbq_path).events(symbol))
+    raw_events = tuple(GbbqDataSource(gbbq_path).events(symbol))
+
+    # 判定一次，**复权与质检吃同一份**结果。否则会出现「复权已经不算它了，质检却还在按它
+    # 报异常」这种自相矛盾（与 ADR-0002 里「涨跌停带必须与撮合共用同一个带」同类）。
+    events, verdicts = resolve_dilution(prices, raw_events, symbol, table)
+
     require_no_anomalies(prices, symbol, table, events)
 
-    return MarketData(symbol=symbol, prices=prices, events=events)
+    return MarketData(symbol=symbol, prices=prices, events=events, verdicts=verdicts)

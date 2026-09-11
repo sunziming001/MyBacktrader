@@ -46,6 +46,40 @@ def test_load_returns_raw_prices_and_events(fixture_root, gbbq_file):
     assert market.backward_adjusted().index.equals(market.prices.index)
 
 
+def test_load_carries_the_dilution_verdicts(fixture_root, gbbq_file):
+    """入口把**判定记录**一并交出，且事件已按判定结果处理（票据 #20）。
+
+    这条锁的是「判定接在正门上」——否则调用方拿到的是一份未判定的事件集，
+    而复权与质检读到的就不是同一份东西了。
+    """
+    market = load_market_data(
+        "sh600000", tdx_root=fixture_root, gbbq_path=gbbq_file, rules=LIMIT_RULES
+    )
+
+    assert market.verdicts, "判定记录应随行情交出"
+    assert len(market.verdicts) == len(market.events), "每条参与复权的事件都应有判定记录"
+
+
+def test_load_leaves_a_below_threshold_event_untouched(fixture_root, gbbq_file):
+    """夹具里那笔「每 10 股派 4.20 元」是纯现金分红：稀释为零，故判定不介入、事件原样。
+
+    纯现金分红即使误判也只有 1% 量级，判据在那个量级上分不开噪声与真实事件——
+    故不判，如实留痕即可。
+    """
+    from mbt.data.dilution import BELOW_THRESHOLD
+
+    market = load_market_data(
+        "sh600000", tdx_root=fixture_root, gbbq_path=gbbq_file, rules=LIMIT_RULES
+    )
+
+    verdict = next(v for v in market.verdicts if v.ex_date == dt.date(2026, 7, 16))
+    assert verdict.verdict == BELOW_THRESHOLD
+    assert verdict.low_confidence is False
+    event = next(e for e in market.events if e.ex_date == dt.date(2026, 7, 16))
+    assert event.cash_per_10 == pytest.approx(4.2, abs=1e-5)
+    assert event.bonus_per_10 == 0.0
+
+
 def test_load_rejects_a_gap_that_no_event_explains(tmp_path, gbbq_file):
     """10.00 → 20.00 且无权息事件：越界跳空无公司行为可解释，加载必须失败。"""
     root = _write(

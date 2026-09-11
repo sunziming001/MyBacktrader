@@ -180,32 +180,79 @@ def test_real_ex_date_gap_needs_the_event_to_be_explained(real_root, real_gbbq, 
     assert all(a.kind == "unexplained" for a in without_events)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="gbbq 把股改对价送股记为类别 1，复权照它稀释，而后复权因此凭空插入约 +22% 的"
-    "假跳空。见票据 #20。修好后本用例转为通过——strict=True 会让它在那时提示我们。",
-)
-def test_real_share_reform_event_does_not_create_a_fake_jump(real_root, real_gbbq):
+def test_real_share_reform_event_does_not_create_a_fake_jump(real_root, real_gbbq, limit_rules):
     """股改对价送股**不改变总股本**，故不除权——复权不该在它那里插入跳空。
 
     实测 ``sh600000`` 2006-05-12：gbbq 记有类别 1 的「10送3」，但价格并未按 1.3 稀释——
     原始价 10.86 → 10.21（−5.99%）落在**不稀释**的正常 ±10% 带 ``[9.77, 11.95]`` 内；
-    若真稀释，除权参考价应是 8.35。而后复权把这一区间变成 **+22.22%**，即凭空造出跳空。
+    若真稀释，除权参考价应是 8.35。而**未判定就复权**会把这一区间变成 **+22.22%**。
 
-    这条是**既有缺陷的记录**，不是本票要修的：它以 ``xfail(strict=True)`` 挂着，修好后
-    会由红转绿并提示改成正向断言（见票据 #20）。
+    这条锁定本票的修复（票据 #20）：判定后复权不再插进那个跳空。
     """
+    from mbt.data.dilution import NOT_DILUTED, resolve_dilution
+    from mbt.rules import RuleTable
+
     prices = TdxDataSource(real_root).daily("sh600000")
-    events = GbbqDataSource(real_gbbq).events("sh600000")
+    raw_events = GbbqDataSource(real_gbbq).events("sh600000")
+    rules = RuleTable.load(limit_rules)
 
     before, on = pd.Timestamp("2006-03-20"), pd.Timestamp("2006-05-12")
     if before not in prices.index or on not in prices.index:
         pytest.skip("本机行情未覆盖 2006-03-20 与 2006-05-12")
 
-    raw_gap = float(prices["close"].loc[on]) / float(prices["close"].loc[before]) - 1
-    adjusted = backward_adjusted(prices, events)
-    adjusted_gap = float(adjusted["close"].loc[on]) / float(adjusted["close"].loc[before]) - 1
+    # 未判定就复权 → 假跳空。这一条是「修复前确实有这个问题」的现场证据。
+    naive = backward_adjusted(prices, raw_events)["close"]
+    naive_gap = float(naive.loc[on]) / float(naive.loc[before]) - 1
+    assert naive_gap > 0.20, "未判定时没有假跳空——那这条测试就无从判别"
 
-    # 原始价是正常波动，而复权后成了大涨——那 27 个百分点就是复权插进去的。
+    # 判定后 → 该事件被认出「未稀释」，故不复权。
+    effective, verdicts = resolve_dilution(prices, raw_events, "sh600000", rules)
+    judged = [v for v in verdicts if v.ex_date == on.date()]
+    assert judged and judged[0].verdict == NOT_DILUTED, "该事件应被认出未稀释"
+
+    fixed = backward_adjusted(prices, effective)["close"]
+    raw_gap = float(prices["close"].loc[on]) / float(prices["close"].loc[before]) - 1
+    fixed_gap = float(fixed.loc[on]) / float(fixed.loc[before]) - 1
+    assert fixed_gap == pytest.approx(raw_gap, abs=1e-9), "判定后应回到原始价的真实变动"
     assert raw_gap == pytest.approx(-0.06, abs=0.01)
-    assert abs(adjusted_gap) < 0.02, f"复权插入了 {adjusted_gap:+.2%} 的假跳空"
+
+
+def test_real_dilution_judgement_does_not_bankrupt_the_universe(real_root, real_gbbq):
+    """判定不该把大多数标的挡在门外——实测约 79% 的含事件标的判定成功。
+
+    这条是**诚实的护栏**：判据的价值取决于它还能让人用。若哪天改动让通过率崩下去，
+    这里会失败，而不是等到跑批时才发现。
+    """
+    from mbt.data.dilution import DILUTION_THRESHOLD, resolve_dilution
+    from mbt.data.errors import MarketDataError
+    from mbt.rules import RuleTable, RuleTableError
+
+    source = TdxDataSource(real_root)
+    gbbq = GbbqDataSource(real_gbbq)
+    # 用**出厂**规则表：夹具表只覆盖 2015 起，会把大量早期事件算成「窗口外」而低估通过率。
+    rules = RuleTable.load()
+
+    sample = source.symbols()[::40]  # 约 300 个标的，够看比例
+    judged = failed = 0
+    for symbol in sample:
+        try:
+            prices = source.daily(symbol)
+            events = gbbq.events(symbol)
+        except Exception:  # noqa: BLE001
+            continue
+        if not any(e.bonus_per_share + e.rights_per_share >= DILUTION_THRESHOLD for e in events):
+            continue
+        try:
+            resolve_dilution(prices, events, symbol, rules)
+        except (MarketDataError, RuleTableError):
+            failed += 1
+        else:
+            judged += 1
+
+    total = judged + failed
+    if total < 20:
+        pytest.skip(f"本机样本中可判事件太少（{total} 个标的），不足以谈通过率")
+
+    assert (
+        judged / total >= 0.7
+    ), f"判定通过率仅 {judged}/{total} = {judged / total:.0%}——判据正在把太多标的挡在门外"
