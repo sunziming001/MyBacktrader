@@ -13,12 +13,11 @@ from pathlib import Path
 
 import tomli
 
+from .board import board_of
+from .errors import RuleTableError
+
 #: 过户费的收取方向取值。
 _FEE_SIDES = ("both", "buy", "sell", "none")
-
-
-class RuleTableError(Exception):
-    """规则表不可用：文件读不到、结构不合法，或未覆盖所查的日期/板块。"""
 
 
 class _Series:
@@ -52,12 +51,15 @@ class RuleTable:
     """
 
     def __init__(self, raw: dict):
-        self._price_limit: dict[str, _Series] = {}
-        self._transfer_fee: dict[str, _Series] = {}
-        self._transfer_fee_sides: dict[str, _Series] = {}
+        self._price_limit = {}
+        self._st_price_limit = {}
+        self._transfer_fee = {}
+        self._transfer_fee_sides = {}
 
         for entry in raw.get("price_limit", []):
             self._price_limit.setdefault(entry["board"], []).append(entry)
+        for entry in raw.get("st_price_limit", []):
+            self._st_price_limit.setdefault(entry["board"], []).append(entry)
         for entry in raw.get("transfer_fee", []):
             sides = entry["sides"]
             if sides not in _FEE_SIDES:
@@ -70,6 +72,9 @@ class RuleTable:
         self._price_limit = {
             k: _Series(v, "limit", f"{k} 的涨跌幅限制") for k, v in self._price_limit.items()
         }
+        self._st_price_limit = {
+            k: _Series(v, "limit", f"{k} 的 ST 涨跌幅限制") for k, v in self._st_price_limit.items()
+        }
         self._transfer_fee = {
             k: _Series(v, "rate", f"{k} 的过户费") for k, v in self._transfer_fee.items()
         }
@@ -79,6 +84,13 @@ class RuleTable:
         }
 
         self._stamp_duty = _Series(raw.get("stamp_duty", []), "sell_rate", "印花税")
+
+        # ST 期间：登记了才认。
+        self._st_periods: dict[str, list[tuple[dt.date, dt.date | None]]] = {}
+        for entry in raw.get("st_period", []):
+            self._st_periods.setdefault(entry["symbol"], []).append(
+                (entry["start"], entry.get("end"))
+            )
 
     @classmethod
     def load(cls, path) -> RuleTable:
@@ -95,8 +107,40 @@ class RuleTable:
 
     # --- 查表 ---
 
+    def board_of(self, symbol: str) -> str:
+        """标的所属**板块**（主板 / 创业板 / 科创板 / 北交所）。"""
+        return board_of(symbol)
+
+    def is_st(self, symbol: str, on: dt.date) -> bool:
+        """标的在成交日是否处于 ST 期间。
+
+        **只有登记在 ``[[st_period]]`` 里的才认**——未登记即视为非 ST。
+        这是必须显式声明的局限：本地价格数据不含股票名称，无法回溯历史上的 ST 状态。
+        """
+        for start, end in self._st_periods.get(symbol, ()):
+            if start <= on and (end is None or on <= end):
+                return True
+        return False
+
+    def limit_for(self, symbol: str, on: dt.date) -> float:
+        """标的在成交日的**涨跌幅限制**，已按需叠加 ST 覆盖。
+
+        ST 限幅本身按板块取值（主板 5%，而创业板 ST 仍与创业板普通股相同），
+        因此它是规则表里的**数据**，不是代码里的分支。
+        """
+        board = self.board_of(symbol)
+        if self.is_st(symbol, on):
+            if board not in self._st_price_limit:
+                raise RuleTableError(
+                    f"标的 {symbol} 在 {on.isoformat()} 属于 ST，"
+                    f"但规则表中没有{board}的 ST 涨跌幅限制——"
+                    f"静默退回普通限幅会放过本不该成交的交易"
+                )
+            return self._st_price_limit[board].at(on, "")
+        return self.price_limit(board, on)
+
     def price_limit(self, board: str, on: dt.date) -> float:
-        """某板块在成交日的**涨跌幅限制**（如 0.10 表示 10%）。"""
+        """某板块在成交日的**涨跌幅限制**（如 0.10 表示 10%），不含 ST 覆盖。"""
         return self._series(self._price_limit, board, on, f"板块 {board!r}")
 
     def stamp_duty_rate(self, on: dt.date) -> float:

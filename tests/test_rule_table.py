@@ -20,13 +20,13 @@ def test_price_limit_switches_on_effective_date(synthetic_rules):
     """变更日**当天**就用新规则，前一天仍用旧规则——边界必须闭合。"""
     table = RuleTable.load(synthetic_rules)
 
-    assert table.price_limit("主板", on=date(2023, 5, 31)) == 0.10
-    assert table.price_limit("主板", on=date(2023, 6, 1)) == 0.12
-    assert table.price_limit("主板", on=date(2023, 6, 2)) == 0.12
+    assert table.price_limit("沪主板", on=date(2023, 5, 31)) == 0.10
+    assert table.price_limit("沪主板", on=date(2023, 6, 1)) == 0.12
+    assert table.price_limit("沪主板", on=date(2023, 6, 2)) == 0.12
 
 
 def test_price_limit_lookup_does_not_leak_across_boards(synthetic_rules):
-    """板块之间互不串用：主板变更不影响创业板自己的生效日期。"""
+    """板块之间互不串用：沪主板变更不影响创业板自己的生效日期。"""
     table = RuleTable.load(synthetic_rules)
 
     assert table.price_limit("创业板", on=date(2023, 6, 1)) == 0.20
@@ -39,14 +39,14 @@ def test_price_limit_before_earliest_rule_raises(synthetic_rules):
     table = RuleTable.load(synthetic_rules)
 
     with pytest.raises(RuleTableError, match="2014-12-31"):
-        table.price_limit("主板", on=date(2014, 12, 31))
+        table.price_limit("沪主板", on=date(2014, 12, 31))
 
 
 def test_unknown_board_raises(synthetic_rules):
     table = RuleTable.load(synthetic_rules)
 
-    with pytest.raises(RuleTableError, match="北交所"):
-        table.price_limit("北交所", on=date(2023, 6, 1))
+    with pytest.raises(RuleTableError, match="不存在的板块"):
+        table.price_limit("不存在的板块", on=date(2023, 6, 1))
 
 
 # --- 费用：同一套查表机制，作用在不同字段上 ---

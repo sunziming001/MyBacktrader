@@ -4,6 +4,8 @@
 本层只依赖标准库与 ``tomli``，**不依赖 backtrader**（ADR-0007）。
 """
 
-from .table import RuleTable, RuleTableError
+from .board import board_of
+from .errors import RuleTableError
+from .table import RuleTable
 
-__all__ = ["RuleTable", "RuleTableError"]
+__all__ = ["RuleTable", "RuleTableError", "board_of"]

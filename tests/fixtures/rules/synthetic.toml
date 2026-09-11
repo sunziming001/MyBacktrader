@@ -2,19 +2,27 @@
 #
 # 出厂规则表在 src/mbt/rules/a_share.toml，那里的每条数值都带出处。
 # 测试指向本文件（测试缝 S3），因此改制度时机制测试不受影响。
+#
+# 板块命名统一为：沪主板 / 深主板 / 创业板 / 科创板 / 北交所。
+# 沪深分列是必要的——过户费在 2022-04-29 之前的收取方式沪深不同。
 
 schema_version = 1
 
-# 主板在测试区间内变更过一次限幅，用于验证「按成交日取当日生效规则」
+# 主板限幅在测试区间内变更过一次，用于验证「按成交日取当日生效规则」
 [[price_limit]]
-board = "主板"
+board = "沪主板"
 effective_from = 2015-01-01
 limit = 0.10
 
 [[price_limit]]
-board = "主板"
+board = "沪主板"
 effective_from = 2023-06-01
 limit = 0.12
+
+[[price_limit]]
+board = "深主板"
+effective_from = 2015-01-01
+limit = 0.10
 
 # 创业板另有自己的生效日期，用于验证规则不跨板块串用
 [[price_limit]]
@@ -26,6 +34,55 @@ limit = 0.10
 board = "创业板"
 effective_from = 2020-08-24
 limit = 0.20
+
+[[price_limit]]
+board = "科创板"
+effective_from = 2019-07-22
+limit = 0.20
+
+[[price_limit]]
+board = "北交所"
+effective_from = 2021-11-15
+limit = 0.30
+
+# --- ST 覆盖 ---
+# ST 股的限幅是**数据**而非代码分支：创业板的 ST 股限幅仍是 20%（不等于主板的 5%），
+# 这个例外因此只需要表里一行。真实数值待查证后写入出厂表。
+[[st_price_limit]]
+board = "沪主板"
+effective_from = 2015-01-01
+limit = 0.05
+
+[[st_price_limit]]
+board = "深主板"
+effective_from = 2015-01-01
+limit = 0.05
+
+[[st_price_limit]]
+board = "创业板"
+effective_from = 2015-01-01
+limit = 0.20
+
+# 科创板**故意不登记** ST 限幅，用于验证「是 ST 却查不到 ST 规则」时会报错。
+
+# ST 期间：登记了才认，未登记则视为非 ST（该局限在出厂表中显式声明）
+[[st_period]]
+symbol = "sz000609"
+start = 2020-05-06
+end = 2021-04-30
+
+[[st_period]]
+symbol = "sh600243"
+start = 2025-04-01
+
+[[st_period]]
+symbol = "sz300001"
+start = 2024-01-01
+
+# 科创板标的被登记为 ST，但其板块没有 ST 限幅，用于触发报错路径
+[[st_period]]
+symbol = "sh688981"
+start = 2024-01-01
 
 # 印花税只有卖出方缴纳，仅按日期取值
 [[stamp_duty]]
