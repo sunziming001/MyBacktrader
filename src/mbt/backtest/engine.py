@@ -6,9 +6,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import backtrader as bt
 import pandas as pd
+
+from mbt.rules import RuleTable
+
+from .costs import AStockBroker, AStockCommissionInfo
+
+#: 出厂规则表路径。每条数值都带出处，见该文件内的注释。
+DEFAULT_RULES_PATH = Path(__file__).resolve().parent.parent / "rules" / "a_share.toml"
 
 #: 成交明细的列。
 TRADE_COLUMNS = ("date", "size", "price", "value", "commission")
@@ -76,32 +84,56 @@ class _FillRecorder(bt.Analyzer):
         return pd.DataFrame(self._fills, columns=list(TRADE_COLUMNS))
 
 
-def run_backtest(prices, strategy, cash=100_000.0, commission=0.0, **strategy_params):
+def run_backtest(
+    prices,
+    symbol,
+    strategy,
+    cash=100_000.0,
+    rules=None,
+    commission=0.0,
+    commission_min=0.0,
+    slippage=0.0,
+    **strategy_params,
+):
     """对单一标的的价格表跑一次回测。
 
     参数:
         prices: 交易日为索引、含 ``open`` / ``high`` / ``low`` / ``close`` / ``volume``
             的价格表。传入**原始价**会得到未复权的结果——复权视图由复权层提供。
+        symbol: 标的符号，形如 ``sh600000``。交易制度按它取板块与 ST 状态，
+            因此**必填**——缺了它就无法确定过户费与涨跌幅限制，费用会算错。
         strategy: ``backtrader.Strategy`` 的子类。
         cash: 期初资金。
-        commission: 手续费率，一期为单一费率。
+        rules: 规则表，可以是 ``RuleTable`` 或 TOML 文件路径。默认取出厂规则表。
+        commission: 手续费率（券商约定，如 0.0003）。
+        commission_min: 单笔最低手续费。
+        slippage: 滑点比例，成交价按此劣化。
 
     .. warning::
 
-        本函数是本项目的一期曳光弹，**尚不可用于策略判断**：它既不做复权，
-        也不实现 A 股交易制度约束（T+1、涨跌停不可成交、停牌、印花税）。
-
-        这与 ADR-0002「回测从第一天就实现 A 股交易制度约束」**直接冲突**——按
-        ``docs/agents/domain.md`` 的要求在此显式提出，而非静默绕过。冲突是刻意接受的：
-        ADR-0002 约束的是**可用于策略判断的回测**，而本票产物按定义不是回测结论，
-        只是管道连通性证据（README 同此声明）。制度约束由票据 03 补齐，
-        在它落地之前，本函数的输出不得用于任何策略优劣的判断。
+        本函数**尚不可用于策略判断**：它不做复权，也未实现 T+1、涨跌停不可成交
+        与停牌约束（见票据 03 与 04 的剩余切片）。费用与制度费率已按成交日查表。
     """
+    table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules or DEFAULT_RULES_PATH)
+
     cerebro = bt.Cerebro()
-    cerebro.adddata(bt.feeds.PandasData(dataname=prices))
+
+    data = bt.feeds.PandasData(dataname=prices)
+    data._mbt_symbol = symbol
+    data._name = symbol
+    cerebro.adddata(data)
     cerebro.addstrategy(strategy, **strategy_params)
-    cerebro.broker.setcash(cash)
-    cerebro.broker.setcommission(commission=commission)
+
+    broker = AStockBroker()
+    broker.setcash(cash)
+    broker.addcommissioninfo(
+        AStockCommissionInfo(rules=table, commission=commission, commission_min=commission_min),
+        name=symbol,
+    )
+    if slippage:
+        broker.set_slippage_perc(slippage)
+    cerebro.setbroker(broker)
+
     cerebro.addanalyzer(_EquityRecorder, _name="equity")
     cerebro.addanalyzer(_FillRecorder, _name="fills")
 

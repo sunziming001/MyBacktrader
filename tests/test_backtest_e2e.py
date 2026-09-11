@@ -23,25 +23,31 @@ class BuyOnce(bt.Strategy):
             self.buy()
 
 
-def test_equity_curve_is_hand_computable(make_prices):
+def test_equity_curve_is_hand_computable(make_prices, zero_cost_rules):
     """每根 K 线开高低收相同，故净值可手算。
 
     资金 1000，默认下单量为 1 股：次根 K 线以 11 成交，占用 11，余 989。
     净值依次为 1000（未持仓）、989+11=1000、989+12=1001、989+13=1002。
+
+    用零费用规则表，使本测试只锁撮合机制；制度费用的数值由 ``test_costs.py`` 覆盖。
     """
     prices = make_prices([10.0, 11.0, 12.0, 13.0])
 
-    result = run_backtest(prices, strategy=BuyOnce, cash=1000.0)
+    result = run_backtest(
+        prices, symbol="sh600000", strategy=BuyOnce, cash=1000.0, rules=zero_cost_rules
+    )
 
     assert list(result.equity_curve.index) == list(prices.index)
     assert result.equity_curve.tolist() == [1000.0, 1000.0, 1001.0, 1002.0]
     assert result.final_value == 1002.0
 
 
-def test_trades_record_every_fill(make_prices):
+def test_trades_record_every_fill(make_prices, zero_cost_rules):
     prices = make_prices([10.0, 11.0, 12.0, 13.0])
 
-    result = run_backtest(prices, strategy=BuyOnce, cash=1000.0)
+    result = run_backtest(
+        prices, symbol="sh600000", strategy=BuyOnce, cash=1000.0, rules=zero_cost_rules
+    )
 
     trades = result.trades
     assert len(trades) == 1
@@ -52,20 +58,28 @@ def test_trades_record_every_fill(make_prices):
     assert fill["value"] == 11.0
 
 
-def test_trade_columns_are_exactly_the_documented_contract(make_prices):
+def test_trade_columns_are_exactly_the_documented_contract(make_prices, zero_cost_rules):
     """成交明细的列就是公开契约 ``TRADE_COLUMNS``——不多、不少、顺序一致。"""
     from mbt.backtest.engine import TRADE_COLUMNS
 
-    result = run_backtest(make_prices([10.0, 11.0]), strategy=BuyOnce, cash=1000.0)
+    result = run_backtest(
+        make_prices([10.0, 11.0]),
+        symbol="sh600000",
+        strategy=BuyOnce,
+        cash=1000.0,
+        rules=zero_cost_rules,
+    )
 
     assert list(result.trades.columns) == list(TRADE_COLUMNS)
 
 
-def test_end_to_end_from_local_tdx_fixture(fixture_root):
+def test_end_to_end_from_local_tdx_fixture(fixture_root, zero_cost_rules):
     """曳光弹：从本地通达信文件解析，一路跑到净值曲线与成交明细。"""
     prices = TdxDataSource(fixture_root).daily("sh600000")
 
-    result = run_backtest(prices, strategy=BuyOnce, cash=100_000.0)
+    result = run_backtest(
+        prices, symbol="sh600000", strategy=BuyOnce, cash=100_000.0, rules=zero_cost_rules
+    )
 
     assert len(result.equity_curve) == len(prices)
     assert result.equity_curve.index[0] == prices.index[0]

@@ -50,11 +50,13 @@ def test_real_day_file_length_is_record_multiple(real_root):
     assert source.path_for("sh600000").stat().st_size % DAY_RECORD_SIZE == 0
 
 
-def test_backtest_runs_on_real_data(real_root):
-    """端到端在真实数据上跑通（结果本身尚不可用于策略判断，见票据 02/03）。"""
+def test_backtest_runs_on_real_data(real_root, zero_cost_rules):
+    """端到端在真实数据上跑通（结果本身尚不可用于策略判断，见票据 03/04）。"""
     prices = TdxDataSource(real_root).daily("sh600000")
 
-    result = run_backtest(prices, strategy=BuyAndHold, cash=100_000.0)
+    result = run_backtest(
+        prices, symbol="sh600000", strategy=BuyAndHold, cash=100_000.0, rules=zero_cost_rules
+    )
 
     assert len(result.equity_curve) == len(prices)
     assert len(result.trades) == 1

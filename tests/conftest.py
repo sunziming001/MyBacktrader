@@ -27,6 +27,12 @@ def synthetic_rules():
 
 
 @pytest.fixture
+def zero_cost_rules():
+    """零费用规则表路径——让撮合机制测试与费用数值测试分离（测试缝 S3）。"""
+    return TESTS_DIR / "fixtures" / "rules" / "zero-costs.toml"
+
+
+@pytest.fixture
 def make_prices():
     """工厂：由收盘价序列构造最小 OHLCV 宽表。
 

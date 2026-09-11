@@ -1,0 +1,69 @@
+# 零费用规则表——**测试夹具，不代表任何真实制度配置**。
+#
+# 用途：让「撮合机制」的测试（净值曲线、成交明细、真实数据冒烟）与「费用数值」的
+# 测试分离。费用行为由 tests/test_costs.py 用 synthetic.toml 专门覆盖；
+# 这里费用全零，机制测试的期望值因此仍可手算。
+#
+# 生效日期故意很早，好覆盖真实数据的完整历史区间。
+
+schema_version = 1
+
+# 限幅取值不影响这些测试（它们不涉涨跌停约束），但查表需要覆盖到成交日。
+[[price_limit]]
+board = "沪主板"
+effective_from = 1990-01-01
+limit = 0.10
+
+[[price_limit]]
+board = "深主板"
+effective_from = 1990-01-01
+limit = 0.10
+
+[[price_limit]]
+board = "创业板"
+effective_from = 1990-01-01
+limit = 0.20
+
+[[price_limit]]
+board = "科创板"
+effective_from = 1990-01-01
+limit = 0.20
+
+[[price_limit]]
+board = "北交所"
+effective_from = 1990-01-01
+limit = 0.30
+
+[[stamp_duty]]
+effective_from = 1990-01-01
+sell_rate = 0.0
+
+[[transfer_fee]]
+board = "沪主板"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"
+
+[[transfer_fee]]
+board = "深主板"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"
+
+[[transfer_fee]]
+board = "创业板"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"
+
+[[transfer_fee]]
+board = "科创板"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"
+
+[[transfer_fee]]
+board = "北交所"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"
