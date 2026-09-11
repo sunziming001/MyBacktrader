@@ -26,12 +26,16 @@ class BuyOnce(bt.Strategy):
 def test_equity_curve_is_hand_computable(make_prices, zero_cost_rules):
     """每根 K 线开高低收相同，故净值可手算。
 
-    资金 1000，默认下单量为 1 股：次根 K 线以 11 成交，占用 11，余 989。
-    净值依次为 1000（未持仓）、989+11=1000、989+12=1001、989+13=1002。
+    资金 1000，默认下单量为 1 股：次根 K 线以 21 成交，占用 21，余 979。
+    净值依次为 1000（未持仓）、979+21=1000、979+22=1001、979+23=1002。
+
+    价格从 20 起、每步约 +5%，是刻意的：``make_prices`` 令每根 K 线 ``o==h==l==c``，
+    若相邻收盘恰好相差一个限幅（如 10→11 恰为 +10%），那根 K 线就是**涨停一字板**，
+    买单会被撮合约束正确地挡下。此处要测的是净值记账，故避开该情形。
 
     用零费用规则表，使本测试只锁撮合机制；制度费用的数值由 ``test_costs.py`` 覆盖。
     """
-    prices = make_prices([10.0, 11.0, 12.0, 13.0])
+    prices = make_prices([20.0, 21.0, 22.0, 23.0])
 
     result = run_backtest(
         prices, symbol="sh600000", strategy=BuyOnce, cash=1000.0, rules=zero_cost_rules
@@ -43,7 +47,7 @@ def test_equity_curve_is_hand_computable(make_prices, zero_cost_rules):
 
 
 def test_trades_record_every_fill(make_prices, zero_cost_rules):
-    prices = make_prices([10.0, 11.0, 12.0, 13.0])
+    prices = make_prices([20.0, 21.0, 22.0, 23.0])
 
     result = run_backtest(
         prices, symbol="sh600000", strategy=BuyOnce, cash=1000.0, rules=zero_cost_rules
@@ -54,8 +58,8 @@ def test_trades_record_every_fill(make_prices, zero_cost_rules):
     fill = trades.iloc[0]
     assert fill["date"] == pd.Timestamp("2024-01-03")
     assert fill["size"] == 1
-    assert fill["price"] == 11.0
-    assert fill["value"] == 11.0
+    assert fill["price"] == 21.0
+    assert fill["value"] == 21.0
 
 
 def test_trade_columns_are_exactly_the_documented_contract(make_prices, zero_cost_rules):
@@ -63,7 +67,7 @@ def test_trade_columns_are_exactly_the_documented_contract(make_prices, zero_cos
     from mbt.backtest.engine import TRADE_COLUMNS
 
     result = run_backtest(
-        make_prices([10.0, 11.0]),
+        make_prices([20.0, 21.0]),
         symbol="sh600000",
         strategy=BuyOnce,
         cash=1000.0,

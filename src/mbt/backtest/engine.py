@@ -104,15 +104,23 @@ def run_backtest(
             因此**必填**——缺了它就无法确定过户费与涨跌幅限制，费用会算错。
         strategy: ``backtrader.Strategy`` 的子类。
         cash: 期初资金。
-        rules: 规则表，可以是 ``RuleTable`` 或 TOML 文件路径。默认取出厂规则表。
+        rules: 规则表，可以是 ``RuleTable`` 或 TOML 文件路径。默认取出厂规则表，
+            但**出厂规则表尚未落地**（票据 04 切片 8，等制度数值查证），故目前
+            请显式传入路径。
         commission: 手续费率（券商约定，如 0.0003）。
         commission_min: 单笔最低手续费。
         slippage: 滑点比例，成交价按此劣化。
 
     .. warning::
 
-        本函数**尚不可用于策略判断**：它不做复权，也未实现 T+1、涨跌停不可成交
-        与停牌约束（见票据 03 与 04 的剩余切片）。费用与制度费率已按成交日查表。
+        本函数**尚不可用于策略判断**：它不做复权（待票据 03）。A 股制度约束已完成
+        费用、T+1、涨跌停不可成交、无成交量不可成交（票据 04 切片 1–6），但仍缺：
+
+        - 行情**异常检测**（切片 7）：单日涨跌幅超出制度上限目前不会报错，
+          而 ADR-0005 要求异常报错；
+        - 出厂规则表（切片 8），故现在必须显式传入 ``rules``。
+
+        未复权意味着除权跳空会原样进入回测，收益结论仍偏乐观。
     """
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules or DEFAULT_RULES_PATH)
 
@@ -124,7 +132,7 @@ def run_backtest(
     cerebro.adddata(data)
     cerebro.addstrategy(strategy, **strategy_params)
 
-    broker = AStockBroker()
+    broker = AStockBroker(rules=table)
     broker.setcash(cash)
     broker.addcommissioninfo(
         AStockCommissionInfo(rules=table, commission=commission, commission_min=commission_min),

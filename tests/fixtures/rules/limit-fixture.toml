@@ -1,0 +1,52 @@
+# 撮合约束夹具——**测试夹具，费用全零以隔离涨跌停与停牌的判定**。
+#
+# 这份表的限幅取真实制度值，好让 tests/test_trading_constraints.py 直接用仓库内
+# 的真实 fixture（sh600243 / sz000609）当回归样本：
+#   sh600243  2025-03-20  +10.06% 涨停一字（此时非 ST）
+#             2025-04-22  停牌
+#             2025-04-23  −4.86% 跌停一字（此时已是 ST，限幅 5%）
+# 注意最后一条：若 ST 期间没登记，限幅会取 10%，2.35 就不被判为跌停价——
+# 这正是「ST 期间必须显式登记」这条局限的直接后果。
+
+schema_version = 1
+
+[[price_limit]]
+board = "沪主板"
+effective_from = 1990-01-01
+limit = 0.10
+
+[[price_limit]]
+board = "深主板"
+effective_from = 1990-01-01
+limit = 0.10
+
+[[st_price_limit]]
+board = "沪主板"
+effective_from = 1990-01-01
+limit = 0.05
+
+[[st_price_limit]]
+board = "深主板"
+effective_from = 1990-01-01
+limit = 0.05
+
+# sh600243 自 2025-04-01 起带 ST，故 2025-04-23 的限幅为 5%
+[[st_period]]
+symbol = "sh600243"
+start = 2025-04-01
+
+[[stamp_duty]]
+effective_from = 1990-01-01
+sell_rate = 0.0
+
+[[transfer_fee]]
+board = "沪主板"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"
+
+[[transfer_fee]]
+board = "深主板"
+effective_from = 1990-01-01
+rate = 0.0
+sides = "none"

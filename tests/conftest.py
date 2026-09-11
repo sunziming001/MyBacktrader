@@ -33,10 +33,23 @@ def zero_cost_rules():
 
 
 @pytest.fixture
+def limit_rules():
+    """撮合约束夹具规则表路径：限幅取真实制度值，费用为零（测试缝 S3）。"""
+    return TESTS_DIR / "fixtures" / "rules" / "limit-fixture.toml"
+
+
+@pytest.fixture
 def make_prices():
     """工厂：由收盘价序列构造最小 OHLCV 宽表。
 
     为让行为可手算，默认令 open = high = low = close，即每根 K 线无振幅。
+
+    .. warning::
+
+        正因为每根 K 线 ``o == h == l == c``，**相邻收盘若恰好相差一个限幅**
+        （主板 10% 步进，如 10 → 11），该根 K 线就构成**一字板**，会被撮合约束
+        正确挡下而改变成交日。要测净值/费用记账时请避开这种步进，或显式传入
+        非 10% 的价差。相关判定见 ``mbt.backtest.costs.AStockBroker._limit_locked``。
     """
 
     def _make(closes, start="2024-01-02", volume=1000):

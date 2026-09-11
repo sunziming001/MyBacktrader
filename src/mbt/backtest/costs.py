@@ -7,11 +7,26 @@
 解法：broker 在计算费用的那一刻被调用 ``getcommissioninfo(data)``，此时
 ``data.datetime.date(0)`` 正是成交日，于是把日期注入费用对象即可。
 这比事后修正净值更贴近引擎的真实撮合路径，且策略无法绕过。
+
+本模块同时承载撮合侧的硬约束（T+1、涨跌停不可成交、停牌跳过）。它们与费用同属
+「撮合按当日制度执行」这一件事，故共用 :class:`AStockBroker` 这一个接入点。
 """
 
 from __future__ import annotations
 
 import backtrader as bt
+
+#: 价格保留的小数位。A 股价格精确到分，涨跌停价按前收盘价四舍五入到分。
+_PRICE_DECIMALS = 2
+
+#: 价比的容差。价格精确到分，此处仅为吸收 ``round`` 与二进制小数的表示误差，
+#: 不是模糊阈值——判「是否触限」不应有模糊地带。
+_PRICE_TOLERANCE = 1e-9
+
+
+def _same_price(a: float, b: float) -> bool:
+    """两个价格是否相等（容忍浮点表示误差）。"""
+    return abs(a - b) < _PRICE_TOLERANCE
 
 
 class AStockCommissionInfo(bt.CommissionInfo):
@@ -65,11 +80,31 @@ class AStockCommissionInfo(bt.CommissionInfo):
 
 
 class AStockBroker(bt.brokers.BackBroker):
-    """在费用计算那一刻把成交日与标的注入费用对象。
+    """撮合侧的 A 股硬约束，以及把成交日与标的注入费用对象。
 
-    这是本层唯一需要触碰引擎内部的地方：``getcommissioninfo`` 恰好在每次费用计算前
-    被调用，且调用时的当前 K 线就是成交所在的那根。
+    三条约束共用 ``_try_exec`` 这一个接入点，但**处置方式刻意不同**：
+
+    - **涨跌停不可成交、当日无成交**：本日**不具备成交条件**，故保留挂单，
+      引擎会自动把它挪到下一根 K 线再试（即用户选定的「挂单保留至下一可交易日」）。
+    - **T+1**：本单在当日**不合法**，故 ``reject()`` 终结，不拖到次日。
+
+    区分依据是引擎的挂单循环：``_try_exec`` 返回后，订单若仍 ``alive()`` 就会被
+    重新放回 pending 队列；被拒则不再存活。因此「不成交」只需什么都不做。
+
+    ``getcommissioninfo`` 是本层唯一另一处接入点：它在每次费用计算前被调用，且
+    调用时的当前 K 线就是成交所在的那根，于是成交日得以注入费用对象。
     """
+
+    params = (("rules", None),)
+
+    def __init__(self):
+        super().__init__()
+        #: data → (成交日, 该日买入的股数)。用于 T+1 判定。
+        self._bought_today: dict = {}
+        #: order.ref → 已记入的累计成交股数，避免部分成交被重复计数。
+        self._counted: dict = {}
+
+    # --- 费用：注入成交日与标的 ---
 
     def getcommissioninfo(self, data):
         info = super().getcommissioninfo(data)
@@ -79,3 +114,104 @@ class AStockBroker(bt.brokers.BackBroker):
             inject(getattr(data, "_mbt_symbol", None), data.datetime.date(0))
 
         return info
+
+    # --- 撮合约束 ---
+
+    def _try_exec(self, order):
+        if order.issell() and not self._t1_allows(order):
+            # T+1：当日买入的股份当日不可卖。交易所就是拒单，故不得留到次日。
+            order.reject()
+            self.notify(order)
+            return
+
+        if not self._tradeable_today(order):
+            return  # 保留挂单：仍 alive 的订单会被引擎放回队列，下一根再试
+
+        return super()._try_exec(order)
+
+    def _execute(self, order, ago=None, price=None, cash=None, position=None, dtcoc=None):
+        result = super()._execute(
+            order, ago=ago, price=price, cash=cash, position=position, dtcoc=dtcoc
+        )
+
+        # ago is None 表示伪执行（试探资金够不够）。它在 order.execute 之前就返回，
+        # 不改订单状态，因此这里不会把未成交的单误记成已买入。
+        if ago is not None:
+            self._remember_bought_today(order)
+
+        return result
+
+    def _remember_bought_today(self, order):
+        """记下本笔买入的股数，供 T+1 判定。
+
+        按累计成交量取增量，故部分成交分批到来时不会重复计数。
+        """
+        if not order.isbuy():
+            return
+
+        executed = abs(order.executed.size)
+        delta = executed - self._counted.get(order.ref, 0)
+        if delta <= 0:
+            return
+        self._counted[order.ref] = executed
+
+        data = order.data
+        on = data.datetime.date(0)
+        prev_date, prev_qty = self._bought_today.get(data, (on, 0))
+        qty = prev_qty if prev_date == on else 0
+        self._bought_today[data] = (on, qty + delta)
+
+    def _t1_allows(self, order):
+        """可卖量 = 持仓 − 当日买入量；卖出量超过可卖量即违规。
+
+        这里把「当日买入」当作一整块扣减，没有逐笔追踪卖出的是哪一批股票。日线上
+        一根 K 线只能下一次单、成交在下一根，日内多次往返实际不会出现，故无需
+        lot 级追踪。代价是极端场景下偏保守——宁可少卖，也不放出不存在的成交。
+        """
+        data = order.data
+        on = data.datetime.date(0)
+        bought_on, qty = self._bought_today.get(data, (on, 0))
+        bought_today = qty if bought_on == on else 0
+
+        sellable = self.positions[data].size - bought_today
+        return abs(order.created.size) <= sellable
+
+    def _tradeable_today(self, order):
+        """当日是否具备成交条件。缺规则表时只判「有无成交量」。"""
+        data = order.data
+
+        if data.volume[0] == 0:
+            # 当日无成交。股票停牌是缺记录，但基金/债券会留下零量的平价 K 线。
+            return False
+
+        return not self._limit_locked(order)
+
+    def _limit_locked(self, order):
+        """本根 K 线是否是**挡住该订单方向**的一字板。
+
+        判据必须同时满足两条：
+
+        1. ``o == h == l == c``——全天只有一个价；
+        2. 该价**恰在当日涨跌停价上**——由前收盘价与当日限幅算出。
+
+        只凭形态（第 1 条）会把没有涨跌停的品种也算成锁死，故必须补上第 2 条。
+        方向也必须分清：涨停一字**买不进但卖得出**，跌停一字**卖不出但买得到**
+        ——后者是常被写错的：跌停时卖方排队，买方反而立即成交。
+        """
+        data = order.data
+        if not (data.open[0] == data.high[0] == data.low[0] == data.close[0]):
+            return False
+        if len(data) < 2:  # 没有前收盘价就算不出涨跌停价
+            return False
+
+        symbol = getattr(data, "_mbt_symbol", None)
+        if symbol is None or self.p.rules is None:
+            return False  # 无制度信息则不判锁死——此处不猜
+
+        close = data.close[0]
+        prev_close = data.close[-1]
+        limit = self.p.rules.limit_for(symbol, data.datetime.date(0))
+
+        if order.isbuy():
+            return _same_price(close, round(prev_close * (1 + limit), _PRICE_DECIMALS))
+        return _same_price(close, round(prev_close * (1 - limit), _PRICE_DECIMALS))
