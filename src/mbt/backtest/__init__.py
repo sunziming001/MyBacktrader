@@ -4,6 +4,18 @@
 """
 
 from . import _btcompat  # noqa: F401  导入即应用 Python 3.10 兼容修补
-from .engine import BacktestResult, run_backtest
+from .engine import (
+    BacktestResult,
+    build_tradability,
+    run_backtest,
+    run_portfolio_backtest,
+)
+from .sizing import EqualWeightSizer
 
-__all__ = ["BacktestResult", "run_backtest"]
+__all__ = [
+    "BacktestResult",
+    "EqualWeightSizer",
+    "build_tradability",
+    "run_backtest",
+    "run_portfolio_backtest",
+]

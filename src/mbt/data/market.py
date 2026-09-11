@@ -98,17 +98,10 @@ def load_market_data(
         MarketDataError: 行情文件缺失 / 损坏，或存在无法用公司行为解释的越界跳空。
         RuleTableError: 符号不是规则表覆盖的股票（指数、基金、债券）。
     """
-    table = (
-        rules if isinstance(rules, RuleTable) else RuleTable.load(rules or _default_rules_path())
-    )
+    table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 
     prices = TdxDataSource(tdx_root).daily(symbol)
     events = tuple(GbbqDataSource(gbbq_path).events(symbol))
     require_no_anomalies(prices, symbol, table, events)
 
     return MarketData(symbol=symbol, prices=prices, events=events)
-
-
-def _default_rules_path() -> Path:
-    """出厂规则表路径。与 :func:`mbt.backtest.run_backtest` 用的是同一份。"""
-    return Path(__file__).resolve().parent.parent / "rules" / "a_share.toml"

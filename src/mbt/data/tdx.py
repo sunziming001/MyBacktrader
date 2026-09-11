@@ -53,6 +53,28 @@ class TdxDataSource:
         """标的日线文件路径。``symbol`` 形如 ``sh600000``，与文件名一致。"""
         return self._root / symbol[:2] / "lday" / f"{symbol}.day"
 
+    def symbols(self) -> list[str]:
+        """列出数据源中的全部标的，**排序**返回。
+
+        扫 ``sh`` / ``sz`` / ``bj`` 三个市场目录。市场目录缺席是正常的（只装了沪深数据
+        的情形很常见），故不报错、跳过即可。
+
+        **刻意不做品种过滤**——过滤是股票池的职责。指数、可转债、基金的代码照样返回，
+        调用方才能知道「目录里到底有什么」，也才能把「为什么被排除」讲清楚。
+
+        文件名的合法性同样**不在这里筛**：不合法者照原样返回，由
+        :func:`mbt.data.instrument_type` 判为「其他」而在股票池那一层被排除。静默丢弃
+        会让你无从分辨「目录里没有这个文件」与「文件在但被略过了」——后者等于替调用方
+        做了判断，而判断错了就是少收标的。
+        """
+        found = []
+        for market in ("sh", "sz", "bj"):
+            lday = self._root / market / "lday"
+            if not lday.is_dir():
+                continue
+            found.extend(path.stem for path in lday.glob("*.day"))
+        return sorted(found)
+
     def daily(self, symbol: str) -> pd.DataFrame:
         """读取单个标的的日线**原始价**。
 

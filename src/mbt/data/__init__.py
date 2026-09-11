@@ -20,6 +20,7 @@ from .adjust import (
 from .anomaly import Anomaly, find_anomalies, require_no_anomalies
 from .errors import MarketDataError
 from .gbbq import GbbqDataSource, GbbqError, GbbqRecord
+from .instrument import instrument_type, is_stock
 from .market import MarketData, load_market_data
 from .panel import Panel, assemble_panel
 from .tdx import TdxDataSource
@@ -40,6 +41,8 @@ __all__ = [
     "combined_reference_price",
     "find_anomalies",
     "forward_adjusted",
+    "instrument_type",
+    "is_stock",
     "load_market_data",
     "require_no_anomalies",
 ]

@@ -7,10 +7,11 @@
 from .board import board_of
 from .errors import RuleTableError
 from .price import PRICE_TOLERANCE, limit_band, limit_price, round_to_cent, same_price
-from .table import RuleTable
+from .table import SHIPPED_RULES_PATH, RuleTable
 
 __all__ = [
     "PRICE_TOLERANCE",
+    "SHIPPED_RULES_PATH",
     "RuleTable",
     "RuleTableError",
     "board_of",
