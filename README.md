@@ -34,6 +34,21 @@
     跌停一字卖不出但买得到。
   - **出厂规则表已落地**：`src/mbt/rules/a_share.toml`，覆盖 2015–2026 的涨跌幅、
     ST 限幅、印花税、过户费、经手费、证管费，每条数值都带出处。**但 ST 限幅目前实际选不中**（见下）。
+- **信号层已实现**（票据 [#5](https://github.com/sunziming001/MyBacktrader/issues/5)）：项目的架构中枢。
+  指标、过滤信号、排序因子一律算成日期 × 标的的**标的宽表**，回测按列取时序、选股按行取截面
+  ——同一个函数，两个消费方向（ADR-0001）。全部是纯函数：无 I/O、无状态、不读全局配置。
+  - 指标：`sma`、`rolling_max`、`volume_ratio`（成交量比）、`atr`（Wilder 口径，见下）
+  - 过滤信号：`new_high`、`volume_surge`、`ma_cross_up`、`rising_streak`、`above_ma`
+  - 排序因子：`momentum`、`distance_to_high`
+  - **行情面板已实现**（票据 [#14](https://github.com/sunziming001/MyBacktrader/issues/14)）：
+    `Panel` + `assemble_panel`。ATR 一行内要用 `high` / `low` / `close` 且必须同日对齐，而标的
+    宽表一格只能放一个数，面板补上这一层。它是**按需组装**的显式结构，不落盘、不常驻；字段
+    由调用方显式声明，组装时强制各字段同日对齐。正名与理由见
+    [ADR-0009](docs/adr/0009-panel-and-frame-naming.md)：裸用「宽表」一词在本项目里被禁止，
+    因为**字段宽表**与**标的宽表**形状同形而语义相反。
+  - 术语提醒：`volume_ratio` **不是**交易所口径的「量比」（后者是盘中、5 日、每分钟口径，
+    日线无法忠实复现），本项目刻意不实现量比、也不用那个词。
+
 - **没有选股能力**（待票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)），
   也不会评估基准、回撤等指标。
 

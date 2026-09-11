@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import pandas as pd
 
-from mbt.signals._wide import check_wide
+from mbt.signals._symbol_frame import check_symbol_frame
 from mbt.signals.indicators import rolling_max
 
 
 def momentum(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     """n 日动量：``当根收盘 / n 根前收盘 − 1``。**越大越强**。"""
-    prices = check_wide(prices)
+    prices = check_symbol_frame(prices)
     return prices / prices.shift(n) - 1.0
 
 
@@ -28,10 +28,10 @@ def distance_to_high(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     数值**越接近 0 越强**。
 
     基准是**收盘价**的最高值，不是 K 线的最高价（``high``）——两者不是一回事，而本层的
-    输入约定是一张单一字段的宽表，故「最高价」在此一律指收盘价的最大值（与 ``new_high``
+    输入约定是一张单一字段的标的宽表，故「最高价」在此一律指收盘价的最大值（与 ``new_high``
     的口径一致）。
 
     定义为「接近程度」而非「回撤幅度」，是为了让所有因子**同向**（越大越好）：消费方
     排序时不必为每个因子记住方向，从而不必在每处都猜一次符号。
     """
-    return check_wide(prices) / rolling_max(prices, n) - 1.0
+    return check_symbol_frame(prices) / rolling_max(prices, n) - 1.0

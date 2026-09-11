@@ -58,7 +58,7 @@ class TdxDataSource:
 
         ``symbol`` 形如 ``sh600000``（市场前缀 + 代码），与文件名一致。
 
-        返回以交易日为索引的宽表，列含 ``open`` / ``high`` / ``low`` / ``close`` /
+        返回以交易日为索引的**字段宽表**，列含 ``open`` / ``high`` / ``low`` / ``close`` /
         ``volume`` / ``amount``。
 
         文件不存在时抛 ``MarketDataError``——对调用方而言「这个标的取不到数据」
