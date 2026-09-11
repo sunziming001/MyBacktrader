@@ -60,6 +60,17 @@ def test_close_outside_daily_range_is_rejected(make_source):
         TdxDataSource(root).daily(SYMBOL)
 
 
+def test_missing_symbol_file_is_rejected_as_market_data_error(make_source):
+    """文件根本不存在，与文件损坏一样属于「数据不可用」。
+
+    两者统一为 ``MarketDataError``，调用方无需为「数据取不到」捕捉两种异常类型。
+    """
+    root = make_source([(20240102, 1000, 1010, 990, 1005, 1.0, 100)])
+
+    with pytest.raises(MarketDataError, match="未找到"):
+        TdxDataSource(root).daily("sh999999")
+
+
 def test_truncated_file_is_rejected(make_source):
     """文件长度不是记录长度的整数倍，说明格式假设已被打破。"""
     root = make_source([(20240102, 1000, 1010, 990, 1005, 1.0, 100)])

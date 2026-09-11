@@ -11,12 +11,22 @@
 [#2](https://github.com/sunziming001/MyBacktrader/issues/2)），它只打通管道、暴露集成问题，
 **还不是一个可用的回测工具**。具体地，它目前：
 
-- **不做复权**。解析器返回原始价，除权除息造成的价格跳空会原样进入回测，因而会得到错误的收益。
-- **不实现 A 股交易制度约束**。没有 T+1、没有涨跌停不可成交、没有停牌、没有印花税与过户费。
+- **不做复权**（待票据 [#3](https://github.com/sunziming001/MyBacktrader/issues/3)）。解析器返回原始价，
+  除权除息造成的价格跳空会原样进入回测，因而会得到错误的收益。
+- **不实现 A 股交易制度约束**（待票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4)）。
+  没有 T+1、没有涨跌停不可成交、没有停牌、没有印花税与过户费。
   这意味着策略可以做到现实中做不到的事，回测结果会**系统性偏乐观**。
-- **没有选股能力**，也不会评估基准、回撤等指标。
+- **没有选股能力**（待票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)），
+  也不会评估基准、回撤等指标。
 
 用当前代码得出的任何收益数字都只能视为**管道连通性的证据**，不能作为策略好坏的依据。
+
+> **与 ADR-0002 的冲突（显式声明）**：[ADR-0002](docs/adr/0002-a-share-trading-constraints.md)
+> 决策「回测从第一天就实现 A 股交易制度约束」。当前代码**违背**该决策，这是刻意接受的：
+> ADR-0002 约束的是**可用于策略判断的回测**，而本票产物按定义不是回测结论，只是管道证据。
+> 制度约束由票据 [#4](https://github.com/sunziming001/MyBacktrader/issues/4) 补齐；
+> 在它落地之前，`run_backtest` 的输出不得用于任何策略优劣的判断。
+
 完整的范围与验收标准见规格 [issue #1](https://github.com/sunziming001/MyBacktrader/issues/1)。
 
 ## 安装

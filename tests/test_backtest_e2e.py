@@ -52,6 +52,15 @@ def test_trades_record_every_fill(make_prices):
     assert fill["value"] == 11.0
 
 
+def test_trade_columns_are_exactly_the_documented_contract(make_prices):
+    """成交明细的列就是公开契约 ``TRADE_COLUMNS``——不多、不少、顺序一致。"""
+    from mbt.backtest.engine import TRADE_COLUMNS
+
+    result = run_backtest(make_prices([10.0, 11.0]), strategy=BuyOnce, cash=1000.0)
+
+    assert list(result.trades.columns) == list(TRADE_COLUMNS)
+
+
 def test_end_to_end_from_local_tdx_fixture(fixture_root):
     """曳光弹：从本地通达信文件解析，一路跑到净值曲线与成交明细。"""
     prices = TdxDataSource(fixture_root).daily("sh600000")

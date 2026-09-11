@@ -14,6 +14,7 @@ import pytest
 
 from mbt.backtest import run_backtest
 from mbt.data import TdxDataSource
+from mbt.data.tdx import DAY_RECORD_SIZE
 
 DEFAULT_ROOT = Path(r"D:\Tools\tdx\vipdoc")
 
@@ -44,9 +45,9 @@ def test_real_day_file_covers_expected_history(real_root):
 
 def test_real_day_file_length_is_record_multiple(real_root):
     """真实文件的长度必须能被记录长度整除——这是格式假设的直接验证。"""
-    path = real_root / "sh" / "lday" / "sh600000.day"
+    source = TdxDataSource(real_root)
 
-    assert path.stat().st_size % 32 == 0
+    assert source.path_for("sh600000").stat().st_size % DAY_RECORD_SIZE == 0
 
 
 def test_backtest_runs_on_real_data(real_root):
