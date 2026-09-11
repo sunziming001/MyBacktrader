@@ -47,6 +47,14 @@
 > 等到带生效日期的 ST 名称历史到位，出厂表里的 ST 限幅即自动生效。
 > 详见 [`docs/research/tdx-halt-and-limit-representation.md`](docs/research/tdx-halt-and-limit-representation.md)。
 
+> **交易成本被系统性低估（方向偏乐观）**：出厂表只含**印花税**与**过户费**，
+> **未含经手费**（2023-08-28 后 0.0341‰，双向）与**证管费**（0.02‰，双向）。
+> 二者合计单边约 **0.0054%**，买入卖出一次约 **0.011%**。它们**总是被收取**，不建模是
+> 因为券商多以「全佣」一并报价，另立条目会与 `commission` 参数**重复计费**。
+> 故：若你填入的是**净佣**费率，请自行把这两项计入 `commission`；
+> 若填入的是**全佣**费率，则当前口径正确。默认 `commission=0` 意味着这些成本一律未计。
+> 逐条费率与出处见 [`docs/research/a-share-trading-rules.md`](docs/research/a-share-trading-rules.md) §1.7、§1.8。
+
 完整的范围与验收标准见规格 [issue #1](https://github.com/sunziming001/MyBacktrader/issues/1)。
 
 ## 安装
