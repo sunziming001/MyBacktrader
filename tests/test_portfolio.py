@@ -197,7 +197,7 @@ def test_a_buy_outside_the_universe_is_rejected(make_market, zero_cost_rules):
 
 
 def test_a_sell_outside_the_universe_is_still_allowed(make_market, synthetic_rules):
-    """池外只禁买、不禁卖——持仓可能因调仓或数据变化掉出池子，禁卖会把仓位卡死。
+    """池外只禁买、不禁卖——持仓可能因调仓或数据变化掉出池子，禁卖会把持仓卡死。
 
     做法是造一个「先在内、后在外」的标的：合成规则表登记 ``sh600243`` 自 **2025-04-01**
     起为 ST。于是 3 月底买入时它在池内，4 月起被排除——此时卖出仍须成交。
@@ -236,7 +236,7 @@ def test_a_sell_outside_the_universe_is_still_allowed(make_market, synthetic_rul
     assert len(sells) == 1, "池外卖出被拦了——持仓会被卡死"
 
 
-# --- 最大持仓数与仓位分配 -----------------------------------------------------
+# --- 最大持仓数与持仓分配 -----------------------------------------------------
 
 
 def test_max_positions_caps_the_number_of_held_symbols(make_market, zero_cost_rules):
@@ -344,8 +344,8 @@ def test_golden_case_of_a_three_symbol_portfolio(make_market, zero_cost_rules):
     - ``sz000002`` 价格恒 30.0，**缺第 2 根**（停牌）；它因此不能在第 2 个 tick 成交
     - 期初 100000，最大持仓数 3，等权分配（默认 sizer）
 
-    手算依据是默认 sizer 的**成文口径**：``可用资金 ÷ 剩余仓位 ÷ 价格``，向下取整。
-    三个买单在同一 tick 提交，故各自看到「已持 0 只、剩 3 个仓位、可用资金 100000」：
+    手算依据是默认 sizer 的**成文口径**：``可用资金 ÷ 剩余持仓名额 ÷ 价格``，向下取整。
+    三个买单在同一 tick 提交，故各自看到「已持 0 只、剩 3 个名额、可用资金 100000」：
 
     - ``100000 ÷ 3 ÷ 10 = 3333``（sh600000）
     - ``100000 ÷ 3 ÷ 20 = 1666``（sz000001）
