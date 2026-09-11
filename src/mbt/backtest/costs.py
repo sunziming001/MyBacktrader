@@ -14,37 +14,9 @@
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal
-
 import backtrader as bt
 
-#: 价格的最小单位：分。
-_CENT = Decimal("0.01")
-
-#: 价比的容差。价格精确到分，此处仅为吸收 ``float`` 的表示误差，
-#: 不是模糊阈值——判「是否触限」不应有模糊地带。
-_PRICE_TOLERANCE = 1e-9
-
-
-def _same_price(a: float, b: float) -> bool:
-    """两个价格是否相等（容忍浮点表示误差）。"""
-    return abs(a - b) < _PRICE_TOLERANCE
-
-
-def _limit_price(prev_close: float, limit: float, direction: int) -> float:
-    """当日涨跌停价：前收盘价 × (1 + 限幅 × 方向)，四舍五入到分。
-
-    必须用**十进制**半进位，不能用内建 ``round()``：``round`` 走二进制浮点，
-    在恰好半分处会少一分——前收 14.45 的跌停价应是 13.01，``round`` 给 13.00。
-
-    代价不只是数字难看：差一分就足以**漏判一字板**，从而放过一笔现实中不可能
-    的成交，正是 ADR-0002 要防的虚假信心。实测（见
-    ``docs/research/tdx-halt-and-limit-representation.md``）：本机 16 只主板
-    股票中两种算法给出不同限价的有 1,916 天（约 4.4%）；而在两者会分歧、且
-    当日确实触及限价的 38 个交易日里，市场**全部**落在十进制半进位一侧，无一例外。
-    """
-    price = Decimal(str(prev_close)) * (Decimal(1) + Decimal(str(limit)) * direction)
-    return float(price.quantize(_CENT, rounding=ROUND_HALF_UP))
+from mbt.rules import limit_price, same_price
 
 
 class AStockCommissionInfo(bt.CommissionInfo):
@@ -240,5 +212,5 @@ class AStockBroker(bt.brokers.BackBroker):
         limit = self.p.rules.limit_for(symbol, data.datetime.date(0))
 
         if order.isbuy():
-            return _same_price(close, _limit_price(prev_close, limit, 1))
-        return _same_price(close, _limit_price(prev_close, limit, -1))
+            return same_price(close, limit_price(prev_close, limit, 1))
+        return same_price(close, limit_price(prev_close, limit, -1))

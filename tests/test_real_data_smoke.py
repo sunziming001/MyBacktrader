@@ -16,7 +16,7 @@ import pandas as pd
 import pytest
 
 from mbt.backtest import run_backtest
-from mbt.data import GbbqDataSource, TdxDataSource, backward_adjusted
+from mbt.data import GbbqDataSource, TdxDataSource, backward_adjusted, find_anomalies
 from mbt.data.tdx import DAY_RECORD_SIZE
 
 DEFAULT_ROOT = Path(r"D:\Tools\tdx\vipdoc")
@@ -110,3 +110,42 @@ def test_real_backward_adjusted_removes_the_ex_date_gap(real_root, real_gbbq):
     assert abs(raw_gap) > 0.04, "原始价在除权日应有明显跳空，否则这条测试无从判别"
     assert abs(hfq_gap) < 0.01, f"后复权后不应有 {hfq_gap:.2%} 的跳空"
     assert adjusted["close"].iloc[0] == prices["close"].iloc[0]
+
+
+def test_real_ratio_over_the_limit_but_at_the_band_is_not_an_anomaly(real_root, limit_rules):
+    """``sh600004`` 2015-07-09：11.26 → 12.39 是 **+10.04%**，但 12.39 正是涨停价。
+
+    这是「判异常必须比限价、不能比比率」在真实数据上的直接证据（研究结论五）：
+    ``11.26 × 1.1 = 12.386`` 进位到 12.39，比率必然略超名义限幅。
+    """
+    from mbt.rules import RuleTable, limit_price
+
+    prices = TdxDataSource(real_root).daily("sh600004")
+    on = pd.Timestamp("2015-07-09")
+    if on not in prices.index:
+        pytest.skip("本机行情未覆盖 2015-07-09")
+
+    prev_close = prices["close"].loc[:on].iloc[-2]
+    assert limit_price(prev_close, 0.10, +1) == prices["close"].loc[on], "该日收在涨停价上"
+    assert prices["close"].loc[on] / prev_close - 1 > 0.10, "比率确实略超 10%"
+
+    rules = RuleTable.load(limit_rules)
+    assert [a for a in find_anomalies(prices, "sh600004", rules) if a.date == on.date()] == []
+
+
+def test_real_ex_date_gap_needs_the_event_to_be_explained(real_root, real_gbbq, limit_rules):
+    """``sh600000`` 的除权跳空：有权息信息时不报，没有时就是坏数据。
+
+    这条锁死的是本模块的核心归因——**公司行为把「越界跳空」解释掉**，而不是见到
+    任何超限就报错。``without events: 2`` 也说明若不做归因，真实数据会被误报。
+    """
+    from mbt.rules import RuleTable
+
+    prices = TdxDataSource(real_root).daily("sh600000")
+    events = GbbqDataSource(real_gbbq).events("sh600000")
+    rules = RuleTable.load(limit_rules)
+
+    assert find_anomalies(prices, "sh600000", rules, events) == []
+    without_events = find_anomalies(prices, "sh600000", rules)
+    assert len(without_events) == 2
+    assert all(a.kind == "unexplained" for a in without_events)

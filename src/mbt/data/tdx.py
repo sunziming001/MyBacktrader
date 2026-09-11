@@ -100,8 +100,9 @@ class TdxDataSource:
     def _reject_anomalies(records: np.ndarray) -> None:
         """异常值检查：价格为 0、K 线不自洽。
 
-        涨跌幅是否超出当日制度上限同样属于异常，但判定它需要按日期与板块查表，
-        属制度规则表的职责（票据 03），不在此处实现。
+        涨跌幅是否越过当日制度上限同样属于异常，但判定它需要按日期与板块查表、还要
+        权息事件来解释除权跳空，故不在此处——见 :mod:`mbt.data.anomaly`，以及把三者
+        组合起来并强制检查的 :func:`mbt.data.load_market_data`。
         """
         open_ = records["open"].astype("int64")
         high = records["high"].astype("int64")
