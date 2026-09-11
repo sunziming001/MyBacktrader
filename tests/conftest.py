@@ -121,3 +121,18 @@ def make_source(tmp_path, day_bytes):
         return root
 
     return _make
+
+
+@pytest.fixture
+def wide():
+    """工厂：由 ``{标的: 序列}`` 构造信号层的宽表输入（``日期 × 标的``）。
+
+    缺失值请显式写成 ``float("nan")``——本工厂**不填充**，也不接受 ``None``：
+    信号层把缺失当正常状态处理，填充会在测试里先把这条纪律破坏掉。
+    """
+
+    def _make(values, start="2024-01-02"):
+        idx = pd.bdate_range(start, periods=len(next(iter(values.values()))))
+        return pd.DataFrame(values, index=idx)
+
+    return _make
