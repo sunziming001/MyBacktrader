@@ -1,0 +1,254 @@
+"""选股规则：过滤器 + 排序 + 取前 N（票据 #7，AC 1–3、5）。
+
+`CONTEXT.md` 里**选股规则**是「过滤器 + 排序 + 取前 N 的组合，产出一个候选标的集。它回答
+『今天买哪些』，不回答『买多少』」。本模块就是那句定义。
+
+## 三个部件都是「面板 → 标的宽表」的纯函数
+
+取**行情面板**（ADR-0009）而不取单字段的标的宽表，是因为必须同时容纳两类部件：多数过滤
+信号只吃一个字段（``new_high``），而 ``atr`` 一行内要用 high/low/close。面板是唯一能统一
+两者的输入形状，也让回测侧（手上有 ``MarketData``）与独立选股侧走同一条路径。
+
+代价是单字段信号要写成 ``lambda panel: new_high(panel["close"], n)``——略啰嗦，但显式，比再
+引一层「按字段分派」的机制便宜。
+
+## 整体是因果的，故可**一次算完**
+
+选股只在**一行之内**比较（排序取前 N 不跨行），而信号本身只回看。故「整张帧一次性算出」
+与「逐日以当日为评估日各算一次」结果必然相同——这条性质有测试钉住（截断重算不变性，
+见 ``tests/test_screen.py``）。因此引擎与调用方都可以算一次、按日期取行，不必逐 tick 重跑。
+
+## 候选集是 boolean 标的宽表
+
+与**股票池**同形（ADR-0001 的「行 = 截面」）。回测侧只要把它当闸门，与股票池是同一套机制；
+CLI 取某一行即成清单。故**一种形状，两个消费方向**。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import pandas as pd
+
+from mbt.data.panel import Panel
+
+#: 组面板时提供给选股规则的字段。刻意**不含** ``amount``：它与信号无关，没有理由被带进
+#: 计算（ADR-0009 的「字段显式声明」）。这是一份**固定声明**的集合，不是从数据里推断的。
+SCREEN_FIELDS = ("open", "high", "low", "close", "volume")
+
+#: 过滤器与排序因子的共同签名：**行情面板进、标的宽表出**。
+#:
+#: 刻意不叫 ``Signal``——`CONTEXT.md` 里「信号」是**过滤信号**与**排序因子**各自 `_Avoid_`
+#: 列出的简称，用它当类型名会让两种部件在代码里混为一谈。
+FrameTransform = Callable[[Panel], pd.DataFrame]
+
+
+@dataclass(frozen=True)
+class Screen:
+    """一条选股规则：过滤器 + 排序 + 取前 N。
+
+    三个部件**都可独立配置**（AC 1）：
+
+    - ``filters``：若干个过滤信号，以 **AND** 组合。空元组表示「不过滤」。
+    - ``factor``：排序因子，按信号层契约**越大越靠前**。``None`` 表示不排序。
+    - ``top_n``：只取前 N 名。``None`` 表示不截断。
+
+    **不提供反转方向的开关**：因子一律「越大越靠前」，这是信号层的既定契约（``distance_to_high``
+    特意定义成「接近程度」而非「回撤幅度」，就是为了让所有因子同向）。给一个反转开关会让那条
+    约定形同虚设，于是每个因子又得各自交代方向。要反向就在因子层写一个新因子。
+
+    **不管持仓**：规则回答「今天买哪些」，不回答「买多少」，也不知道你已经持有什么——
+    「重复的要不要跳过」归策略与引擎（``max_positions``、sizer）。持仓是路径依赖的运行时
+    状态，而规则按定义是纯函数。
+    """
+
+    filters: tuple[FrameTransform, ...] = ()
+    factor: FrameTransform | None = None
+    top_n: int | None = None
+
+    def apply(
+        self,
+        panel: Panel,
+        *,
+        as_of: dt.date | dt.datetime | str | None = None,
+        universe_mask: pd.DataFrame | None = None,
+    ) -> ScreenResult:
+        """算出整张候选集。
+
+        参数:
+            panel: 行情面板，须含 :data:`SCREEN_FIELDS` 里的字段。
+            as_of: 评估日。给了就只算到该日为止（**该日之后的记录一律不使用**，ADR-0006）；
+                省略则算到数据末端。该日必须是交易日，否则报错——「12 月 31 日的选股结果」
+                实际由别的某一天算出，是静默失真。
+            universe_mask: **股票池**掩码（boolean 标的宽表）。给了就与选股结果取交集，
+                故股票池规则在选股时同样生效（AC 4）。规则**自己不建池**：建池要碰行情、
+                准入规则与规则表，那会把这层从纯函数变成碰数据的函数，而 ``build_universe``
+                只有一个实现，重复一次必然漂移。
+
+        返回:
+            :class:`ScreenResult`。
+
+        抛:
+            ValueError: 组合不成立（给了 ``top_n`` 却没给 ``factor``、或 ``top_n < 1``）、
+                ``as_of`` 不是交易日、某个部件返回的形状与面板不一致、或部件返回的类型不对。
+                这些都在**这里**校验而非构造时，因为 dataclass 是公开可直接构造的，而它的
+                合法性取决于运行时拿到的面板。
+        """
+        if self.top_n is not None and self.factor is None:
+            raise ValueError(
+                "给了 top_n 就必须有排序因子：没有排序就无从谈「前 N 名」。"
+                "要按代码顺序取前 N 请显式给一个因子，不要指望默认顺序。"
+            )
+        if self.top_n is not None and self.top_n < 1:
+            raise ValueError(f"top_n 至少为 1，收到 {self.top_n}")
+
+        working = _truncate(panel, as_of)
+        index, columns = _shape_of(working)
+
+        selected = pd.DataFrame(True, index=index, columns=columns)
+        for i, one_filter in enumerate(self.filters):
+            out = _validate(one_filter(working), index, columns, f"第 {i + 1} 个过滤器")
+            if out.dtypes.map(lambda dtype: dtype.kind != "b").any():
+                raise ValueError(
+                    f"第 {i + 1} 个过滤器返回的不是布尔值——过滤信号回答「合格与否」，"
+                    f"是/否才是它的语义。若你要的是连续数值，那是**排序因子**。"
+                )
+            selected &= out
+
+        scores = pd.DataFrame()
+        if self.factor is not None:
+            scores = _validate(self.factor(working), index, columns, "排序因子")
+            if scores.dtypes.map(lambda dtype: dtype.kind != "f").any():
+                raise ValueError(
+                    "排序因子返回的不是浮点数——因子要能横向比较大小，布尔答不了「谁更靠前」。"
+                )
+            # 因子缺失即排除：排序未知的标的不参与取前 N，也不该因为「不知道」而被当成合格。
+            # 与过滤器「缺失取 False」同一精神。
+            selected &= scores.notna()
+
+        if universe_mask is not None:
+            selected &= _align(universe_mask, index, columns, "股票池掩码")
+
+        if self.top_n is not None:
+            selected = _keep_top(selected, scores, self.top_n)
+
+        return ScreenResult(selected=selected, scores=scores)
+
+
+@dataclass(frozen=True)
+class ScreenResult:
+    """选股结果。
+
+    属性:
+        selected: boolean 标的宽表，True 即当日选中。它是**候选集**，也是回测的入场闸门。
+        scores: 排序因子的数值，形状同上；无因子时是空帧。缺失处以缺失值表示
+            （被排除的标的其数值仍在，但 ``selected`` 已为 False）。
+    """
+
+    selected: pd.DataFrame
+    scores: pd.DataFrame
+
+    def candidates(self, on: dt.date | dt.datetime | str) -> list[str]:
+        """指定评估日选中的标的，**从优到劣**排列。
+
+        顺序即排名，故它同时回答「买哪些」与「谁更靠前」。没有因子时按代码升序。
+
+        抛:
+            ValueError: 该日不是交易日（数据里没有这一行）。**不向前取最近的交易日**——
+            那会让「这一天的结果」实际是别的某一天算出来的，而且是静默的。注意它与
+            「那天选出了空集」是两件事：后者是合法产物。
+        """
+        stamp = _timestamp(on, "评估日")
+        row = _row(self.selected, stamp, "选股结果")
+        picked = [symbol for symbol in row.index if bool(row[symbol])]
+
+        if self.scores.empty:
+            return sorted(picked)
+
+        scores = _row(self.scores, stamp, "因子值")
+        ranked = sorted(picked, key=lambda symbol: (-scores[symbol], symbol))
+        return ranked
+
+
+def _truncate(panel: Panel, as_of) -> Panel:
+    """把面板截到评估日（含当日）——**时点正确性的落点**（AC 5，ADR-0006）。"""
+    if as_of is None:
+        return panel
+
+    stamp = _timestamp(as_of, "评估日")
+    reference = _shape_of(panel)[0]
+    if stamp not in reference:
+        raise ValueError(
+            f"评估日 {stamp.date()} 不是交易日（不在数据的日期索引里）。"
+            f"不替你取最近的交易日——那会让这一天的结果实际由别的某一天算出，而且是静默的。"
+        )
+    return Panel({name: frame.loc[:stamp] for name, frame in panel.fields.items()})
+
+
+def _shape_of(panel: Panel) -> tuple[pd.Index, pd.Index]:
+    frame = next(iter(panel.fields.values()))
+    return frame.index, frame.columns
+
+
+def _validate(out, index, columns, label: str) -> pd.DataFrame:
+    """部件返回的必须是与面板**逐格对应**的标的宽表，并归一成面板的列序。
+
+    形状不对齐若不拦，`&` 会静默按列名对齐、缺的补缺失值——得到一张看着正常的结果表
+    （ADR-0009 记的正是这类静默错答）。
+
+    校验的是**标签集合**而非标签顺序：顺序不影响任何计算结果（``&`` 按标签对齐），把它也
+    当错会造成一类莫名其妙的拒绝。归一成面板的列序则让下游的比较与输出稳定可复现。
+    """
+    if not isinstance(out, pd.DataFrame):
+        raise ValueError(f"{label}必须返回 DataFrame（标的宽表），收到 {type(out).__name__}")
+    if not _same_labels(out.index, index) or not _same_labels(out.columns, columns):
+        raise ValueError(
+            f"{label}的日期与标的必须与面板一致："
+            f"面板是 {len(index)} 行 × {len(columns)} 列，而它给了 "
+            f"{len(out.index)} 行 × {len(out.columns)} 列（或标签不同）。"
+            f"选股只在同一行内比较，形状错位会静默错答。"
+        )
+    return out.reindex(index=index, columns=columns)
+
+
+def _same_labels(left: pd.Index, right: pd.Index) -> bool:
+    """两个索引是否装着同一批标签（忽略顺序）。"""
+    return left.is_unique and right.is_unique and set(left) == set(right)
+
+
+def _align(mask, index, columns, label: str) -> pd.DataFrame:
+    """校验并归一掩码，再取布尔——复用 :func:`_validate` 的那一套形状校验，免得两处漂移。"""
+    return _validate(mask, index, columns, label).astype(bool)
+
+
+def _keep_top(selected: pd.DataFrame, scores: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    """每行只留因子值最大的前 ``top_n`` 个（在**已通过过滤**的标的之间比较）。
+
+    先把未通过过滤者的因子值抹成缺失再排名，否则一个「分数很高但被过滤掉」的标的会占掉
+    名次，把本该入选的挤出去。
+
+    列先按**代码升序**排再排名，于是 ``method="first"`` 的同分处理恰好等于「同分按代码升序
+    打破平局」——这可复现，否则同一天两次运行可能给出不同清单。
+    """
+    by_symbol = sorted(selected.columns)
+    masked = scores.loc[:, by_symbol].where(selected.loc[:, by_symbol])
+    rank = masked.rank(axis=1, ascending=False, method="first")
+    kept = selected.loc[:, by_symbol] & (rank <= top_n)
+    return kept.reindex(columns=selected.columns)
+
+
+def _timestamp(value, label: str) -> pd.Timestamp:
+    """把日期归一成 ``Timestamp``；解析不了就报错并说明**是哪一个日期**（评估日常有多个来源）。"""
+    try:
+        stamp = pd.Timestamp(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{label}无法解析为日期：{value!r}") from exc
+    return stamp.tz_localize(None) if stamp.tz is not None else stamp
+
+
+def _row(frame: pd.DataFrame, stamp: pd.Timestamp, label: str) -> pd.Series:
+    if stamp not in frame.index:
+        raise ValueError(f"{label}里没有 {stamp.date()} 这一行——它不是交易日，或不在数据范围内")
+    return frame.loc[stamp]
