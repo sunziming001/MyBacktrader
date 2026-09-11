@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 临时草稿与调研工作区（不属于仓库内容）
+.scratch/
