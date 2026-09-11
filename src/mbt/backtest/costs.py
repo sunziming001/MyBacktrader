@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import backtrader as bt
+import pandas as pd
 
 from mbt.rules import limit_price, same_price
 
@@ -49,6 +50,12 @@ class AStockCommissionInfo(bt.CommissionInfo):
         """由 broker 在费用计算前调用，注入本次成交的标的与日期。"""
         self.symbol = symbol
         self.trade_date = on
+        # 非股票标的（指数、基金、可转债）没有板块，这里**报错而不兜底**：把股票那套
+        # 费率硬套上去会让成本悄悄算错（ADR-0002），而「不猜」是本项目在制度参数上的
+        # 一贯立场（见 `mbt.rules.board_of` 与 `_limit_locked`）。
+        #
+        # 后果是「对一个非股票标的下单」会在**计算仓位**时即失败——那正是应有的响亮
+        # 反应：这类标的本就不得按股票制度交易，股票池也会把它排除。
         self._board = self.p.rules.board_of(symbol) if symbol else None
 
     def _getcommission(self, size, price, pseudoexec):
@@ -81,20 +88,45 @@ class AStockCommissionInfo(bt.CommissionInfo):
 class AStockBroker(bt.brokers.BackBroker):
     """撮合侧的 A 股硬约束，以及把成交日与标的注入费用对象。
 
-    三条约束共用 ``_try_exec`` 这一个接入点，但**处置方式刻意不同**：
+    四条约束共用 ``_try_exec`` 这一个接入点，但**处置方式刻意不同**：
 
     - **涨跌停不可成交、当日无成交**：本日**不具备成交条件**，故保留挂单，
       引擎会自动把它挪到下一根 K 线再试（即用户选定的「挂单保留至下一可交易日」）。
     - **T+1**：本单在当日**不合法**，故 ``reject()`` 终结，不拖到次日。
+    - **股票池外买入**：资格问题不会因等待而消失，故 ``reject()`` 终结并留痕。
+      **卖出不受限**——持仓可能因调仓或数据变化掉出池子，禁卖会把仓位卡死。
+    - **长期无 K 线**：标的停牌超过 ``order_expiry_ticks`` 个交易日即 ``reject()``。
+      「保留至下一可交易日」在单标的下是「下一天」，停牌数月时就变成「另一笔交易」。
 
     区分依据是引擎的挂单循环：``_try_exec`` 返回后，订单若仍 ``alive()`` 就会被
     重新放回 pending 队列；被拒则不再存活。因此「不成交」只需什么都不做。
 
     ``getcommissioninfo`` 是本层唯一另一处接入点：它在每次费用计算前被调用，且
     调用时的当前 K 线就是成交所在的那根，于是成交日得以注入费用对象。
+
+    ## 为什么需要 ``tradability`` 掩码
+
+    单标的路径不需要它——停牌日**根本没有那一行**，引擎见不到它，``volume[0] == 0``
+    就够了。但**多标的场景下 backtrader 在停牌日返回的是上一根的陈旧 K 线**：
+    ``volume`` 看着完全正常，于是订单会按**陈旧价成交**。实测（8 根 K 线、B 缺 2 天）：
+    订单在 B 停牌当天按 20.0 成交了。那是「凭空造出一笔没有成交的成交」，正是 ADR-0002
+    要防的虚假信心，且它是**组合场景独有的**。
+
+    掩码是逐日的「当日具备成交条件」布尔表（有 K 线且成交量 > 0），故它能答出
+    ``data`` 自己答不了的问题：**今天这根到底是新的还是陈旧的**。
     """
 
-    params = (("rules", None),)
+    params = (
+        ("rules", None),
+        #: boolean 标的宽表：当日具备成交条件（有 K 线且量 > 0）。多标的场景必填。
+        ("tradability", None),
+        #: boolean 标的宽表：股票池。给出时，池外标的的**买入**被拒、卖出不受限。
+        ("universe", None),
+        #: 标的连续多少个交易日无 K 线后，挂单失效。默认 5。
+        ("order_expiry_ticks", 5),
+        #: 最大持仓**标的数**。``None`` 表示不限。
+        ("max_positions", None),
+    )
 
     def __init__(self):
         super().__init__()
@@ -102,6 +134,31 @@ class AStockBroker(bt.brokers.BackBroker):
         self._bought_today: dict = {}
         #: order.ref → 已记入的累计成交股数，避免部分成交被重复计数。
         self._counted: dict = {}
+        #: order.ref → (最后计数的 tick 日期, 连续无 K 线天数)，用于挂单失效。
+        self._stale: dict = {}
+        #: 本 tick 的主时钟日期，由 :meth:`next` 缓存（见 :meth:`_today`）。
+        self._clock = None
+
+    def next(self):
+        # 主时钟每个 tick 只算一次：它要遍历全部标的，放进 _try_exec 会变成每个订单一次。
+        self._clock = self._compute_clock()
+        super().next()
+
+    @property
+    def tradability_mask(self):
+        """当日**是否具备成交条件**的布尔标的宽表（有 K 线且量 > 0）。
+
+        停牌日为 ``False``，而此时 ``data.close[0]`` 返回的是**陈旧价**。策略读价格做决策前
+        必须先查这张表，否则会基于几个月前的价格下单——那不会报错，只会让结论失真
+        （ADR-0006）。
+        """
+        return self.p.tradability
+
+    @property
+    def universe_mask(self):
+        """**股票池**的布尔标的宽表。撮合层已强制「池外不可买」，这张表供策略自查
+        （例如察觉自己的持仓已掉出池子）。"""
+        return self.p.universe
 
     # --- 费用：注入成交日与标的 ---
 
@@ -119,14 +176,76 @@ class AStockBroker(bt.brokers.BackBroker):
     def _try_exec(self, order):
         if order.issell() and not self._t1_allows(order):
             # T+1：当日买入的股份当日不可卖。交易所就是拒单，故不得留到次日。
-            order.reject()
-            self.notify(order)
-            return
+            return self._reject(order)
+
+        if order.isbuy() and self._mask_says(self.p.universe, order) is False:
+            # 股票池外买入：资格问题不会因等待而消失，故拒单而不是保留挂单。
+            return self._reject(order)
+
+        if order.isbuy() and self._at_position_limit(order):
+            # 已持满最大持仓数时，对**新标的**的买入被拒；对已有持仓加仓不受限，
+            # 因为那不会增加持仓的标的数。
+            return self._reject(order)
 
         if not self._tradeable_today(order):
             return  # 保留挂单：仍 alive 的订单会被引擎放回队列，下一根再试
 
         return super()._try_exec(order)
+
+    def _at_position_limit(self, order) -> bool:
+        """本笔买入是否会让持仓的**标的数**超过上限。"""
+        limit = self.p.max_positions
+        if limit is None:
+            return False
+        if self.positions[order.data].size:
+            return False  # 加仓，不增加标的数
+        held = sum(1 for position in self.positions.values() if position.size)
+        return held >= limit
+
+    def _reject(self, order):
+        order.reject()
+        self.notify(order)
+        # 订单已终结，它的计数没有留存价值；不清理会让这张表随回测长度无界增长。
+        self._stale.pop(order.ref, None)
+
+    def _clear_stale(self, order):
+        """标的重新有了 K 线——停牌的那一串中断了，计数随之归零。"""
+        self._stale.pop(order.ref, None)
+
+    def _today(self):
+        """引擎的**主时钟**日期，即当日真实的交易日。
+
+        不能用 ``data.datetime.date(0)``：标的停牌时它停在**上一根** K 线的日期，据此
+        查掩码会把停牌日误判为可交易。主时钟取各标的当前日期里的**最大者**——引擎把每个
+        标的推进到不超过时钟的位置，故有 K 线的标的其日期正是时钟，而停牌的那个落后，
+        最大值因此恰是时钟本身。
+        """
+        if self._clock is None:
+            self._clock = self._compute_clock()
+        return self._clock
+
+    def _compute_clock(self):
+        latest = None
+        for data in getattr(self.cerebro, "datas", ()):
+            if len(data) == 0:
+                continue  # 该标的尚未开始（首根 K 线晚于当前 tick）
+            current = data.datetime.date(0)
+            if latest is None or current > latest:
+                latest = current
+        return latest
+
+    def _mask_says(self, frame, order):
+        """查标的宽表掩码。返回 ``None`` 表示「无掩码，无从判断」。"""
+        symbol = getattr(order.data, "_mbt_symbol", None)
+        on = self._today()
+        if frame is None or symbol is None or on is None:
+            return None
+        if symbol not in frame.columns:
+            return False
+        stamp = pd.Timestamp(on)
+        if stamp not in frame.index:
+            return False
+        return bool(frame.at[stamp, symbol])
 
     def _execute(self, order, ago=None, price=None, cash=None, position=None, dtcoc=None):
         result = super()._execute(
@@ -176,14 +295,49 @@ class AStockBroker(bt.brokers.BackBroker):
         return abs(order.created.size) <= sellable
 
     def _tradeable_today(self, order):
-        """当日是否具备成交条件。缺规则表时只判「有无成交量」。"""
+        """当日是否具备成交条件，含「这根 K 线是不是今天的」。"""
         data = order.data
 
-        if data.volume[0] == 0:
+        if self.p.tradability is not None:
+            if self._mask_says(self.p.tradability, order) is not True:
+                # 当日无 K 线（停牌）或为零量。挂单可以再等，但等太久就作废——否则一笔单
+                # 会在停牌数月后的复牌日突然成交，那已不是原来那笔交易。
+                self._expire_if_stale(order)
+                return False
+            self._clear_stale(order)
+        elif len(self.cerebro.datas) > 1:
+            # 多标的却没给掩码：此时无从分辨 K 线是新的还是陈旧的，而那会造出按陈旧价
+            # 成交的订单。宁可报错也不静默放过。
+            raise RuntimeError(
+                "多标的回测必须提供 tradability 掩码：停牌日 backtrader 会返回上一根的"
+                "陈旧 K 线，没有掩码就会按陈旧价成交（凭空造出未发生的成交）。"
+                "请用 run_portfolio_backtest，它会自动构建掩码。"
+            )
+        elif data.volume[0] == 0:
             # 当日无成交。股票停牌是缺记录，但基金/债券会留下零量的平价 K 线。
             return False
 
         return not self._limit_locked(order)
+
+    def _expire_if_stale(self, order) -> bool:
+        """标的连续无 K 线达 ``order_expiry_ticks`` 天时拒单。返回是否已拒。
+
+        计数按**交易日**而非调用次数：``_try_exec`` 每个 tick 只会被调一次，但用日期
+        去重可以让计数不依赖引擎的调用节奏。
+        """
+        today = self._today()
+        last_date, days = self._stale.get(order.ref, (None, 0))
+        if today is not None and last_date == today:
+            return days >= self.p.order_expiry_ticks
+
+        days += 1
+        self._stale[order.ref] = (today, days)
+
+        # 「超过 N 个交易日」是**严格大于**：第 N 个无 K 线的交易日仍算在容忍期内。
+        if days > self.p.order_expiry_ticks:
+            self._reject(order)
+            return True
+        return False
 
     def _limit_locked(self, order):
         """本根 K 线是否是**挡住该订单方向**的一字板。

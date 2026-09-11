@@ -1,25 +1,40 @@
 """回测：把价格表交给引擎，取回净值曲线与成交明细。
 
 引擎被隔离在本模块之后（ADR-0007）：数据层与信号层不依赖 backtrader。
+
+两个入口，**同一条引擎路径**：
+
+- :func:`run_portfolio_backtest` —— 组合入口，收一组 :class:`~mbt.data.market.MarketData`，
+  多标的共享资金池，有最大持仓数与股票池约束。**新代码应当用它。**
+- :func:`run_backtest` —— 单标的入口，签名字面与历史一致，内部构造单元素序列后委派给
+  组合入口（最大持仓数为 1）。它**不改变既有行为**，故既有调用方与黄金值继续有效。
+
+两者的差别只有一处，见 :func:`run_backtest` 的说明（sizer 的默认值）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import backtrader as bt
 import pandas as pd
 
-from mbt.rules import RuleTable
+from mbt.data.market import MarketData
+from mbt.rules import SHIPPED_RULES_PATH, RuleTable
+from mbt.universe import UniverseRules, build_universe
 
 from .costs import AStockBroker, AStockCommissionInfo
+from .sizing import EqualWeightSizer
 
-#: 出厂规则表路径。每条数值都带出处，见该文件内的注释。
-DEFAULT_RULES_PATH = Path(__file__).resolve().parent.parent / "rules" / "a_share.toml"
+#: 出厂规则表路径。定义在规则层（``mbt.rules.SHIPPED_RULES_PATH``），此处转出以保持
+#: 既有引用可用；「出厂表在哪」只有那一处定义。
+DEFAULT_RULES_PATH = SHIPPED_RULES_PATH
 
 #: 成交明细的列。
 TRADE_COLUMNS = ("date", "size", "price", "value", "commission")
+
+#: 未成交而终结的订单的列。**留痕**用：挂单失效、拒单、保证金不足都要能事后查到。
+REJECT_COLUMNS = ("date", "symbol", "size", "status")
 
 
 @dataclass(frozen=True)
@@ -30,11 +45,14 @@ class BacktestResult:
         equity_curve: 净值曲线，交易日为索引、组合总资产为值。
         trades: 成交明细，每笔成交一行（买入为正、卖出为负）。
         final_value: 期末总资产。
+        rejected: **未成交而终结**的订单，每笔一行。挂单因停牌过久失效、因出池被拒、
+            因资金不足被拒都在这里——只交出成交明细等于让这些事件悄无声息地发生。
     """
 
     equity_curve: pd.Series
     trades: pd.DataFrame
     final_value: float
+    rejected: pd.DataFrame
 
 
 class _EquityRecorder(bt.Analyzer):
@@ -84,6 +102,181 @@ class _FillRecorder(bt.Analyzer):
         return pd.DataFrame(self._fills, columns=list(TRADE_COLUMNS))
 
 
+class _RejectionRecorder(bt.Analyzer):
+    """记录**未成交而终结**的订单。
+
+    挂单失效（停牌过久）在 AC 里要求「留痕」。只把成交明细交出去，失效就查不到了——
+    而「一笔单为什么没成交」恰恰是排查回测结果时最先要问的问题。
+    """
+
+    def start(self):
+        self._rows = []
+
+    def notify_order(self, order):
+        if order.status == order.Completed or order.alive():
+            return  # 成交的归成交明细；还活着的不算终结
+        self._rows.append(
+            dict(
+                zip(
+                    REJECT_COLUMNS,
+                    (
+                        self.datas[0].datetime.date(0),
+                        getattr(order.data, "_mbt_symbol", None),
+                        order.created.size,
+                        order.getstatusname(),
+                    ),
+                    strict=True,
+                )
+            )
+        )
+
+    def get_analysis(self):
+        return pd.DataFrame(self._rows, columns=list(REJECT_COLUMNS))
+
+
+def build_tradability(markets) -> pd.DataFrame:
+    """当日具备成交条件的布尔表（有 K 线且成交量 > 0）。
+
+    它答的是 ``data`` 自己答不了的问题：**今天这根 K 线是新的还是陈旧的**。停牌日
+    backtrader 会返回上一根的陈旧 K 线，其 ``volume`` 看着完全正常，故只看 ``data``
+    必然会把停牌日误判为可交易（实测确认，见 :class:`~mbt.backtest.costs.AStockBroker`）。
+
+    涨跌停**不**在这里：它按方向区分（涨停买不进但卖得出），故归撮合层判。
+    """
+    volumes = pd.DataFrame({market.symbol: market.prices["volume"] for market in markets})
+    closes = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    return (closes.notna() & (volumes > 0)).astype(bool)
+
+
+def run_portfolio_backtest(
+    markets,
+    strategy,
+    *,
+    cash=100_000.0,
+    max_positions=None,
+    rules=None,
+    universe_rules=None,
+    universe=True,
+    sizer=None,
+    sizer_options=None,
+    commission=0.0,
+    commission_min=0.0,
+    commission_mode=None,
+    slippage=0.0,
+    order_expiry_ticks=5,
+    **strategy_params,
+):
+    """对一组标的跑一次**组合**回测。
+
+    参数:
+        markets: 一组 :class:`~mbt.data.market.MarketData`。**必须已经过质检**
+            （走 :func:`mbt.data.load_market_data`），本函数不重复检查——它拿到的只是一组
+            价格表，无从判断跳空是公司行为还是坏数据（ADR-0005）。
+        strategy: ``backtrader.Strategy`` 的子类。
+        cash: 期初资金，全部标的**共享**这一个资金池。
+        max_positions: 最大持仓**标的数**。``None`` 表示不限。给出时由撮合层强制：
+            已持满时对**新标的**的买入被拒（对已有持仓加仓不受限）。
+        rules: 规则表，``RuleTable`` 或 TOML 路径。默认取出厂表。
+        universe_rules: 股票池的准入规则（:class:`~mbt.universe.UniverseRules`）。
+            ``None`` 时用出厂设定（排除次新股、纳入四个板块）。
+        universe: 是否施加股票池约束，默认 ``True``。**只有单标的入口会传 ``False``**，
+            理由见 :func:`run_backtest`——那不是给策略用的越池开关：组合回测里股票池
+            始终生效，撮合层强制池外不可买。要放宽条件请改 ``universe_rules``，
+            而不是关掉它。
+        sizer: 仓位分配，传一个 ``backtrader.Sizer`` **子类**（不是实例）。``None`` 时用
+            :class:`~mbt.backtest.sizing.EqualWeightSizer`（把剩余资金摊给剩余仓位）。
+            要沿用 backtrader 的默认（每次固定股数）请传 ``bt.sizers.FixedSize``。
+        sizer_options: 传给 ``sizer`` 的关键字参数。
+        commission: 手续费率。``commission_mode`` 的约定同 :func:`run_backtest`。
+        order_expiry_ticks: 标的连续多少个交易日无 K 线后挂单失效。
+
+    返回:
+        :class:`BacktestResult`。
+
+    ## 策略如何读到两张掩码
+
+    引擎把两张 boolean 标的宽表挂到 broker 上，策略可以随时查：
+
+    - ``self.broker.tradability_mask``：当日**是否具备成交条件**。停牌日为 ``False``，
+      而此时 ``self.dataX.close[0]`` 返回的是**陈旧价**——读价格做决策前必须先查它，
+      否则会基于几个月前的价格下单（见 ADR-0006）。
+    - ``self.broker.universe_mask``：当日**是否在股票池内**。撮合层已强制「池外不可买」，
+      这张表是给策略自己判断用的（例如察觉自己的持仓已掉出池子）。
+
+    示例::
+
+        def next(self):
+            today = self.data0.datetime.date(0)
+            for data in self.datas:
+                if not self.broker.tradability_mask.at[today, data._name]:
+                    continue          # 今天这根是陈旧的，不是新 K 线
+                ...
+    """
+    markets = list(markets)
+    if not markets:
+        raise ValueError("组合回测至少要有一个标的")
+
+    table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
+
+    universe_mask = None
+    if universe:
+        universe_mask = build_universe(markets, rules=universe_rules, rule_table=table)
+
+    tradability = build_tradability(markets)
+
+    cerebro = bt.Cerebro()
+    for market in markets:
+        # 复权在引擎内部做：组合场景下漏掉复权的代价是每个除权日一个假跳空，
+        # 比单标的更容易被忽略，故不让调用方记着这件事。
+        prices = market.backward_adjusted()
+        data = bt.feeds.PandasData(dataname=prices)
+        data._mbt_symbol = market.symbol
+        data._name = market.symbol
+        cerebro.adddata(data)
+
+    cerebro.addstrategy(strategy, **strategy_params)
+    if sizer is None:
+        cerebro.addsizer(EqualWeightSizer, max_positions=max_positions)
+    else:
+        cerebro.addsizer(sizer, **(sizer_options or {}))
+
+    broker = AStockBroker(
+        rules=table,
+        tradability=tradability,
+        universe=universe_mask,
+        max_positions=max_positions,
+        order_expiry_ticks=order_expiry_ticks,
+    )
+    broker.setcash(cash)
+    for market in markets:
+        broker.addcommissioninfo(
+            AStockCommissionInfo(
+                rules=table,
+                commission=commission,
+                commission_min=commission_min,
+                commission_mode=commission_mode or "all_in",
+            ),
+            name=market.symbol,
+        )
+    if slippage:
+        broker.set_slippage_perc(slippage)
+    cerebro.setbroker(broker)
+
+    cerebro.addanalyzer(_EquityRecorder, _name="equity")
+    cerebro.addanalyzer(_FillRecorder, _name="fills")
+    cerebro.addanalyzer(_RejectionRecorder, _name="rejections")
+
+    runs = cerebro.run()
+    run = runs[0]
+
+    return BacktestResult(
+        equity_curve=run.analyzers.equity.get_analysis(),
+        trades=run.analyzers.fills.get_analysis(),
+        final_value=cerebro.broker.getvalue(),
+        rejected=run.analyzers.rejections.get_analysis(),
+    )
+
+
 def run_backtest(
     prices,
     symbol,
@@ -96,11 +289,21 @@ def run_backtest(
     slippage=0.0,
     **strategy_params,
 ):
-    """对单一标的的价格表跑一次回测。
+    """对**单一标的**的价格表跑一次回测。
+
+    它是 :func:`run_portfolio_backtest` 的**退化情形**（最大持仓数为 1），不存在第二套
+    引擎路径。为了不改变既有行为，它有两处刻意的设定：
+
+    - ``sizer`` 保持 backtrader 的默认（每次 1 股）而非组合入口的等权分配——改变它会让
+      既有回测的期末资金全部改变，而那是既有黄金值的根基；
+    - ``universe=False``：单标的入口拿到的是一张价格表，其品种与准入资格无从判定，
+      故不施加股票池约束（撮合层的其他约束照常）。
+
+    要组合级行为请用 :func:`run_portfolio_backtest`。
 
     参数:
         prices: 交易日为索引、含 ``open`` / ``high`` / ``low`` / ``close`` / ``volume``
-            的价格表。**本函数不做数据质检**——它拿到的是一张表，无法判断跳空是公司
+            的**字段宽表**。**本函数不做数据质检**——它拿到的是一张表，无法判断跳空是公司
             行为还是坏数据。要一份已质检的行情，请走
             :func:`mbt.data.load_market_data`（ADR-0005）。传原始价则结果未复权；
             传 :meth:`mbt.data.MarketData.backward_adjusted` 的后复权价则已复权。
@@ -137,8 +340,6 @@ def run_backtest(
         - 股改复牌首日不设涨跌幅限制这类**历史制度空窗**不在规则表内，故 2005–2007
           年的数据做质检时可能误报（见 :mod:`mbt.data.anomaly` 的已知误报源）。
     """
-    table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules or DEFAULT_RULES_PATH)
-
     if commission and commission_mode is None:
         raise ValueError(
             "commission > 0 时必须指定 commission_mode："
@@ -149,37 +350,31 @@ def run_backtest(
     if commission_mode not in (None, "all_in", "net"):
         raise ValueError(f"commission_mode 只能是 'all_in' 或 'net'，收到 {commission_mode!r}")
 
-    cerebro = bt.Cerebro()
+    market = MarketData(symbol=symbol, prices=prices, events=())
 
-    data = bt.feeds.PandasData(dataname=prices)
-    data._mbt_symbol = symbol
-    data._name = symbol
-    cerebro.adddata(data)
-    cerebro.addstrategy(strategy, **strategy_params)
-
-    broker = AStockBroker(rules=table)
-    broker.setcash(cash)
-    broker.addcommissioninfo(
-        AStockCommissionInfo(
-            rules=table,
-            commission=commission,
-            commission_min=commission_min,
-            commission_mode=commission_mode or "all_in",
-        ),
-        name=symbol,
-    )
-    if slippage:
-        broker.set_slippage_perc(slippage)
-    cerebro.setbroker(broker)
-
-    cerebro.addanalyzer(_EquityRecorder, _name="equity")
-    cerebro.addanalyzer(_FillRecorder, _name="fills")
-
-    runs = cerebro.run()
-    run = runs[0]
-
-    return BacktestResult(
-        equity_curve=run.analyzers.equity.get_analysis(),
-        trades=run.analyzers.fills.get_analysis(),
-        final_value=cerebro.broker.getvalue(),
+    return run_portfolio_backtest(
+        [market],
+        strategy,
+        cash=cash,
+        max_positions=1,
+        rules=rules,
+        # 单标的入口**不施加股票池**：调用方已经显式点名了标的，没有「池」可言——
+        # 对着一个被点名的标的再判一次「它够不够格进池」会把「回测这一只」变成
+        # 「回测这一只，前提是它自己不反对」。
+        #
+        # 这不是给策略用的越池开关：组合入口的股票池始终由撮合层强制。而且它也不构成
+        # 新的漏洞——ST 判定本就依赖规则表登记期间，出厂表不登记，故不论走哪个入口都
+        # 判不出 ST（该局限已在 README 与 ADR-0002 显式登记）。
+        universe=False,
+        # 于是「上市多久」这类准入条件也不该在这一层被判定。
+        universe_rules=UniverseRules(min_bars=0),
+        # 单标的入口沿用 backtrader 的默认 sizer（每次 1 股），以保住既有黄金值。
+        # 组合入口的默认是等权分配，那是新行为，不去改既有回测的期末资金。
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 1},
+        commission=commission,
+        commission_min=commission_min,
+        commission_mode=commission_mode,
+        slippage=slippage,
+        **strategy_params,
     )

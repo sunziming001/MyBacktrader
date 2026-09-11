@@ -16,6 +16,10 @@ import tomli
 from .board import board_of
 from .errors import RuleTableError
 
+#: 出厂规则表路径。与本模块同目录，故「出厂表在哪」只有这一处定义
+#: （数据层入口、回测入口与测试都经由 :meth:`RuleTable.load` 取用）。
+SHIPPED_RULES_PATH = Path(__file__).resolve().parent / "a_share.toml"
+
 #: 过户费的收取方向取值。
 _FEE_SIDES = ("both", "buy", "sell", "none")
 
@@ -107,9 +111,13 @@ class RuleTable:
             )
 
     @classmethod
-    def load(cls, path) -> RuleTable:
-        """从 TOML 文件加载规则表。"""
-        path = Path(path)
+    def load(cls, path=None) -> RuleTable:
+        """从 TOML 文件加载规则表。``path`` 省略或为 ``None`` 时取出厂表。
+
+        出厂表与本模块同目录，故它的位置只有这一处定义——调用方（数据层入口、回测入口、
+        测试）都不必各自拼一次路径，也就不会各自拼错。
+        """
+        path = SHIPPED_RULES_PATH if path is None else Path(path)
         if not path.is_file():
             raise RuleTableError(f"规则表文件不存在：{path}")
         try:
@@ -135,6 +143,14 @@ class RuleTable:
             if start <= on and (end is None or on <= end):
                 return True
         return False
+
+    def has_st_period(self, symbol: str) -> bool:
+        """该标的在规则表里是否**登记过** ST 期间。
+
+        供股票池先做一次廉价的筛除，免得对四千多个标的逐日查 ST。把这件事放在规则表自己
+        身上，是因为「登记了什么」是它的内部状态——让调用方去摸它的私有字段会让两者绑死。
+        """
+        return bool(self._st_periods.get(symbol))
 
     def limit_for(self, symbol: str, on: dt.date) -> float:
         """标的在成交日的**涨跌幅限制**，已按需叠加 ST 覆盖。

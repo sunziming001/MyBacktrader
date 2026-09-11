@@ -167,3 +167,36 @@ def panel(symbol_frame):
         return Panel({name: symbol_frame(values) for name, values in fields.items()})
 
     return _make
+
+
+@pytest.fixture
+def make_vipdoc(tmp_path):
+    """工厂：在临时目录搭一个含多个标的、跨市场的 ``vipdoc`` 根，返回其根路径。
+
+    ``extra_files`` 用于摆上不该被当成标的的杂项文件（如说明文件、非 ``.day`` 后缀）。
+    """
+
+    def _make(symbols, extra_files=(), start="2024-01-02", periods=3):
+        root = tmp_path / "vipdoc"
+        closes = [10.0 + i for i in range(periods)]
+        for symbol in symbols:
+            target = root / symbol[:2] / "lday"
+            target.mkdir(parents=True, exist_ok=True)
+            frame = pd.DataFrame(
+                {
+                    "open": closes,
+                    "high": closes,
+                    "low": closes,
+                    "close": closes,
+                    "volume": [1000] * periods,
+                },
+                index=pd.bdate_range(start, periods=periods),
+            )
+            frame.to_csv(target / f"{symbol}.day", index=False)
+        for relative in extra_files:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("not a symbol", encoding="utf-8")
+        return root
+
+    return _make

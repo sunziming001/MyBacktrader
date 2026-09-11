@@ -98,3 +98,58 @@ def test_one_fixture_spans_a_limit_regime_change(fixture_root):
 
     assert pd.Timestamp("2025-04-22") not in df.index
     assert len(df) == 30
+
+
+# --- 扫描标的名单（票据 #6） ---------------------------------------------------
+
+
+def test_symbols_lists_every_market_and_is_sorted(make_vipdoc):
+    """按三个市场目录汇总标的，**排序**返回——顺序稳定，测试与批处理才可复现。"""
+    root = make_vipdoc(["sz000001", "sh600000", "bj920819", "sh688981"])
+
+    got = TdxDataSource(root).symbols()
+
+    assert got == ["bj920819", "sh600000", "sh688981", "sz000001"]
+
+
+def test_symbols_ignores_files_that_are_not_day_files(make_vipdoc):
+    """只认 ``.day``。目录里混着说明文件或备份时不该把它们当成标的。"""
+    root = make_vipdoc(
+        ["sh600000"],
+        extra_files=["sh/lday/readme.txt", "sh/lday/sh600000.day.bak", "sh/lday/notes.md"],
+    )
+
+    assert TdxDataSource(root).symbols() == ["sh600000"]
+
+
+def test_symbols_tolerates_a_missing_market_directory(make_vipdoc):
+    """没有任何北交所数据时不该报错——本机只装了沪深数据是完全正常的情形。"""
+    root = make_vipdoc(["sh600000", "sz000001"])
+
+    assert TdxDataSource(root).symbols() == ["sh600000", "sz000001"]
+
+
+def test_symbols_does_not_filter_by_instrument_type(make_vipdoc):
+    """扫描**不做品种过滤**——那是股票池的职责。
+
+    指数、可转债、基金的代码照样返回。若在这里过滤，调用方就无从知道「目录里到底
+    有什么」，也无法把「被排除的原因」讲清楚。
+    """
+    root = make_vipdoc(["sh600000", "sh000001", "sh510300", "sh110043"])
+
+    got = TdxDataSource(root).symbols()
+
+    assert got == ["sh000001", "sh110043", "sh510300", "sh600000"]
+
+
+def test_symbols_returns_dirty_names_rather_than_silently_dropping_them(make_vipdoc):
+    """文件名不合法时照原样返回，让它在品种判定那里归入「其他」而被排除。
+
+    静默丢弃会让你无从分辨「目录里没有这个文件」与「文件在但被略过了」——前者是数据
+    状况，后者要实现替你判断，而判断错了就是少收标的。
+    """
+    root = make_vipdoc(["sh600000"], extra_files=["sh/lday/weird.name.day"])
+
+    got = TdxDataSource(root).symbols()
+
+    assert got == ["sh600000", "weird.name"]
