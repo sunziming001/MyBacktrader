@@ -92,6 +92,7 @@ def run_backtest(
     rules=None,
     commission=0.0,
     commission_min=0.0,
+    commission_mode=None,
     slippage=0.0,
     **strategy_params,
 ):
@@ -109,6 +110,13 @@ def run_backtest(
             ``docs/research/a-share-trading-rules.md``）。
         commission: 手续费率（券商约定，如 0.0003）。
         commission_min: 单笔最低手续费。
+        commission_mode: 该费率的口径，``commission > 0`` 时**必填**：
+
+            - ``"all_in"``：券商「全佣」，费率**已含**经手费与证管费，不再叠加。
+            - ``"net"``：券商「净佣」，费率**未含**，按成交日另行叠加经手费与证管费。
+
+            不设默认值是刻意的：两种口径算出的成本不同（2026 年后单边差约 0.0054%），
+            替你猜就会静默高估或低估成本。``commission == 0`` 时不起作用，可省略。
         slippage: 滑点比例，成交价按此劣化。
 
     .. warning::
@@ -125,10 +133,22 @@ def run_backtest(
         - **ST 限幅实际选不中**：出厂表不登记任何 ST 期间，故一律按非 ST 取限幅。
           本地数据不含股票名称，无法回溯历史 ST 状态，故主板 ST 的 5%（2026-07-06
           起为 10%）等规则在 ST 期间数据源到位前不会生效。
+        - 少数成本项未建模（证券结算风险基金、大宗交易费率下浮），方向同为偏乐观，
+          但量级远小于已建模的各项。见 README 的风险清单。
 
         未复权意味着除权跳空会原样进入回测，收益结论仍偏乐观。
     """
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules or DEFAULT_RULES_PATH)
+
+    if commission and commission_mode is None:
+        raise ValueError(
+            "commission > 0 时必须指定 commission_mode："
+            "'all_in'（券商「全佣」，费率已含经手费与证管费）或 "
+            "'net'（券商「净佣」，需另行叠加）。"
+            "两种口径的成本不同，替你猜会静默算错。"
+        )
+    if commission_mode not in (None, "all_in", "net"):
+        raise ValueError(f"commission_mode 只能是 'all_in' 或 'net'，收到 {commission_mode!r}")
 
     cerebro = bt.Cerebro()
 
@@ -141,7 +161,12 @@ def run_backtest(
     broker = AStockBroker(rules=table)
     broker.setcash(cash)
     broker.addcommissioninfo(
-        AStockCommissionInfo(rules=table, commission=commission, commission_min=commission_min),
+        AStockCommissionInfo(
+            rules=table,
+            commission=commission,
+            commission_min=commission_min,
+            commission_mode=commission_mode or "all_in",
+        ),
         name=symbol,
     )
     if slippage:

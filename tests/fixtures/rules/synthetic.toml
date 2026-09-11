@@ -117,3 +117,25 @@ board = "深主板"
 effective_from = 2022-04-29
 rate = 0.00001
 sides = "both"
+
+# 经手费与证管费：**总是发生**，但是否叠加取决于 commission_mode。
+# 数值同样是编造的，只为验证「net 口径会叠加、all_in 不会」这一分支。
+[[handling_fee]]
+board = "沪主板"
+effective_from = 2015-01-01
+rate = 0.00005
+
+[[handling_fee]]
+board = "深主板"
+effective_from = 2015-01-01
+rate = 0.00005
+
+[[regulatory_fee]]
+board = "沪主板"
+effective_from = 2015-01-01
+rate = 0.00002
+
+[[regulatory_fee]]
+board = "深主板"
+effective_from = 2015-01-01
+rate = 0.00002

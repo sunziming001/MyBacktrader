@@ -55,6 +55,8 @@ class RuleTable:
         self._st_price_limit = {}
         self._transfer_fee = {}
         self._transfer_fee_sides = {}
+        self._handling_fee = {}
+        self._regulatory_fee = {}
 
         for entry in raw.get("price_limit", []):
             self._price_limit.setdefault(entry["board"], []).append(entry)
@@ -69,6 +71,11 @@ class RuleTable:
             self._transfer_fee.setdefault(entry["board"], []).append(entry)
             self._transfer_fee_sides.setdefault(entry["board"], []).append(entry)
 
+        for entry in raw.get("handling_fee", []):
+            self._handling_fee.setdefault(entry["board"], []).append(entry)
+        for entry in raw.get("regulatory_fee", []):
+            self._regulatory_fee.setdefault(entry["board"], []).append(entry)
+
         self._price_limit = {
             k: _Series(v, "limit", f"{k} 的涨跌幅限制") for k, v in self._price_limit.items()
         }
@@ -81,6 +88,13 @@ class RuleTable:
         self._transfer_fee_sides = {
             k: _Series(v, "sides", f"{k} 的过户费收取方向")
             for k, v in self._transfer_fee_sides.items()
+        }
+
+        self._handling_fee = {
+            k: _Series(v, "rate", f"{k} 的经手费") for k, v in self._handling_fee.items()
+        }
+        self._regulatory_fee = {
+            k: _Series(v, "rate", f"{k} 的证管费") for k, v in self._regulatory_fee.items()
         }
 
         self._stamp_duty = _Series(raw.get("stamp_duty", []), "sell_rate", "印花税")
@@ -154,6 +168,21 @@ class RuleTable:
     def transfer_fee_sides(self, board: str, on: dt.date) -> str:
         """某板块在成交日的过户费**收取方向**：``both`` / ``buy`` / ``sell`` / ``none``。"""
         return self._series(self._transfer_fee_sides, board, on, f"板块 {board!r}")
+
+    def handling_fee_rate(self, board: str, on: dt.date) -> float:
+        """某板块在成交日的**经手费**费率，按成交金额计、买卖双向。
+
+        经手费由交易所收取，**总是发生**。它是否与 ``commission`` 重复，取决于用户的报价
+        口径（「全佣」已含、「净佣」未含），故由调用方决定是否叠加。
+        """
+        return self._series(self._handling_fee, board, on, f"板块 {board!r}")
+
+    def regulatory_fee_rate(self, board: str, on: dt.date) -> float:
+        """某板块在成交日的**证管费**费率，按成交金额计、买卖双向。
+
+        与 :meth:`handling_fee_rate` 同理：总是发生，是否叠加取决于佣金口径。
+        """
+        return self._series(self._regulatory_fee, board, on, f"板块 {board!r}")
 
     @staticmethod
     def _series(series: dict, board: str, on: dt.date, key_desc: str):

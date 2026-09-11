@@ -187,3 +187,49 @@ def test_shanghai_transfer_fee_before_2015_08_01_is_not_covered(table):
 
     # 深市同期是按成交金额计的，故有据可查、可以给出
     assert table.transfer_fee_rate("深主板", dt.date(2015, 7, 31)) == 0.0000255
+
+
+# --- 经手费与证管费 ---
+
+
+def test_handling_fee_cuts_on_2015_08_01_and_2023_08_28(table):
+    """经手费两度下调：0.0696‰ → 0.0487‰（2015-08-01）→ 0.0341‰（2023-08-28）。"""
+    assert table.handling_fee_rate("沪主板", dt.date(2015, 7, 31)) == 0.0000696
+    assert table.handling_fee_rate("沪主板", dt.date(2015, 8, 1)) == 0.0000487
+    assert table.handling_fee_rate("沪主板", dt.date(2023, 8, 27)) == 0.0000487
+    assert table.handling_fee_rate("沪主板", dt.date(2023, 8, 28)) == 0.0000341
+
+
+def test_handling_fee_differs_on_the_bse(table):
+    """北交所经手费与沪深不同，且有自己的三次费率（0.5‰→0.25‰→0.125‰）。"""
+    assert table.handling_fee_rate("北交所", dt.date(2021, 11, 15)) == 0.0005
+    assert table.handling_fee_rate("北交所", dt.date(2022, 12, 1)) == 0.00025
+    assert table.handling_fee_rate("北交所", dt.date(2023, 8, 28)) == 0.000125
+
+
+def test_regulatory_fee_is_flat_across_the_window(table):
+    """证管费 0.02‰ 自 2012-07-01 起，窗口内未变。"""
+    assert table.regulatory_fee_rate("沪主板", dt.date(2015, 1, 5)) == 0.00002
+    assert table.regulatory_fee_rate("沪主板", dt.date(2026, 1, 5)) == 0.00002
+    assert table.regulatory_fee_rate("北交所", dt.date(2021, 11, 15)) == 0.00002
+
+
+def test_shanghai_converges_on_2023_08_28_across_fees(table):
+    """2023-08-28 是多项费率同日变更日：印花税、经手费、过户费的口径都动。
+
+    这条同时是「按成交日查表」的联合边界测试——若任何一项在变更日两侧取错，
+    汇总出来的单边成本就会偏。
+    """
+    before = dt.date(2023, 8, 27)
+    on = dt.date(2023, 8, 28)
+    gross = 1_000_000.0
+
+    def per_side(date, selling):
+        fee = table.handling_fee_rate("沪主板", date) + table.regulatory_fee_rate("沪主板", date)
+        fee += table.transfer_fee_rate("沪主板", date)
+        if selling:
+            fee += table.stamp_duty_rate(date)
+        return fee * gross
+
+    assert per_side(on, selling=True) < per_side(before, selling=True)
+    assert per_side(on, selling=False) < per_side(before, selling=False)

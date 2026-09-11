@@ -36,6 +36,9 @@ class BuyThenSell(bt.Strategy):
 
 def _run(start, make_prices, synthetic_rules, cash=1_100_000.0, **kwargs):
     prices = make_prices([10.0] * 6, start=start)
+    # 默认按「全佣」口径：本文件的期望值都是「费率 + 印花税 + 过户费」，
+    # 不含经手费与证管费。net 口径由专门测试覆盖。
+    kwargs.setdefault("commission_mode", "all_in")
     return run_backtest(
         prices,
         symbol=SYMBOL,
@@ -117,6 +120,7 @@ def test_commission_minimum_applies_to_small_trades(make_prices, synthetic_rules
         rules=synthetic_rules,
         commission=COMMISSION,
         commission_min=COMMISSION_MIN,
+        commission_mode="all_in",
     )
 
     assert result.trades.iloc[0]["commission"] == pytest.approx(5.02, abs=1e-9)
@@ -156,3 +160,52 @@ def test_slippage_worsens_the_fill_price(synthetic_rules):
 
     # 第 1 根开盘 10.00，滑点 1% → 10.10，未越过当日最高 10.50，故成交于 10.10
     assert result.trades.iloc[0]["price"] == pytest.approx(10.10, abs=1e-9)
+
+
+# --- 佣金口径：全佣 / 净佣 ---
+
+
+def test_commission_mode_is_required_when_commission_is_positive(make_prices, synthetic_rules):
+    """填了费率就必须说明口径——两种口径的成本不同，替你猜会静默算错。"""
+    with pytest.raises(ValueError, match="commission_mode"):
+        run_backtest(
+            make_prices([10.0] * 3, start="2022-01-03"),
+            symbol=SYMBOL,
+            strategy=BuyThenSell,
+            cash=1_000_000.0,
+            rules=synthetic_rules,
+            commission=COMMISSION,
+        )
+
+
+def test_commission_mode_is_not_needed_when_commission_is_zero(make_prices, synthetic_rules):
+    """零费率时无口径可言，不得强迫调用方传参。"""
+    result = run_backtest(
+        make_prices([10.0] * 3, start="2022-01-03"),
+        symbol=SYMBOL,
+        strategy=BuyThenSell,
+        cash=1_000_000.0,
+        rules=synthetic_rules,
+    )
+
+    # 价格恒定且费用为零，故净值不动——这条测试只关心「不传口径也能跑起来」
+    assert result.final_value == pytest.approx(1_000_000.0)
+
+
+def test_net_mode_adds_handling_and_regulatory_fees(make_prices, synthetic_rules):
+    """净佣口径下另行叠加经手费与证管费；全佣口径下不得叠加（否则重复计费）。
+
+    合成表里沪主板经手费 0.00005、证管费 0.00002，合计 0.00007。
+    成交额 1e6 时，买入多出 70，卖出再多出 70。
+    """
+    all_in = _run("2022-01-03", make_prices, synthetic_rules, commission_mode="all_in")
+    net = _run("2022-01-03", make_prices, synthetic_rules, commission_mode="net")
+
+    buy_all_in, sell_all_in = all_in.trades.iloc[0], all_in.trades.iloc[1]
+    buy_net, sell_net = net.trades.iloc[0], net.trades.iloc[1]
+
+    assert buy_net["commission"] - buy_all_in["commission"] == pytest.approx(70.0, abs=1e-6)
+    assert sell_net["commission"] - sell_all_in["commission"] == pytest.approx(70.0, abs=1e-6)
+
+    # 净佣口径的期末资金正好少了两笔规费
+    assert all_in.final_value - net.final_value == pytest.approx(140.0, abs=1e-6)

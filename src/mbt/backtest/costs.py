@@ -50,11 +50,13 @@ def _limit_price(prev_close: float, limit: float, direction: int) -> float:
 class AStockCommissionInfo(bt.CommissionInfo):
     """按成交日查表计算 A 股交易费用。
 
-    费用由三部分构成：
+    费用由四部分构成：
 
     - **手续费**：按成交金额乘费率，并受单笔最低金额约束。费率由用户给定（券商约定）。
     - **印花税**：仅卖出方缴纳，费率按成交日查表。
     - **过户费**：费率与收取方向均按板块与成交日查表。
+    - **经手费 + 证管费**：按板块与成交日查表，双向。**仅当** ``commission_mode="net"``
+      时叠加——券商报「全佣」时这两项已含在费率里，再叠加就是重复计费。
 
     成交日与标的由 :class:`AStockBroker` 在费用计算前注入。
     """
@@ -62,6 +64,7 @@ class AStockCommissionInfo(bt.CommissionInfo):
     params = (
         ("rules", None),
         ("commission_min", 0.0),
+        ("commission_mode", "all_in"),
     )
 
     def __init__(self):
@@ -93,6 +96,12 @@ class AStockCommissionInfo(bt.CommissionInfo):
             )
             if charged:
                 fee += rules.transfer_fee_rate(self._board, date) * gross
+
+            # 经手费与证管费总是发生，但「全佣」报价已把它们计入费率里，
+            # 故只在「净佣」口径下叠加，免得把同一笔钱收两遍。
+            if self.p.commission_mode == "net":
+                fee += rules.handling_fee_rate(self._board, date) * gross
+                fee += rules.regulatory_fee_rate(self._board, date) * gross
 
         return fee
 
