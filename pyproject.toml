@@ -22,6 +22,9 @@ dev = [
     "ruff==0.8.6",
 ]
 
+[project.scripts]
+mbt = "mbt.cli:_entry_point"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

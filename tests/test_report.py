@@ -164,10 +164,42 @@ def test_describe_screen_returns_none_when_there_is_no_screen():
     assert describe_screen(None) is None
 
 
-def test_the_metrics_file_carries_the_six_metrics_the_ac_names(tmp_path):
-    """AC 列的六项一个都不能少，且都要以**数值**落在产物里。
+def test_metrics_file_uses_null_instead_of_the_invalid_json_token_nan(tmp_path):
+    """``NaN`` **不是合法 JSON**——`jq` / JavaScript / Rust 的解析器都会拒收整个文件。
 
-    断言落在 `metrics.json` 上而不是 dataclass 的字段表上——后者由定义保证，是空转的。
+    Python 的 ``json.dumps`` 默认会写出字面量 ``NaN``，而指标的缺失是**正常状态**
+    （无波动、无平仓交易），故必须落成 ``null``。这条用**严格解析器**来验：Python 自己
+    的 ``json.loads`` 默认接受 ``NaN``，所以它验不出来。
+    """
+    run_dir = write_run_artifacts(make_result(values=(100.0, 100.0, 100.0)), output_dir=tmp_path)
+
+    raw = (run_dir / "metrics.json").read_text(encoding="utf-8")
+
+    assert "NaN" not in raw and "Infinity" not in raw
+    parsed = json.loads(raw, parse_constant=_reject_constant)
+    assert parsed["sharpe"] is None, "无波动时夏普应落成 null"
+
+
+def _reject_constant(name):
+    raise AssertionError(f"metrics.json 里出现了非法 JSON 字面量 {name}")
+
+
+def test_metrics_file_is_readable_by_a_strict_json_parser(tmp_path):
+    """整份文件都要能被严格解析——不只是那个缺失的字段。"""
+    run_dir = write_run_artifacts(
+        make_result(values=(100.0, 120.0, 90.0, 130.0)), output_dir=tmp_path
+    )
+
+    json.loads(
+        (run_dir / "metrics.json").read_text(encoding="utf-8"), parse_constant=_reject_constant
+    )
+
+
+def test_the_metrics_file_carries_the_six_metrics_the_ac_names(tmp_path):
+    """AC 列的六项**一个都不能少**——`metrics.json` 里必须有这六个键。
+
+    值是否可算则是另一回事：缺失是**正常状态**（无波动、无平仓交易），落成 ``null``。
+    故这里断言「键在」而不是「值都是数」——后者会把合法的缺失也判为失败。
     """
     run_dir = write_run_artifacts(
         make_result(
@@ -187,6 +219,9 @@ def test_the_metrics_file_carries_the_six_metrics_the_ac_names(tmp_path):
         "payoff_ratio",
         "turnover",
     ):
+        assert name in metrics, name
+    # 这一组在这份数据上算得出来，故必须是数值——键在但值错也要拦住。
+    for name in ("annual_return", "max_drawdown", "win_rate", "turnover"):
         assert isinstance(metrics[name], int | float), name
 
 
@@ -234,6 +269,24 @@ def test_a_benchmark_covering_only_part_of_the_period_is_intersected_and_recorde
     assert meta["benchmark"]["used_end"] == "2024-01-04"
     assert meta["benchmark"]["bars"] == 2
     assert frame["benchmark"].notna().sum() == 2
+
+
+def test_a_benchmark_that_is_a_field_frame_is_rejected_with_a_clear_message(tmp_path):
+    """传整张**字段宽表**当基准要报错并说清该怎么办。
+
+    实跑 CLI 时撞到过：`TdxDataSource.daily()` 返回六列，而基准要的是单列序列；不拦的话
+    它会在算年化时以 pandas 的 "cannot convert the series to float" 收场，与真正的病因
+    隔了三层。
+    """
+    frame = pd.DataFrame(
+        {"open": [1.0, 1.0], "close": [1.0, 1.0]},
+        index=pd.bdate_range("2024-01-02", periods=2),
+    )
+
+    with pytest.raises(ValueError, match=r"单列价格序列"):
+        write_run_artifacts(
+            make_result(values=(1.0, 1.0)), output_dir=tmp_path, benchmark_prices=frame
+        )
 
 
 def test_a_benchmark_with_no_overlap_is_rejected(tmp_path):

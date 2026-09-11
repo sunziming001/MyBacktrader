@@ -226,7 +226,7 @@ def write_run_artifacts(
         json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8"
     )
     (run_dir / "metrics.json").write_text(
-        json.dumps(metrics.as_dict(), indent=2, ensure_ascii=False, sort_keys=True),
+        json.dumps(_json_safe(metrics.as_dict()), indent=2, ensure_ascii=False, sort_keys=True),
         encoding="utf-8",
     )
 
@@ -272,6 +272,22 @@ def render_drawdown_svg(equity: pd.Series) -> str:
     return _line_chart(
         [(drawdown, "回撤")], x_index=equity.index, zero_based=True, title="回撤（自运行最高点）"
     )
+
+
+def _json_safe(payload: dict) -> dict:
+    """把 ``NaN`` / ``Infinity`` 换成 ``null``。
+
+    Python 的 ``json.dumps`` 默认**会**输出字面量 ``NaN``，而那不是合法 JSON——`jq`、
+    JavaScript、Rust 的解析器都会直接拒收整个文件。指标的缺失是正常状态（无波动、无平仓
+    交易），故必须落成 ``null`` 而不是让文件变得读不了。
+    """
+    safe = {}
+    for key, value in payload.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            safe[key] = None
+        else:
+            safe[key] = value
+    return safe
 
 
 def import_strategy(metadata: dict):
@@ -361,6 +377,14 @@ def _align_benchmark(benchmark: pd.Series | None, index: pd.Index):
     """
     if benchmark is None or benchmark.empty:
         return None, None
+
+    if not isinstance(benchmark, pd.Series):
+        # 传进来的多半是 daily() 的**字段宽表**（六列）。不拦的话，它会在算年化时以一句
+        # 难懂的 pandas 报错收场（"cannot convert the series to float"）。
+        raise ValueError(
+            f"基准须是**单列价格序列**，收到的却是 {type(benchmark).__name__}"
+            f"（列：{list(benchmark.columns)}）。若来自 TdxDataSource.daily()，请取 ['close']。"
+        )
 
     common = index.intersection(benchmark.index)
     if len(common) < 2:
