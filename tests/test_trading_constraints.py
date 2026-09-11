@@ -193,11 +193,11 @@ def test_limit_price_rounds_in_decimal_half_up_not_binary():
     ``round()`` 走二进制浮点，在恰好半分处会少一分。见
     ``docs/research/tdx-halt-and-limit-representation.md``。
     """
-    from mbt.backtest.costs import _limit_price
+    from mbt.rules import limit_price
 
-    assert _limit_price(14.45, 0.10, -1) == 13.01, "round(14.45 * 0.9, 2) 会错给 13.00"
-    assert _limit_price(15.25, 0.10, -1) == 13.73, "round(15.25 * 0.9, 2) 会错给 13.72"
-    assert _limit_price(5.35, 0.10, +1) == 5.89, "round(5.35 * 1.1, 2) 会错给 5.88"
+    assert limit_price(14.45, 0.10, -1) == 13.01, "round(14.45 * 0.9, 2) 会错给 13.00"
+    assert limit_price(15.25, 0.10, -1) == 13.73, "round(15.25 * 0.9, 2) 会错给 13.72"
+    assert limit_price(5.35, 0.10, +1) == 5.89, "round(5.35 * 1.1, 2) 会错给 5.88"
 
 
 def test_sell_is_blocked_when_the_bar_closes_at_the_decimal_limit_price(limit_rules):

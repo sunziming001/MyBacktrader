@@ -3,28 +3,40 @@
 本层只依赖 pandas 与 numpy，**不依赖 backtrader**（ADR-0007）。
 
 复权遵循 ADR-0003：只保存 / 传递**原始价与复权事件**，已复权的价格序列一律**用时计算**
-（见 :mod:`mbt.data.adjust`）。原始价来自 :class:`TdxDataSource`，除权除息事件来自
-:class:`GbbqDataSource`——两者的根目录不同，由调用方分别注入后组合。
+（见 :mod:`mbt.data.adjust`）。
+
+要一份能直接拿去回测的行情，走 :func:`load_market_data`——它把行情目录、权息文件与
+规则表组合起来，并在返回前做完越界检查（ADR-0005）。下面三个数据源是它的零件，
+需要单独取某一样时才直接用。
 """
 
 from .adjust import (
     AdjustmentEvent,
     adjustment_factors,
     backward_adjusted,
+    combined_reference_price,
     forward_adjusted,
 )
+from .anomaly import Anomaly, find_anomalies, require_no_anomalies
 from .errors import MarketDataError
 from .gbbq import GbbqDataSource, GbbqError, GbbqRecord
+from .market import MarketData, load_market_data
 from .tdx import TdxDataSource
 
 __all__ = [
     "AdjustmentEvent",
+    "Anomaly",
     "GbbqDataSource",
     "GbbqError",
     "GbbqRecord",
+    "MarketData",
     "MarketDataError",
     "TdxDataSource",
     "adjustment_factors",
     "backward_adjusted",
+    "combined_reference_price",
+    "find_anomalies",
     "forward_adjusted",
+    "load_market_data",
+    "require_no_anomalies",
 ]

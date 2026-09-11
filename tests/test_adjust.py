@@ -147,6 +147,48 @@ def test_events_compound_multiplicatively():
     assert factors.iloc[3] == pytest.approx(1 / (0.95 * 0.90))
 
 
+def test_events_on_the_same_day_are_summed_into_one_formula():
+    """同日多条按标准公式**求和**后一次代入，而不是逐条套用（每步基数不同）。
+
+    两个送转事件最能分开这两种算法：10 送 10 与 10 送 20 同日，正确算法是
+    ``10 / (1 + 1 + 2) = 2.50``（因子 4.0）；逐条套用则得 ``10/2/3 = 1.67``（因子 6.0）。
+    现金分红之间可加，区分不开，故此处只用送转。
+    """
+    prices = _frame([10.0] * 2)
+    events = [
+        AdjustmentEvent(SH, dt.date(2024, 1, 3), bonus_per_10=10.0),
+        AdjustmentEvent(SH, dt.date(2024, 1, 3), bonus_per_10=20.0),
+    ]
+
+    factors = adjustment_factors(prices, events)
+
+    assert factors.iloc[1] == pytest.approx(4.0)
+    assert factors.iloc[1] != pytest.approx(6.0)
+
+
+def test_events_inside_a_suspension_are_chained_on_the_resumption_bar():
+    """停牌区间内的多次除权都落在复牌日那一根 K 线上，必须按除权日**链式**折算。
+
+    10.00 --（10 送 10）--> 5.00 --（10 派 2 元）--> 4.80。复牌日收在参考价 4.80 上时，
+    后复权视图应当**连续**（两日都是 10.00）。若让两条事件各自对着同一个前收盘价
+    10.00 算因子（``2 × 1/0.98 = 2.0408``），复权后是 9.80——除权日的假跳空原样留在
+    了回测里，正是本模块要消除的东西。
+    """
+    prices = _frame([10.0, 4.8])
+    prices.index = pd.to_datetime(["2024-01-02", "2024-06-03"])  # 中间是停牌
+
+    events = [
+        AdjustmentEvent(SH, dt.date(2024, 2, 1), bonus_per_10=10.0),
+        AdjustmentEvent(SH, dt.date(2024, 4, 1), cash_per_10=2.0),
+    ]
+
+    factors = adjustment_factors(prices, events)
+
+    assert factors.iloc[1] == pytest.approx(10.0 / 4.8)
+    adjusted = backward_adjusted(prices, events)
+    assert adjusted["close"].iloc[1] == pytest.approx(adjusted["close"].iloc[0])
+
+
 def test_events_before_the_series_are_not_applied():
     """序列之前的事件算不出 r（缺前收盘价），且只贡献一个常数倍数，故略去。"""
     prices = _frame([10.0, 11.0, 12.0])

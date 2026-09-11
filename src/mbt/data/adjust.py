@@ -26,6 +26,13 @@ ADR-0005 明令禁止的。这类事件对整条序列只贡献一个**常数倍
 
 代价要说清楚：本模块的「后复权」与全历史口径的后复权**相差一个常数**，数值不必与
 行情软件一致；与行情软件可比的是前复权视图（其最新价不变是硬性性质）。
+
+## 落在同一根 K 线上的多次除权
+
+除权除息日可能落在**停牌区间内**，于是多次除权的 K 线位置相同（都落在复牌日）。
+它们不能各自对着同一个前收盘价算因子——每一步的基数都不同——必须按除权日链式折算，
+见 :func:`_chained_reference_price`。此处与 :mod:`mbt.data.anomaly` 的口径一致（那边
+同样跨日链式），故「复权」与「质检」对同一段跳空给出同一个解释。
 """
 
 from __future__ import annotations
@@ -84,10 +91,7 @@ class AdjustmentEvent:
         不按分位取整——交易所公布的参考价会取整，但复权因子用的是**未取整**的理论值，
         取整会引入每笔不足一分的偏差，与「连续性」这一目标冲突。
         """
-        rights = self.rights_per_share
-        return (prev_close - self.cash_per_share + self.rights_price * rights) / (
-            1.0 + self.bonus_per_share + rights
-        )
+        return combined_reference_price(prev_close, (self,))
 
     def factor(self, prev_close: float) -> float:
         """除权因子 ``r = ref / 前收盘``。
@@ -108,6 +112,24 @@ class AdjustmentEvent:
                 f"配股价 {self.rights_price}、每 10 股配股 {self.rights_per_10}）"
             )
         return factor
+
+
+def combined_reference_price(prev_close: float, events) -> float:
+    """除权除息参考价，**可合并同日的多条事件**（标准公式）。
+
+    ``ref = (前收盘 − Σ每股分红 + Σ(配股价 × 每股配股)) / (1 + Σ每股送转 + Σ每股配股)``
+
+    同日多条记录时不能逐个套用（每一步的基数都不同），必须先把各量求和再代入一次。
+    本函数返回**未取整**的理论值——复权因子要它（见 ADR-0003）；而异常检测要的是
+    交易所公布的**已取整**参考价，故那边会自行取整到分。
+    """
+    cash = bonus = rights = paid = 0.0
+    for event in events:
+        cash += event.cash_per_share
+        bonus += event.bonus_per_share
+        rights += event.rights_per_share
+        paid += event.rights_price * event.rights_per_share
+    return (prev_close - cash + paid) / (1.0 + bonus + rights)
 
 
 def adjustment_factors(
@@ -137,7 +159,12 @@ def adjustment_factors(
 
     # 每个事件只影响「从除权日起的每一根 K 线」，故在除权日那一根上放一个乘数，
     # 再取累积乘积——这样同一根 K 线上有多个事件时也自然合并。
+    #
+    # 「同一根 K 线」有个停牌带来的陷阱：除权除息日可能落在**停牌区间内**，于是多次
+    # 除权的 K 线位置相同（都落在复牌日）。它们不能各自对着同一个前收盘价算因子——
+    # 每一步的基数都不同——必须按除权日**链式**折算，见 :func:`_chained_reference_price`。
     steps = np.ones(len(index), dtype="float64")
+    by_position: dict[int, list[AdjustmentEvent]] = {}
     for event in events:
         if event.ex_date > cutoff:
             continue
@@ -146,9 +173,44 @@ def adjustment_factors(
         # position == len：事件晚于序列末根，落不到任何 K 线上。
         if position == 0 or position >= len(index):
             continue
-        steps[position] *= 1.0 / event.factor(closes[position - 1])
+        by_position.setdefault(position, []).append(event)
+
+    for position, group in by_position.items():
+        prev_close = float(closes[position - 1])
+        if prev_close <= 0:
+            raise MarketDataError(
+                f"{group[0].symbol} 在 {index[position].date().isoformat()} 的前收盘价 "
+                f"{prev_close} 非正，无法计算复权因子"
+            )
+        steps[position] *= prev_close / _chained_reference_price(prev_close, group, index[position])
 
     return pd.Series(np.cumprod(steps), index=index, name="adjustment_factor")
+
+
+def _chained_reference_price(prev_close: float, events, on: pd.Timestamp) -> float:
+    """把落在同一根 K 线上的一组事件按**除权日**链式折算，返回最终的参考价。
+
+    **同日**多条要按标准公式**求和**后一次代入（:func:`combined_reference_price`）；
+    **跨日**的多条要**链式**——每一步的参考价就是下一步的基数。后者正是长期停牌区间内
+    发生多次除权的情形：它们的 K 线位置相同，但决不能共享同一个基数。
+
+    链式的累积乘数可化简：``Π(1/r_i) = 前收盘 / 末次参考价``（逐项相消），故调用方只需
+    这一个末值。
+    """
+    by_date: dict[dt.date, list[AdjustmentEvent]] = {}
+    for event in events:
+        by_date.setdefault(event.ex_date, []).append(event)
+
+    reference = prev_close
+    for ex_date in sorted(by_date):
+        reference = combined_reference_price(reference, by_date[ex_date])
+
+    if not reference > 0:
+        raise MarketDataError(
+            f"{events[0].symbol} 在 {on.date().isoformat()} 的复权参考价为 {reference}"
+            f"（前收盘 {prev_close}，涉及 {len(events)} 条除权除息事件），事件数据不成立"
+        )
+    return reference
 
 
 def backward_adjusted(
