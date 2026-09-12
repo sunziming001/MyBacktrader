@@ -180,7 +180,12 @@ def write_run_artifacts(
     aligned_benchmark, benchmark_range = _align_benchmark(benchmark_prices, equity.index)
 
     if metrics is None:
-        metrics = compute_metrics(equity, result.trades, benchmark_equity=aligned_benchmark)
+        metrics = compute_metrics(
+            equity,
+            result.trades,
+            benchmark_equity=aligned_benchmark,
+            rejected=result.rejected,
+        )
 
     created_at = created_at or dt.datetime.now()
     snapshot = data_snapshot(snapshot_paths)
@@ -240,6 +245,11 @@ def write_run_artifacts(
         render_equity_svg(equity, aligned_benchmark), encoding="utf-8"
     )
     (run_dir / "drawdown.svg").write_text(render_drawdown_svg(equity), encoding="utf-8")
+
+    # 成交明细与**拒单明细**都落盘。拒单必须留下逐笔证据，否则「买单全被拒」这类事实在产物
+    # 里完全看不见——实测排查时只能临时加打印，而那种排查不会留下任何可供事后核对的东西。
+    result.trades.to_csv(run_dir / "trades.csv", index=False)
+    result.rejected.to_csv(run_dir / "rejected.csv", index=False)
 
     return run_dir
 

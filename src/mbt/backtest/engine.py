@@ -358,7 +358,11 @@ def _drive_engine(
 
     cerebro.addstrategy(strategy, **strategy_params)
     if sizer is None:
-        cerebro.addsizer(EqualWeightSizer, max_positions=max_positions)
+        # `sizer_options` 在这里也要生效：默认 sizer 的 `headroom`（留余地比例）是 AC 要求
+        # **可配置**的那一项，只在自定义 sizer 那条路径生效会让它不可达。
+        cerebro.addsizer(
+            EqualWeightSizer, max_positions=max_positions, rules=table, **(sizer_options or {})
+        )
     else:
         cerebro.addsizer(sizer, **(sizer_options or {}))
 

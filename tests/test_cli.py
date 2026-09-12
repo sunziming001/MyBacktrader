@@ -818,3 +818,37 @@ def test_an_as_of_that_is_not_a_trading_day_is_reported(tmp_path):
 
     assert run_screen_command(args, stdout=out, stderr=err) == 1
     assert "交易日" in err.getvalue()
+
+
+# --- 拒单的可见性 -------------------------------------------------------------
+
+
+def test_the_cli_warns_when_orders_were_placed_but_none_filled(tmp_path):
+    """有下单却**一笔都没成交**时必须告警，并把拒单明细落盘。
+
+    这是本项目最防的那类静默失败：净值曲线是一条平线、指标全是零，看着像个「本来就没信号」
+    的正常结果。构造：窗口只有 30 根，而股票池门槛是 60 个交易日 → **每一笔**买单都以
+    「不在股票池」被拒 → 零成交。
+
+    刻意**不**按「拒单率超阈值」告警——名额有限时高拒单率是**正常**的（34 个信号、10 个名额，
+    24 笔被拒是预期行为），真正没有意义的是「零成交」。
+    """
+    import json
+
+    root, gbbq = make_dataroot(tmp_path, periods=30)  # 不足门槛 60
+    args = make_args(tdx_root=str(root), gbbq=str(gbbq), output_dir=str(tmp_path / "runs"))
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    text = out.getvalue()
+    assert "拒单" in text
+    assert "一笔都没成交" in text, "有下单却零成交，必须告警"
+
+    run_dir = next((tmp_path / "runs").iterdir())
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["rejected_orders"] > 0
+    assert metrics["rejection_rate"] == 1.0, "一笔都没成交，故拒单率是 100%"
+
+    rejected = pd.read_csv(run_dir / "rejected.csv")
+    assert set(rejected["status"]) == {"Rejected"}
+    assert rejected["reason"].str.contains("不在股票池").all(), "理由要能看出为什么被拒"

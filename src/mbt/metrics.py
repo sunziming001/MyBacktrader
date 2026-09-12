@@ -45,6 +45,9 @@ class Metrics:
         closed_trades: 平仓交易笔数——胜率与盈亏比的分母。
         benchmark_annual_return: 基准的几何年化收益；未给基准时为 ``None``。
         excess_annual_return: 策略年化减基准年化；未给基准时为 ``None``。
+        rejected_orders: **未成交而终结**的订单笔数（资金不足、出池、挂单过期等）。
+        rejection_rate: 拒单率 ``拒单笔数 /（成交笔数 + 拒单笔数）``。它高说明大部分下单
+            都没成——那种情形下净值曲线与指标都**不代表策略**，故必须看得见。
         notes: 每条缺失值的**原因**说明（如「无平仓交易」）。空元组表示没有缺失。
     """
 
@@ -59,6 +62,8 @@ class Metrics:
     closed_trades: int
     benchmark_annual_return: float | None = None
     excess_annual_return: float | None = None
+    rejected_orders: int = 0
+    rejection_rate: float = 0.0
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def as_dict(self) -> dict:
@@ -75,6 +80,7 @@ def compute_metrics(
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
     risk_free: float = 0.0,
     benchmark_equity: pd.Series | None = None,
+    rejected: pd.DataFrame | None = None,
 ) -> Metrics:
     """由净值曲线与成交明细算出指标。
 
@@ -87,6 +93,9 @@ def compute_metrics(
         risk_free: **年化**无风险利率（如 0.02 表示 2%）。默认 0，即不扣无风险收益。
         benchmark_equity: 基准的净值/价格序列（与 ``equity`` 同一区间口径）。给了它才算
             基准与超额收益。
+        rejected: **未成交而终结**的订单明细（``mbt.backtest.BacktestResult.rejected``）。它
+            不参与任何指标计算，只用来报出拒单笔数与拒单率——因为**高拒单率下上面的指标都
+            不代表策略**（净值曲线可能只是一条平线），而那件事必须看得见。
 
     返回:
         :class:`Metrics`。
@@ -167,6 +176,11 @@ def compute_metrics(
     elif benchmark_equity is not None:
         notes.append("基准年化缺失：基准序列不足两个点")
 
+    filled = 0 if trades is None else len(trades)
+    rejected_count = 0 if rejected is None else len(rejected)
+    attempted = filled + rejected_count
+    rejection_rate = (rejected_count / attempted) if attempted else 0.0
+
     return Metrics(
         total_return=total_return,
         annual_return=annual_return,
@@ -179,6 +193,8 @@ def compute_metrics(
         closed_trades=len(pnls),
         benchmark_annual_return=benchmark_annual_return,
         excess_annual_return=excess,
+        rejected_orders=rejected_count,
+        rejection_rate=rejection_rate,
         notes=tuple(notes),
     )
 
