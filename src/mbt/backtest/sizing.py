@@ -61,4 +61,35 @@ class EqualWeightSizer(bt.Sizer):
         if price <= 0:
             return 0
 
-        return int(cash / slots / price)
+        return self._affordable(comminfo, cash / slots, price)
+
+    @staticmethod
+    def _affordable(comminfo, budget, price) -> int:
+        """在 ``budget`` 之内买得起的最大股数——**含交易费用**。
+
+        为什么不能只算 ``budget / price``：撮合层要求「成交金额 + 费用 ≤ 现金」，而费用是
+        **制度必收**的（过户费与佣金无关，``commission_mode="net"`` 时还有经手费与证管费）。
+        于是 `budget / price` 几乎正好用光预算时，加上费用就超——**每一笔买单都以 ``Margin``
+        被拒**。实测单标的（``max_positions`` 省略或为 1）时零成交，而退出码仍是 0：不报错，
+        只是回测空转。**这是本项目最防的那类失败。**
+
+        做法是**二分**：``size * price + fee(size)`` 对 ``size`` 严格单调递增（``size*price``
+        递增，``fee`` 单调不减），故在 ``[0, int(budget/price)]`` 上二分即可求出满足约束的
+        最大整数，精确且无需知道费率。
+
+        刻意**不**乘一个 0.999 之类的安全系数：那既盖不住 ``commission=0.3%`` 这类配置，也会
+        在费率很小时白白少买，而两者都不会报错。
+
+        为什么要用 ``comminfo`` 而不用自己的费率常量：backtrader 的 ``Sizer.getsizing`` 会先调
+        ``broker.getcommissioninfo(data)``（本项目的 ``AStockBroker`` 在那里把**成交日与板块**
+        注入费用对象），**再**调 ``_getsizing``。所以这里的 ``comminfo`` 已能算出当日当板块的
+        真实费用——照抄一份费率表出来只会与之漂移（Shotgun Surgery）。
+        """
+        low, high = 0, int(budget / price)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if mid * price + comminfo.getcommission(mid, price) <= budget:
+                low = mid
+            else:
+                high = mid - 1
+        return low
