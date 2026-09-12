@@ -1,11 +1,14 @@
-"""估值信号：动态PE、PE 百分位、PEG（票据 #37）。
+"""估值信号：动态PE、PE 百分位、PEG（票据 #37、#48）。
 
-本文件的重心是**时点正确性**与**口径的边界**，两者都靠手算断言：
+口径**逐项对齐通达信的市盈率公式**（历史分支），因为行情软件里的 PE/PEG 就是它算的：
 
-- 一季报在**公告日**当天才生效，而不是报告期（3 月 31 日）当天——差额近一个月，而那段
-  时间里用它就是把未来的信息搬进历史（ADR-0006）；
-- 百分位在窗口恒定时**返回缺失**，不是 0 或 1；
-- 同比的分母取绝对值，否则「由亏转盈」的符号会反过来。
+    PE历史   = FINVALUE(238) * C / FINVALUE(276)      # 总股本 × 收盘价 ÷ 归母净利TTM
+    增历史   = FINVALUE(184)                            # 当期累计同比(%)
+    PEG      = IF(PE>0 AND ABS(增)>0.1, PE/增, NULL)
+    PE百分位 = (PE − LLV(PE,DUR)) / (HHV(PE,DUR) − LLV(PE,DUR))
+
+本文件的重点是**时点正确性**与**口径的边界**，两者都靠手算断言。另有一条测试把「自创口径
+会造成假阳性」写成可核对的事实（对照 `sz002692` 的真实数字）。
 """
 
 from __future__ import annotations
@@ -22,7 +25,6 @@ from mbt.data.valuation import (
     PE_PERCENTILE,
     PEG,
     VALUATION_FIELDS,
-    annualisation_factor,
     build_valuation,
     pe_percentile,
     price_earnings_growth,
@@ -40,9 +42,9 @@ class FakeFinancials:
         return tuple(sorted(self._by_symbol.get(symbol, ()), key=lambda r: r.report_period))
 
 
-def record(symbol, period, announced, **values):
-    """造一条 ``FinancialRecord``；未给的字段补 0。"""
-    filled = {
+def record(period, announced, *, shares=1_000_000_000.0, ttm=50_000_000.0, growth=30.0, **extra):
+    """造一条 ``FinancialRecord``；三个估值字段按名义值给出，其余补 0。"""
+    values = {
         "eps_ytd": 0.0,
         "net_profit_ytd": 0.0,
         "bvps": 0.0,
@@ -50,16 +52,17 @@ def record(symbol, period, announced, **values):
         "revenue_quarter": 0.0,
         "net_profit_quarter": 0.0,
     }
-    filled.update(values)
+    values.update({"total_shares": shares, "profit_ttm": ttm, "growth_ytd": growth})
+    values.update(extra)
     return FinancialRecord(
-        symbol=symbol,
+        symbol="sh600000",
         report_period=period,
         announcement_date=announced,
-        values=filled,
+        values=values,
     )
 
 
-def frame(values, symbol="sh600000", start="2023-03-01"):
+def frame(values, symbol="sh600000", start="2024-01-02"):
     """一列收盘价（由值序列构造）。"""
     return pd.DataFrame(
         {symbol: [float(v) for v in values]},
@@ -67,62 +70,51 @@ def frame(values, symbol="sh600000", start="2023-03-01"):
     )
 
 
-# --- 年化系数 -----------------------------------------------------------------
+def same_shape(value, symbol="sh600000", start="2024-01-02", periods=3):
+    return pd.DataFrame(
+        {symbol: [float(value)] * periods},
+        index=pd.bdate_range(start, periods=periods),
+    )
 
 
-@pytest.mark.parametrize(
-    ("period", "expected"),
-    [
-        (dt.date(2024, 3, 31), 4.0),
-        (dt.date(2024, 6, 30), 2.0),
-        (dt.date(2024, 9, 30), 4.0 / 3.0),
-        (dt.date(2024, 12, 31), 1.0),
-    ],
-)
-def test_the_annualisation_factor_follows_the_report_period(period, expected):
-    """通达信口径：Q1×4、H1×2、Q3×4/3、年报×1。"""
-    assert annualisation_factor(period) == pytest.approx(expected)
+# --- 动态PE：总股本 × 收盘价 ÷ 归母净利TTM ------------------------------------
 
 
-def test_a_period_that_is_not_a_quarter_end_is_rejected():
-    """不是季末就**报错**，不猜系数——猜错会让整个 PE 序列偏一个倍数，且不报错。"""
-    with pytest.raises(MarketDataError, match="不是季末"):
-        annualisation_factor(dt.date(2024, 5, 31))
+def test_pe_is_market_cap_over_ttm_profit():
+    """PE = 总股本 × 收盘价 ÷ TTM 净利——与通达信 `FINVALUE(238)*C/FINVALUE(276)` 一致。
 
-
-# --- 动态PE -------------------------------------------------------------------
-
-
-def test_pe_divides_price_by_annualised_eps():
-    close = frame([100.0])
-    earnings = frame([4.0])
-
-    assert price_earnings_ratio(close, earnings).iloc[0, 0] == pytest.approx(25.0)
-
-
-def test_a_zero_eps_yields_a_missing_pe_not_an_infinity():
-    """EPS 为 0 → 缺失。除零给出 ``inf`` 会让「PE > 0」之类的比较得到看似正常的结果。"""
-    close = frame([100.0])
-    earnings = frame([0.0])
-
-    assert pd.isna(price_earnings_ratio(close, earnings).iloc[0, 0])
-
-
-def test_a_negative_eps_yields_a_negative_pe():
-    """负 EPS 照常算出负 PE——「PE > 0」是过滤条件的事，不是计算的事。
-
-    多一个隐含分支就多一处会漂移的地方：若这里静默返回缺失，过滤条件与计算之间就有了两套
-    「亏损」的表示。
+    手算：10 亿股 × 20 元 = 200 亿元市值 ÷ 5 亿元 TTM 净利 = **40**。
     """
-    close = frame([100.0])
-    earnings = frame([-4.0])
+    close = same_shape(20.0)
+    shares = same_shape(1_000_000_000.0)
+    ttm = same_shape(500_000_000.0)
 
-    assert price_earnings_ratio(close, earnings).iloc[0, 0] == pytest.approx(-25.0)
+    got = price_earnings_ratio(close, shares, ttm)
+
+    assert got.iloc[0, 0] == pytest.approx(40.0)
+
+
+def test_a_zero_ttm_yields_a_missing_pe_not_an_infinity():
+    """TTM 净利为 0 → 缺失。除零给出 ``inf`` 会让「PE > 0」之类的比较得到看似正常的结果。"""
+    got = price_earnings_ratio(same_shape(20.0), same_shape(1e9), same_shape(0.0))
+
+    assert pd.isna(got.iloc[0, 0])
+
+
+def test_a_negative_ttm_yields_a_negative_pe():
+    """亏损照常算出负 PE——「PE > 0」是过滤条件的事，不是计算的事。"""
+    got = price_earnings_ratio(same_shape(20.0), same_shape(1e9), same_shape(-5e8))
+
+    assert got.iloc[0, 0] == pytest.approx(-40.0)
 
 
 def test_mismatched_shapes_are_rejected():
-    with pytest.raises(MarketDataError, match="columns 不一致"):
-        price_earnings_ratio(frame([1.0]), frame([1.0], symbol="sz000001"))
+    """形状不一致必须报错——逐格相乘/相除时静默错位是本项目最防的那类失败。"""
+    with pytest.raises(MarketDataError, match="index 不一致|columns 不一致"):
+        price_earnings_ratio(frame([1.0]), same_shape(1.0, symbol="sz000001"), same_shape(1.0))
+
+    with pytest.raises(MarketDataError, match="index 不一致|columns 不一致"):
+        price_earnings_ratio(frame([1.0, 2.0]), same_shape(1.0, periods=3), same_shape(1.0))
 
 
 # --- 百分位 -------------------------------------------------------------------
@@ -146,17 +138,11 @@ def test_a_constant_window_yields_missing_not_zero_or_one():
 
     硬给 0 或 1 会让「百分位 < 8%」凭空通过或凭空拦下——两种都是无依据的答案。
     """
-    got = pe_percentile(frame([5.0, 5.0, 5.0]), window=3)
-
-    assert got.iloc[:, 0].isna().all()
+    assert pe_percentile(frame([5.0, 5.0, 5.0]), window=3).iloc[:, 0].isna().all()
 
 
 def test_the_window_uses_available_history_when_shorter_than_requested():
-    """不足 ``window`` 根时按**可得历史**算（通达信 ``LLV``/``HHV`` 语义）。
-
-    故 4 根数据配 1000 的窗口，与配 4 的窗口结果相同——次新股的「4 年百分位」实际是短窗口
-    上的百分位，这是刻意保留的口径（见模块文档）。
-    """
+    """不足 ``window`` 根时按**可得历史**算（通达信 ``LLV``/``HHV`` 语义）。"""
     series = [2.0, 1.0, 3.0, 2.0]
 
     assert pe_percentile(frame(series), window=1000).equals(pe_percentile(frame(series), window=4))
@@ -164,9 +150,7 @@ def test_the_window_uses_available_history_when_shorter_than_requested():
 
 def test_the_window_includes_the_current_day():
     """含当日：第 2 天 ``[2, 1]`` 里当日是 1，故百分位是 0（窗口最低）而不是 0.5。"""
-    got = pe_percentile(frame([2.0, 1.0]), window=2)
-
-    assert got.iloc[1, 0] == pytest.approx(0.0)
+    assert pe_percentile(frame([2.0, 1.0]), window=2).iloc[1, 0] == pytest.approx(0.0)
 
 
 def test_a_non_positive_window_is_rejected():
@@ -179,69 +163,70 @@ def test_a_non_positive_window_is_rejected():
 
 def test_peg_divides_pe_by_the_growth_percentage():
     """PE 15、增长 30% → PEG 0.5。增长率是**百分数**（30 而不是 0.3）。"""
-    pe = frame([15.0])
-    growth = frame([30.0])
-
-    assert price_earnings_growth(pe, growth).iloc[0, 0] == pytest.approx(0.5)
-
-
-def test_a_zero_growth_yields_a_missing_peg():
-    assert pd.isna(price_earnings_growth(frame([15.0]), frame([0.0])).iloc[0, 0])
+    assert price_earnings_growth(same_shape(15.0), same_shape(30.0)).iloc[0, 0] == pytest.approx(
+        0.5
+    )
 
 
-# --- 时点正确性（本组最重要） -------------------------------------------------
+@pytest.mark.parametrize("growth", [0.0, 0.05, -0.05, 0.1, -0.1])
+def test_a_tiny_growth_yields_a_missing_peg(growth):
+    """``|增长率| ≤ 0.1`` → 缺失。
 
-
-def test_a_quarterly_report_takes_effect_on_its_announcement_date_not_the_period_end():
-    """一季报在**公告日**当天生效，而不是报告期（3 月 31 日）。
-
-    构造：年报（报告期 2022-12-31、公告 2023-03-15、累计 EPS 2.0 → 年化 2.0）与一季报
-    （报告期 2023-03-31、**公告 2023-04-28**、累计 EPS 1.2 → 年化 4.8）。收盘价恒 100：
-
-    - 2023-03-20 与 2023-04-01：只知年报 → PE = 100 / 2.0 = **50**
-    - 2023-04-28 之后：一季报生效 → PE = 100 / 4.8 ≈ **20.83**
-
-    若按报告期对齐，4 月 1 日就会用上一季报——比真实公告早了近一个月，而那段「提前知道」
-    正是 ADR-0006 要挡的。
+    这是通达信原式的守卫：增长率接近 0 时 PEG 是个巨大的数，那不是「贵」，是**没有意义**。
+    边界取**严格大于**（``ABS(增)>0.1``），故恰好 0.1 也算缺失。
     """
-    prices = frame([100.0] * 60, start="2023-03-01")
+    assert pd.isna(price_earnings_growth(same_shape(15.0), same_shape(growth)).iloc[0, 0])
+
+
+@pytest.mark.parametrize("pe", [0.0, -15.0])
+def test_a_non_positive_pe_yields_a_missing_peg(pe):
+    """``PE ≤ 0`` → 缺失（通达信同一个守卫）。"""
+    assert pd.isna(price_earnings_growth(same_shape(pe), same_shape(30.0)).iloc[0, 0])
+
+
+def test_a_negative_growth_keeps_its_sign():
+    """增长率为负且绝对值够大时 PEG 照常为负——那正是「增长在恶化」的信号。
+
+    实测 `sz002692` 在 2025-09-02 的 PEG 是 **−36.57**（当期同比 −1.67%、PE 61.07），
+    而买入条件要求 ``0 < PEG``，故它会被排除。这是**正确的**行为。
+    """
+    got = price_earnings_growth(same_shape(61.07), same_shape(-1.67))
+
+    assert got.iloc[0, 0] == pytest.approx(61.07 / -1.67)
+
+
+# --- 时点正确性 ---------------------------------------------------------------
+
+
+def test_a_quarterly_report_takes_effect_on_its_announcement_date():
+    """财报在**公告日**当天生效，而不是报告期当天。
+
+    构造：两期财报。收盘恒 20 元、总股本恒 10 亿股：
+
+    - 2023-03-15 公告那期 TTM = 5 亿 → PE = 200 亿 / 5 亿 = **40**
+    - 2023-04-28 公告那期 TTM = 8 亿 → PE = 200 亿 / 8 亿 = **25**
+    """
+    prices = frame([20.0] * 60, start="2023-03-01")
     financials = FakeFinancials(
         sh600000=[
-            record(
-                "sh600000",
-                dt.date(2022, 12, 31),
-                dt.date(2023, 3, 15),
-                eps_ytd=2.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2023, 3, 31),
-                dt.date(2023, 4, 28),
-                eps_ytd=1.2,
-            ),
+            record(dt.date(2022, 12, 31), dt.date(2023, 3, 15), ttm=500_000_000.0),
+            record(dt.date(2023, 3, 31), dt.date(2023, 4, 28), ttm=800_000_000.0),
         ]
     )
 
     pe = build_valuation(prices, financials).pe
 
     assert pd.isna(pe.loc[pd.Timestamp("2023-03-10"), "sh600000"]), "首份财报公告前无从算起"
-    assert pe.loc[pd.Timestamp("2023-03-20"), "sh600000"] == pytest.approx(50.0)
-    assert pe.loc[pd.Timestamp("2023-04-27"), "sh600000"] == pytest.approx(
-        50.0
-    ), "公告前一日仍是年报"
-    assert pe.loc[pd.Timestamp("2023-04-28"), "sh600000"] == pytest.approx(100.0 / 4.8)
+    assert pe.loc[pd.Timestamp("2023-03-20"), "sh600000"] == pytest.approx(40.0)
+    assert pe.loc[pd.Timestamp("2023-04-27"), "sh600000"] == pytest.approx(40.0), "公告前一日未生效"
+    assert pe.loc[pd.Timestamp("2023-04-28"), "sh600000"] == pytest.approx(25.0)
 
 
 def test_an_unusable_record_does_not_enter_the_series():
-    """公告日**等于**报告期的记录是占位符（2005 年前的特征），一律不进序列。
-
-    若不挡它，那条记录会带着一个假公告日进入点取，让历史某段用上「当时还不知道」的财报。
-    """
-    prices = frame([100.0] * 10, start="2023-03-01")
+    """公告日**等于**报告期的记录是占位符（2005 年前的特征），一律不进序列。"""
+    prices = frame([20.0] * 10, start="2023-03-01")
     financials = FakeFinancials(
-        sh600000=[
-            record("sh600000", dt.date(2023, 3, 31), dt.date(2023, 3, 31), eps_ytd=1.0),
-        ]
+        sh600000=[record(dt.date(2023, 3, 31), dt.date(2023, 3, 31), ttm=500_000_000.0)]
     )
 
     assert build_valuation(prices, financials).pe.isna().all().all()
@@ -249,201 +234,10 @@ def test_an_unusable_record_does_not_enter_the_series():
 
 def test_a_symbol_without_financials_gets_a_missing_series_not_zeros():
     """没有财务数据的标的整列为缺失——给 0 会让 PE 变成 ``inf`` 或 0，属凭空造数。"""
-    prices = frame([100.0] * 5)
+    valuation = build_valuation(frame([20.0] * 5), FakeFinancials())
 
-    valuation = build_valuation(prices, FakeFinancials())
-
-    assert valuation.pe.isna().all().all()
-    assert valuation.pe_percentile.isna().all().all()
-    assert valuation.peg.isna().all().all()
-
-
-# --- 同比增长率 ---------------------------------------------------------------
-
-
-def annual_since_2016():
-    """三条年报记录，年度归母净利 100 → 150 → 300（公告日在次年 3 月）。
-
-    三年是**故意**的：滞后一年的口径要取「上一年同期那一期」的同比，而那本身又需要再往前一年
-    的数据。故只有两年记录时它必然缺失——这正是下面几条测试要分辨的事。
-    """
-    return FakeFinancials(
-        sh600000=[
-            record(
-                "sh600000",
-                dt.date(2020, 12, 31),
-                dt.date(2021, 3, 15),
-                net_profit_ytd=100.0,
-                eps_ytd=1.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2021, 12, 31),
-                dt.date(2022, 3, 15),
-                net_profit_ytd=150.0,
-                eps_ytd=1.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2022, 12, 31),
-                dt.date(2023, 3, 15),
-                net_profit_ytd=300.0,
-                eps_ytd=1.0,
-            ),
-        ]
-    )
-
-
-def test_the_growth_uses_the_prior_year_period_by_default():
-    """**默认口径：取「上一年同期那一期」的同比**，而不是最新一期自己的。
-
-    三条年报的同比分别是：2021 年 ``+50%``、2022 年 ``+100%``。故在 2022 年报公告后：
-
-    - 默认（``growth_lag_years=1``）→ 取 **2021 年那一期**的同比 ``+50%`` → PEG = 15/50 = **0.3**
-    - 传 ``0`` → 取 2022 年自己的同比 ``+100%`` → PEG = 15/100 = **0.15**
-
-    两者相差一倍，且这条会直接进「0 < PEG < 0.75」的买入条件——故必须能被分辨。
-    """
-    prices = frame([15.0] * 20, start="2023-03-01")
-
-    lagged = build_valuation(prices, annual_since_2016(), growth_lag_years=1)
-    current = build_valuation(prices, annual_since_2016(), growth_lag_years=0)
-
-    when = pd.Timestamp("2023-03-20")
-    assert lagged.peg.loc[when, "sh600000"] == pytest.approx(15.0 / 50.0)
-    assert current.peg.loc[when, "sh600000"] == pytest.approx(15.0 / 100.0)
-
-
-def test_the_default_lag_is_one_year():
-    """默认就是滞后一年——本票的核心口径，用常量钉住。"""
-    from mbt.data.valuation import DEFAULT_GROWTH_LAG_YEARS
-
-    assert DEFAULT_GROWTH_LAG_YEARS == 1
-
-
-def test_the_lagged_growth_needs_one_more_year_of_history():
-    """滞后一年需要**多一年**的历史：只有两年记录时它必然缺失。
-
-    评估日落在 2021 年报公告之后、2022 年报公告之前时，最新期是 2021 年，而「上一年同期那一期」
-    是 2020 年——它的同比还要再往前一年，故缺失。这不是 bug，是「取第二年」的字面代价。
-
-    对照：同一时点用 ``growth_lag_years=0`` 就有值（它只需要 2020 与 2021 两期）。
-    """
-    prices = frame([15.0] * 20, start="2022-03-21")
-
-    lagged = build_valuation(prices, annual_since_2016(), growth_lag_years=1)
-    current = build_valuation(prices, annual_since_2016(), growth_lag_years=0)
-
-    when = pd.Timestamp("2022-03-21")
-    assert pd.isna(lagged.peg.loc[when, "sh600000"])
-    assert current.peg.loc[when, "sh600000"] == pytest.approx(15.0 / 50.0)
-
-
-def test_a_loss_turning_into_a_profit_gets_a_positive_growth():
-    """**分母取绝对值**的意义：-100 → +50 是「增长 150%」，不是「下降 150%」。
-
-    不带绝对值时 ``(50 − (−100)) / (−100) = −150%``——符号反了，于是 PEG 变负，而「0 < PEG」
-    这条买入条件会因此把一家刚扭亏的公司挡在门外。
-
-    这里用滞后一年的口径：三段年度净利 ``−100 → 50 → 60``，故 2021 年那一期的同比是
-    ``+150%``，而 2022 年自己的同比是 ``+20%``。默认口径取前者。
-    """
-    prices = frame([15.0] * 20, start="2023-03-01")
-    financials = FakeFinancials(
-        sh600000=[
-            record(
-                "sh600000",
-                dt.date(2020, 12, 31),
-                dt.date(2021, 3, 15),
-                net_profit_ytd=-100.0,
-                eps_ytd=1.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2021, 12, 31),
-                dt.date(2022, 3, 15),
-                net_profit_ytd=50.0,
-                eps_ytd=1.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2022, 12, 31),
-                dt.date(2023, 3, 15),
-                net_profit_ytd=60.0,
-                eps_ytd=1.0,
-            ),
-        ]
-    )
-
-    valuation = build_valuation(prices, financials)
-
-    # 滞后口径取 2021 年那一期的同比 +150% → PEG = 15 / 150 = 0.1（正数）
-    assert valuation.peg.loc[pd.Timestamp("2023-03-20"), "sh600000"] == pytest.approx(0.1)
-
-
-def test_a_missing_prior_year_record_yields_a_missing_peg():
-    """同期记录缺失 → 同比无从算起 → PEG 缺失，而不是拿别的期间凑。"""
-    prices = frame([15.0] * 20, start="2023-03-01")
-    financials = FakeFinancials(
-        sh600000=[
-            record(
-                "sh600000",
-                dt.date(2022, 12, 31),
-                dt.date(2023, 3, 15),
-                net_profit_ytd=130.0,
-                eps_ytd=1.3,
-            ),
-        ]
-    )
-
-    valuation = build_valuation(prices, financials)
-
-    assert valuation.pe.loc[pd.Timestamp("2023-03-20"), "sh600000"] == pytest.approx(15.0 / 1.3)
-    assert pd.isna(valuation.peg.loc[pd.Timestamp("2023-03-20"), "sh600000"])
-
-
-def test_a_zero_base_yields_a_missing_peg():
-    """基数为 0 → 同比无定义（不是无穷大）。
-
-    三年记录：``0 → 0 → 130``。滞后口径取 2021 那一期的同比，而它的基数是 2020 年的 0
-    → 无定义 → PEG 缺失（而不是 ``inf``）。
-    """
-    prices = frame([15.0] * 20, start="2023-03-01")
-    financials = FakeFinancials(
-        sh600000=[
-            record(
-                "sh600000",
-                dt.date(2020, 12, 31),
-                dt.date(2021, 3, 15),
-                net_profit_ytd=0.0,
-                eps_ytd=1.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2021, 12, 31),
-                dt.date(2022, 3, 15),
-                net_profit_ytd=0.0,
-                eps_ytd=1.0,
-            ),
-            record(
-                "sh600000",
-                dt.date(2022, 12, 31),
-                dt.date(2023, 3, 15),
-                net_profit_ytd=130.0,
-                eps_ytd=1.0,
-            ),
-        ]
-    )
-
-    assert pd.isna(build_valuation(prices, financials).peg.loc["2023-03-20", "sh600000"])
-
-
-def test_a_negative_lag_is_rejected():
-    """滞后期数不能为负——负值是笔误，猜一个值只会静默换掉口径。"""
-    with pytest.raises(ValueError, match="滞后期数不能为负"):
-        build_valuation(
-            frame([15.0] * 5, start="2023-03-01"), FakeFinancials(), growth_lag_years=-1
-        )
+    for one in (valuation.pe, valuation.pe_percentile, valuation.peg):
+        assert one.isna().all().all()
 
 
 # --- 契约与形状 ---------------------------------------------------------------
@@ -467,15 +261,43 @@ def test_as_fields_exposes_the_documented_names():
 
 
 def test_a_non_datetime_index_is_rejected():
-    prices = pd.DataFrame({"sh600000": [1.0, 2.0]})
-
     with pytest.raises(MarketDataError, match="DatetimeIndex"):
-        build_valuation(prices, FakeFinancials())
+        build_valuation(pd.DataFrame({"sh600000": [1.0, 2.0]}), FakeFinancials())
 
 
 def test_an_unsorted_index_is_rejected():
     """按公告日点取依赖有序索引；无序会让 ``ffill`` 静默取错值。"""
-    prices = frame([1.0, 2.0, 3.0]).iloc[::-1]
-
     with pytest.raises(MarketDataError, match="升序"):
-        build_valuation(prices, FakeFinancials())
+        build_valuation(frame([1.0, 2.0, 3.0]).iloc[::-1], FakeFinancials())
+
+
+# --- 为什么必须照通达信的口径（票据 #48） --------------------------------------
+
+
+def test_the_hand_rolled_annualisation_would_have_produced_a_false_positive():
+    """**本组的核心**：自创的「年化 EPS」口径会让 `sz002692` 变成假阳性买入。
+
+    真实数字（2025-09-02，`sz002692`）：
+
+    - 通达信口径：PE **61.07**、百分位 **91.82%**、PEG **−36.57** → 「百分位 < 8%」不通过
+    - 自创口径（年化 EPS + 滞后同比）：PE **50.60**、百分位 **2.55%**、PEG **+0.42** → 通过
+
+    差别全在 PE 的算法上：自创口径用「累计 EPS × 年化系数」，而该股 2021 年半年报净利仅
+    870 万元，年化后 PE 冲到 **931**；那个极值进入 1000 日窗口后把分母撑大，于是**之后整整
+    4 年**的百分位都被压低。
+
+    这里用简化数据把那条机制复现出来：同一段 PE 序列，其中一个「被年化放大的极值」会把
+    后续分位压低。
+    """
+    # 末值 55、窗口最低 50；被放大的极值把窗口上界抬到 931，于是分位被压到 0.6%；
+    # 换成真实的次高值 100 时是 10%——**跨越了 8% 这条买入门槛**。
+    pe_with_spike = frame([931.25, 50.0, 60.0, 55.0])
+    pe_without = frame([100.0, 50.0, 60.0, 55.0])
+
+    with_spike = pe_percentile(pe_with_spike, window=4)
+    without = pe_percentile(pe_without, window=4)
+
+    last = pd.Timestamp(pe_with_spike.index[-1])
+    assert with_spike.loc[last, "sh600000"] < 0.08, "被放大的极值让「< 8%」凭空通过"
+    assert without.loc[last, "sh600000"] > 0.08, "换成真实的次高值就通不过"
+    assert with_spike.loc[last, "sh600000"] < without.loc[last, "sh600000"]

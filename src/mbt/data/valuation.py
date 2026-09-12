@@ -1,24 +1,43 @@
-"""估值信号：动态PE、PE 百分位、PEG（票据 #37）。
+"""估值信号：动态PE、PE 百分位、PEG（票据 #37、#48）。
 
 把「收盘价」与「按期财务」合成 **date × 标的** 形状的估值序列，供选股规则与策略共用
 （ADR-0001：同一条件不必写两遍）。本模块与 :mod:`mbt.data.fundamental` 同属数据层——财务
 派生的信号放这里而非 ``mbt.signals``，先例是 ``non_loss_mask``：那是纯 pandas 运算，但它
 要读财务数据，而 ``mbt.signals`` 是「无 I/O 无状态」的纯函数库。
 
-## 三个口径（都已钉死；改动会改变每一个数字）
+## 口径照抄通达信原式，不自创
 
-**动态PE = 收盘价 ÷ 年化每股收益**，年化系数按**报告期**取（通达信口径）::
+三个公式与 TDX 的「市盈率」公式**逐项对齐**（历史分支），因为行情软件里的 PE/PEG 就是它算的，
+而自创口径的最初一版实测已经造成过假阳性买入（见下）::
 
-    报告期   03-31   06-30   09-30   12-31
-    系数         4       2     4/3       1
+    PE历史   = FINVALUE(238) * C / FINVALUE(276)      # 总股本 × 收盘价 ÷ 归母净利TTM
+    增历史   = FINVALUE(184)                            # 归母净利**当期**累计同比(%)
+    PE百分位 = (PE − LLV(PE,DUR)) / (HHV(PE,DUR) − LLV(PE,DUR))
+    PEG      = IF(PE>0 AND ABS(增)>0.1 AND 财年T>0, PE/增, DRAWNULL)
 
-刻意用「累计 EPS × 系数」而不是 PE(TTM)：前者就是行情软件里显示的「动态市盈率」，与
-需求口径一致。代价是 **Q1 × 4 会放大季节性**——一家收入集中在四季度的公司，用一季报年化会
-高估其估值。
+**动态PE 用 `利润TTM` 这个现成字段**，而不是「累计每股收益 × 年化系数」。后者是自创口径，
+`Q1 × 4` 假定一季度占全年四分之一——实测 `sh600988` 的 2023Q1 只占全年约 10%（PE 被高估到
+85）、`sz002692` 的 2021H1 净利仅 870 万（PE 冲到 931）。**代价落在百分位上**：被撑大的极值
+进入 LLV/HHV 窗口后，会把之后整整 `DUR` 个交易日的分位都压低——实测 `sz002692` 在
+2025-09-02 因此得到百分位 **2.55%**（通过「< 8%」而买入），而通达信口径是 **91.82%**
+（根本不该买）。
 
-**PE 百分位 = (PE − LLV(PE, w)) / (HHV(PE, w) − LLV(PE, w))**，``w`` 默认 1000 个交易日。
-``LLV``/``HHV`` 取**含当日**的窗口，且**不足 w 根时按可得历史算**（通达信语义）。故次新股的
-「百分位」是短窗口上的百分位，其含义随上市时间漂移——这是刻意保留的口径，不是疏漏。
+**增长率用 `增历史`（当期累计同比）**，不是滞后一年的同比。滞后口径实测会把恶化藏住：
+`sz002692` 的 2025-06-30 当期同比是 **−1.67%**，而「上一年同期那一期」的同比是 **+120.89%**
+（基期净利仅 1932 万），于是 PEG 从通达信的 **−36.57** 变成 **+0.42**——符号相反。
+
+**PEG 有 `|增长率| > 0.1` 的守卫**：增长率接近 0 时 PEG 是个巨大的数，那不是「贵」，是
+没有意义。
+
+.. note::
+
+    通达信原式里 PEG 还有第三个条件 ``财年T>0``，而 `财年T` 来自 `GPONEDAT(4)`——那是
+    **专业财务数据**（``vipdoc/cw/gp*.dat``），本项目尚未解析。同一条公式的**前瞻分支**
+    （``PE前瞻 = C/EPS_T``、``增预期``）也依赖它。故**当前只实现历史分支**，且省略该条件。
+
+**PE 百分位**取**含当日**的窗口，且**不足 ``window`` 根时按可得历史算**（通达信 ``LLV``/``HHV``
+语义）。故次新股的「百分位」是短窗口上的百分位，其含义随上市时间漂移——这是照原式的结果，
+不是疏漏。
 
 .. warning::
 
@@ -26,29 +45,7 @@
     亏损季度时 PE 曾为负，于是 ``LLV`` 是个负数，此后即使 PE 只是 20（对一家持续盈利的公司
     算便宜），百分位也会被抬高。例：``LLV=-50、HHV=40、PE=20`` → 百分位 ``0.78``。
 
-    之所以照原样实现：需求方明确选了「公式原样（通达信语义）」，而「只让正 PE 参与」是本项目
-    无法替你决定的口径取舍。若要去掉这个失真，改 :func:`pe_percentile` 的入参即可（先把
-    非正值置为缺失）——那会变成另一个口径，需要另行登记。
-
-**PEG = 动态PE ÷ 盈利增长率(%)**，增长率是**归母净利润累计同比**::
-
-    (本期累计 − 去年同期累计) / |去年同期累计| × 100
-
-用累计同比而非单季是为了避开季节性；分母取**绝对值**，则「由亏转盈」这类负基数情形的符号
-仍有意义（否则负基数会让「增长」的符号反过来）。
-
-**增长率取哪一期的同比（``growth_lag_years``，默认 1）**：一份新财报 ``P`` 公告时，用它自己
-那份同比，还是用**上一年同期那一期** ``P−1y`` 的同比？
-
-- ``0`` —— 本期自己的同比 ``(NP(P) − NP(P−1y)) / |NP(P−1y)|``；
-- ``1``（默认）—— 上一年同期那一期的同比 ``(NP(P−1y) − NP(P−2y)) / |NP(P−2y)|``。
-
-选 1 的含义是「接受更**陈旧**的增长」：它避开最新一期的噪声与季节扰动，代价是与当期前景的
-关系更弱。实测茅台（2026-09-11）两种口径差一个符号——本期同比 **−1.95%**、上一年同期的同比
-**+8.89%**，而 ``0 < PEG`` 是买入条件之一，故这一项直接改变选股结果。
-
-两种口径都**时点正确**：``P−1y`` 的同比在 ``P`` 公告时早已可算（它只依赖更早的公告），
-故不引入未来信息。
+    这与通达信一致，故保留；要改就是**另一个口径**，需另行登记。
 
 ## 时点正确性（ADR-0006）
 
@@ -60,8 +57,8 @@
 
 ## 有效起点
 
-财务数据 2005 年前不可用，加上 ``w`` 个交易日的回看，能算出百分位的最早日子在 2010 前后。
-这不是本模块的限制，是数据事实——**回测起点因此被财务数据决定，而不是被行情数据决定**。
+财务数据 2005 年前不可用，加上 ``window`` 个交易日的回看，能算出百分位的最早日子在 2010
+前后。这不是本模块的限制，是数据事实——**回测起点因此被财务数据决定，而不是被行情数据决定**。
 """
 
 from __future__ import annotations
@@ -84,43 +81,35 @@ PEG = "peg"
 #: 本模块产出的字段，按构造顺序。给调用方**显式声明**用（与 ``SCREEN_FIELDS`` 同一精神）。
 VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG)
 
-#: 报告期月份 → 年化系数。只认四个季末；别的月份说明报告期不是季末，**报错而不猜**。
-_ANNUALISATION = {3: 4.0, 6: 2.0, 9: 4.0 / 3.0, 12: 1.0}
-
 #: 百分位的默认窗口（交易日）——约 4 年。
 DEFAULT_WINDOW = 1000
 
-#: PEG 的增长率默认取**几年之前那一期**的同比。``1`` = 上一年同期那一期。
-#:
-#: 口径与代价见模块文档的「PEG 取哪一期的同比」一节。
-DEFAULT_GROWTH_LAG_YEARS = 1
 
+def price_earnings_ratio(
+    close: pd.DataFrame, shares: pd.DataFrame, profit_ttm: pd.DataFrame
+) -> pd.DataFrame:
+    """``PE = 总股本 × 收盘价 ÷ 归母净利润TTM``（总市值 ÷ TTM 净利）。
 
-def annualisation_factor(report_period: dt.date) -> float:
-    """报告期对应的年化系数（见模块文档的表）。
+    这就是通达信 `FINVALUE(238)*C/FINVALUE(276)` 的口径，与行情软件里显示的市盈率一致。
 
-    抛:
-        MarketDataError: 报告期不在四个季末。**不猜**一个系数——猜错会让 PE 整体偏一个倍数，
-            而那种错误不会报错。
+    .. warning::
+
+        **不要退回「累计每股收益 × 年化系数」那一版。** 它靠 `×4 / ×2 / ×4÷3` 把一季报
+        年化，而 `Q1 × 4` 假定一季度占全年四分之一——实测 `sh600988` 的 2023Q1 只占全年
+        约 10%，于是 PE 被高估到 **85**（真实约 34.7），`sz002692` 的 2021H1 净利仅 870 万，
+        年化后 PE 冲到 **931**。
+
+        单看「当天 PE 偏一点」还不够严重；真正的代价在**百分位**：一个被撑大的极值进入
+        LLV/HHV 窗口后，会把之后**整整 `window` 个交易日**的分位都压低。实测 `sz002692`
+        在 2025-09-02 的年化口径给出百分位 **2.55%**（假阳性买入），而 TTM 口径是 **91.82%**。
+
+    分子分母任一缺失处即缺失；``利润TTM`` 为 0 处也判缺失（除零无意义），而**负值照常算出
+    负 PE**——「PE > 0」是过滤条件的事，不是计算的事。
     """
-    try:
-        return _ANNUALISATION[report_period.month]
-    except KeyError:
-        raise MarketDataError(
-            f"报告期 {report_period.isoformat()} 不是季末，无从取年化系数。"
-            f"本模块只认 {sorted(_ANNUALISATION)} 四个月份"
-        ) from None
-
-
-def price_earnings_ratio(close: pd.DataFrame, earnings: pd.DataFrame) -> pd.DataFrame:
-    """``PE = 收盘价 ÷ 年化每股收益``。两者任一缺失处即缺失。
-
-    每股收益为 0 处也判为缺失（除零无意义），而**负值照常算出负 PE**——「PE > 0」是过滤条件
-    的事，不是计算的事（少一个隐含分支，就少一处会漂移的地方）。
-    """
-    _require_same_shape(close, earnings, "收盘价", "年化每股收益")
-    safe = earnings.where(earnings != 0)
-    return close / safe
+    _require_same_shape(close, shares, "收盘价", "总股本")
+    _require_same_shape(close, profit_ttm, "收盘价", "归母净利润TTM")
+    safe = profit_ttm.where(profit_ttm != 0)
+    return close * shares / safe
 
 
 def pe_percentile(pe: pd.DataFrame, window: int = DEFAULT_WINDOW) -> pd.DataFrame:
@@ -142,14 +131,27 @@ def pe_percentile(pe: pd.DataFrame, window: int = DEFAULT_WINDOW) -> pd.DataFram
     return ((pe - lowest) / span.where(span != 0)).clip(lower=0.0, upper=1.0)
 
 
+#: PEG 只在**增长率绝对值**大于它时才有意义。
+#:
+#: 通达信原式：``PEG:IF(选用PE>0 AND ABS(选用增)>0.1 AND 财年T>0, 选用PE/选用增, DRAWNULL)``。
+#: 增长率接近 0 时除数极小，PEG 会是个巨大的数——那不是「贵」，是**没有意义**，故取缺失。
+MIN_GROWTH_ABS = 0.1
+
+
 def price_earnings_growth(pe: pd.DataFrame, growth_pct: pd.DataFrame) -> pd.DataFrame:
-    """``PEG = PE ÷ 盈利增长率(%)``。增长率为 0 处缺失（除零无意义）。
+    """``PEG = PE ÷ 盈利增长率(%)``；``PE ≤ 0`` 或 ``|增长率| ≤ 0.1`` 处为缺失。
 
     增长率是**百分数**（30 表示 30%），故 PEG 的量纲与常用读数一致（PE 15、增长 30 → 0.5）。
+
+    .. note::
+
+        通达信原式里还有第三个条件 ``财年T>0``——`财年T` 来自 `GPONEDAT(4)`，属于**专业财务
+        数据**（`vipdoc/cw/gp*.dat`），本项目尚未解析。故本实现只保留前两个条件；这个差额
+        已登记在票据待办里。
     """
     _require_same_shape(pe, growth_pct, "动态PE", "盈利增长率")
-    safe = growth_pct.where(growth_pct != 0)
-    return pe / safe
+    usable = (pe > 0) & (growth_pct.abs() > MIN_GROWTH_ABS)
+    return (pe / growth_pct).where(usable)
 
 
 @dataclass(frozen=True)
@@ -176,7 +178,6 @@ def build_valuation(
     financials,
     *,
     window: int = DEFAULT_WINDOW,
-    growth_lag_years: int = DEFAULT_GROWTH_LAG_YEARS,
 ) -> Valuation:
     """由收盘价与按期财务算出三个估值序列。
 
@@ -185,9 +186,6 @@ def build_valuation(
         financials: :class:`~mbt.data.fundamental.CwDataSource`（或任何提供 ``records(symbol)``
             的对象）。按**公告日**点取（ADR-0006）。
         window: 百分位窗口，默认 :data:`DEFAULT_WINDOW`。
-        growth_lag_years: PEG 的增长率取**几年之前那一期**的同比。默认
-            :data:`DEFAULT_GROWTH_LAG_YEARS`（1，即上一年同期）；传 ``0`` 即用本期自己那份
-            同比（改动前的行为）。
 
     返回:
         :class:`Valuation`。三个序列与 ``close`` 的索引、列完全一致。
@@ -203,22 +201,12 @@ def build_valuation(
         raise MarketDataError("收盘价的索引必须升序——按公告日点取依赖有序索引")
     if window < 1:
         raise ValueError(f"窗口至少为 1，收到 {window}")
-    if growth_lag_years < 0:
-        raise ValueError(f"增长率的滞后期数不能为负，收到 {growth_lag_years}")
 
-    earnings = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
-    growth = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
+    shares = _point_in_time_frame(close, financials, "total_shares")
+    ttm = _point_in_time_frame(close, financials, "profit_ttm")
+    growth = _point_in_time_frame(close, financials, "growth_ytd")
 
-    for symbol in close.columns:
-        records = [record for record in financials.records(symbol) if record.usable]
-        if not records:
-            continue
-        earnings[symbol] = _point_in_time(_earnings_steps(records), close.index)
-        growth[symbol] = _point_in_time(
-            _growth_steps(records, lag_years=growth_lag_years), close.index
-        )
-
-    pe = price_earnings_ratio(close, earnings)
+    pe = price_earnings_ratio(close, shares, ttm)
     return Valuation(
         pe=pe,
         pe_percentile=pe_percentile(pe, window),
@@ -226,77 +214,34 @@ def build_valuation(
     )
 
 
-def _earnings_steps(records) -> list[tuple[dt.date, float]]:
-    """``(公告日, 年化每股收益)``，按公告日升序。"""
-    steps = [
-        (
-            record.announcement_date,
-            record.values["eps_ytd"] * annualisation_factor(record.report_period),
-        )
-        for record in records
-    ]
-    return sorted(steps, key=lambda step: step[0])
+def _point_in_time_frame(close: pd.DataFrame, financials, field: str) -> pd.DataFrame:
+    """把某个财务字段铺成与 ``close`` 同形的逐日序列（按**公告日**点取，ADR-0006）。
 
-
-def _growth_steps(records, *, lag_years: int = 1) -> list[tuple[dt.date, float]]:
-    """``(公告日, 归母净利润累计同比%)``，按公告日升序。
-
-    去年同期那一期**必须也是可用记录**（公告日可信）——否则算出的同比会建立在一条占位符
-    记录上，而那正是 :attr:`FinancialRecord.usable` 要挡的东西。
-
-    ``lag_years`` 决定**取哪一期的同比**：
-
-    - ``0`` —— 取**本期**的同比 ``(NP(P) − NP(P−1y)) / |NP(P−1y)|``；
-    - ``1``（默认）—— 取**上一年同期那一期**的同比 ``(NP(P−1y) − NP(P−2y)) / |NP(P−2y)|``。
-
-    即「一份新财报公告时，用它给自己算同比」还是「用它**一年前那一期**的同比」。后者更陈旧、
-    也更钝（避开了最新一期的噪声与季节扰动），见模块文档。
+    公告之前的交易日是**缺失**（那时还不知道），而不是 0——给 0 会让 PE 变成无穷大或 0，
+    属于凭空造数。
     """
-    by_period = {record.report_period: record for record in records}
-
-    growth_by_period: dict[dt.date, float] = {}
-    for period, record in by_period.items():
-        previous = by_period.get(_shift_years(period, 1))
-        if previous is None:
-            continue
-        before = previous.values["net_profit_ytd"]
-        if before == 0:
-            continue  # 基数为 0，同比无定义
-        now = record.values["net_profit_ytd"]
-        growth_by_period[period] = (now - before) / abs(before) * 100.0
-
-    steps = []
-    for record in records:
-        value = growth_by_period.get(_shift_years(record.report_period, lag_years))
-        if value is None:
-            continue
-        steps.append((record.announcement_date, value))
-    return sorted(steps, key=lambda step: step[0])
-
-
-def _shift_years(period: dt.date, years: int) -> dt.date | None:
-    """同期往前推 ``years`` 年。2 月 29 日在季末不会出现，但仍防御一下。"""
-    if years == 0:
-        return period
-    try:
-        return dt.date(period.year - years, period.month, period.day)
-    except ValueError:
-        return None
+    out = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
+    for symbol in close.columns:
+        steps = sorted(
+            (record.announcement_date, record.values[field])
+            for record in financials.records(symbol)
+            if record.usable
+        )
+        if steps:
+            out[symbol] = _point_in_time(steps, close.index)
+    return out
 
 
 def _point_in_time(steps: list[tuple[dt.date, float]], index: pd.DatetimeIndex) -> pd.Series:
     """把 ``(公告日, 值)`` 铺成逐日序列：某日取**当日及以前**最近一条公告的值。
 
-    这正是 ADR-0006 的落点：按公告日而非报告期。公告之前的交易日是**缺失**（那时还不知道），
-    而不是 0——给 0 会让 PE 变成无穷大或 0，属于凭空造数。
+    同日多条公告（罕见，例如年报与一季报同日）保留**后出现**的那条。
     """
     if not steps:
         return pd.Series(np.nan, index=index, dtype=float)
 
     stamps = pd.DatetimeIndex([stamp for stamp, _ in steps])
     values = pd.Series([value for _, value in steps], index=stamps, dtype=float)
-    # 同日多条公告（罕见，例如年报与一季报同日）保留**后出现**的那条：``_earnings_steps`` 已按
-    # 公告日排序，而 Python 的排序是稳定的，故「后出现」即列表里靠后的那条。
     values = values[~values.index.duplicated(keep="last")].sort_index()
     return values.reindex(index, method="ffill")
 
@@ -340,7 +285,6 @@ def valuation_for(
     financials,
     *,
     window: int = DEFAULT_WINDOW,
-    growth_lag_years: int = DEFAULT_GROWTH_LAG_YEARS,
 ) -> Valuation:
     """由一组**原始**行情算出估值三序列——库里唯一那个「组装」入口。
 
@@ -358,7 +302,6 @@ def valuation_for(
         markets: 一组 :class:`~mbt.data.market.MarketData`（**原始价**）。
         financials: :class:`~mbt.data.fundamental.CwDataSource` 之类。
         window: 百分位窗口。
-        growth_lag_years: PEG 的增长率取**几年之前那一期**的同比，见 :func:`build_valuation`。
 
     返回:
         :class:`Valuation`，索引与列取自各标的收盘价的**并集**（与引擎时钟一致）。
@@ -369,7 +312,7 @@ def valuation_for(
         raise MarketDataError("算估值至少要有一个标的")
 
     close = assemble_panel(list(markets), ["close"])["close"]
-    return build_valuation(close, financials, window=window, growth_lag_years=growth_lag_years)
+    return build_valuation(close, financials, window=window)
 
 
 def _require_same_shape(left: pd.DataFrame, right: pd.DataFrame, left_name, right_name) -> None:
