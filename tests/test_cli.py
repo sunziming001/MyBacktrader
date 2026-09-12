@@ -116,9 +116,10 @@ def screen_args(**overrides):
 # --- 参数解析 -----------------------------------------------------------------
 
 
-def test_the_parser_has_two_subcommands():
+def test_the_parser_has_three_subcommands():
+    """三条命令：回测、选股、更新检查。"""
     parser = build_parser()
-    assert set(parser._subparsers._group_actions[0].choices) == {"backtest", "screen"}
+    assert set(parser._subparsers._group_actions[0].choices) == {"backtest", "screen", "update"}
 
 
 def test_start_defaults_to_the_fully_priceable_window():
@@ -548,6 +549,199 @@ def test_the_extra_mask_is_loaded_from_the_cw_directory(tmp_path):
 
     assert run_backtest_command(args, stdout=out, stderr=err) == 1
     assert "财务数据读取失败" in err.getvalue()
+
+
+# --- update 子命令 -----------------------------------------------------------
+
+
+def update_args(**overrides):
+    base = dict(
+        command="update",
+        tdx_root=None,
+        baseline=None,
+        limit=None,
+        symbols_file=None,
+        save_baseline=None,
+    )
+    base.update(overrides)
+    return type("Args", (), base)
+
+
+def test_the_update_command_builds_a_baseline_and_saves_it(tmp_path):
+    """首次运行建立基线，退出码 `0`（**首次没有可比对象不是错误**）。"""
+    from mbt.cli import run_update_command
+
+    root, _ = make_dataroot(tmp_path)
+    baseline = tmp_path / "boundaries.csv"
+    args = update_args(tdx_root=str(root), save_baseline=str(baseline))
+    out, err = capture()
+
+    code = run_update_command(args, stdout=out, stderr=err)
+
+    assert code == 0, err.getvalue()
+    assert "首次运行" in out.getvalue()
+    assert baseline.is_file()
+
+
+def test_a_symbol_that_vanished_from_the_source_is_reported(tmp_path):
+    """基线里有、这次取不到的标的 → **已消失**，并让退出码为 1。
+
+    它同样让旧结果作废（样本少了一只），且必须报出来——否则会静默地从基线里消失。
+    """
+    from mbt.data.updates import MISSING, SymbolBoundary, check_updates
+
+    root, _ = make_dataroot(tmp_path)
+    ghost = SymbolBoundary(
+        symbol="sz000999",
+        first_date=pd.Timestamp("2024-01-02").date(),
+        last_date=pd.Timestamp("2024-03-01").date(),
+        bars=40,
+        tail_digest="whatever",
+    )
+
+    report = check_updates(["sh600000"], tdx_root=root, previous={"sz000999": ghost})
+
+    assert report.by_kind.get(MISSING) == ["sz000999"]
+    assert report.needs_rerun is True
+    assert "sz000999" in report.revised
+
+
+def test_an_unreadable_symbol_is_reported_not_silently_dropped(tmp_path):
+    """取不到数据 ≠ 没变化：**必须报出来**，否则「上次查过、这次没了」会无人知晓。"""
+    from mbt.data.updates import check_updates
+
+    root, _ = make_dataroot(tmp_path)
+    # 造一个「文件存在但内容坏掉」的标的：长度不是记录长度的整数倍
+    broken = root / "sz" / "lday" / "sz000002.day"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_bytes(b"\x00" * 7)
+
+    report = check_updates(["sh600000", "sz000002"], tdx_root=root)
+
+    assert report.unreadable == ("sz000002",)
+    assert "sz000002" not in report.boundaries
+
+
+def test_the_update_command_reports_a_revision_with_exit_code_one(tmp_path):
+    """**有回补/修正 → 退出码 1**：那意味着上次的回测结果作废了，脚本应当知道。"""
+    from mbt.cli import run_update_command
+
+    root, _ = make_dataroot(tmp_path)
+    baseline = tmp_path / "boundaries.csv"
+    run_update_command(
+        update_args(tdx_root=str(root), save_baseline=str(baseline)),
+        stdout=capture()[0],
+        stderr=capture()[1],
+    )
+
+    # 改掉倒数第 2 根 K 线的四个价格（只改收盘会造出自洽性错误而被拒绝）
+    path = root / "sh" / "lday" / "sh600000.day"
+    raw = bytearray(path.read_bytes())
+    import struct as _struct
+
+    offset = len(raw) - 2 * 32
+    date, o, h, low, close, amount, volume, reserved = _struct.unpack_from("<IIIIIfII", raw, offset)
+    _struct.pack_into("<IIIIIfII", raw, offset, date, 999, 999, 999, 999, amount, volume, reserved)
+    path.write_bytes(bytes(raw))
+
+    args = update_args(tdx_root=str(root), baseline=str(baseline))
+    out, err = capture()
+    code = run_update_command(args, stdout=out, stderr=err)
+
+    assert code == 1, err.getvalue()
+    assert "回补/修正" in out.getvalue()
+    assert "不再可信" in out.getvalue()
+
+
+def test_the_update_command_reports_an_unchanged_baseline_with_exit_code_zero(tmp_path):
+    from mbt.cli import run_update_command
+
+    root, _ = make_dataroot(tmp_path)
+    baseline = tmp_path / "boundaries.csv"
+    run_update_command(
+        update_args(tdx_root=str(root), save_baseline=str(baseline)),
+        stdout=capture()[0],
+        stderr=capture()[1],
+    )
+
+    out, err = capture()
+    code = run_update_command(
+        update_args(tdx_root=str(root), baseline=str(baseline)), stdout=out, stderr=err
+    )
+
+    assert code == 0, err.getvalue()
+    assert "无变化" in out.getvalue()
+
+
+def test_the_update_command_reports_tail_gaps_and_flags_them_undecidable(tmp_path):
+    """尾部空缺要报出来，并**显式声明停牌与退市不可区分**——不猜。"""
+    from mbt.cli import run_update_command
+
+    root, gbbq = make_dataroot(tmp_path, symbol="sh600000", periods=80)
+    shorter = pd.bdate_range("2024-01-02", periods=40)
+    write_day(
+        root / "sz" / "lday" / "sz000001.day",
+        [(int(f"{stamp:%Y%m%d}"), 1000, 1000, 1000, 1000, 0.0, 1000) for stamp in shorter],
+    )
+    args = update_args(tdx_root=str(root))
+    out, err = capture()
+
+    code = run_update_command(args, stdout=out, stderr=err)
+
+    assert code == 0, err.getvalue()
+    assert "尾部空缺" in out.getvalue()
+    assert "停牌还是退市" in out.getvalue(), "必须显式声明停牌与退市不可区分"
+
+
+def test_all_user_facing_output_is_gbk_encodable(tmp_path):
+    """**CLI 的输出必须能在中文 Windows 控制台上打印。**
+
+    这条是实跑真实数据时撞出来的：输出里用了 ``⚠️``，而中文 Windows 控制台是 GBK，
+    打印时直接抛 ``UnicodeEncodeError: 'gbk' codec can't encode character``——**命令整体失败**，
+    而那与「数据有问题」完全无关，排查起来很费劲。
+
+    判据是「把每一行输出按 GBK 编码时不抛错」。用真流做，比逐字符串断言更接近实际。
+    """
+    from mbt.cli import run_update_command
+
+    root, _ = make_dataroot(tmp_path)
+    args = update_args(tdx_root=str(root), save_baseline=str(tmp_path / "b.csv"))
+
+    out, err = capture()
+    code = run_update_command(args, stdout=out, stderr=err)
+    assert code == 0, err.getvalue()
+
+    for line in (out.getvalue() + err.getvalue()).splitlines():
+        line.encode("gbk")  # 抛 UnicodeEncodeError 即失败
+
+
+def test_the_update_command_rejects_a_missing_baseline_file(tmp_path):
+    """给了 `--baseline` 却指了个不存在的文件要**报错**，不静默当成首次。"""
+    from mbt.cli import run_update_command
+
+    root, _ = make_dataroot(tmp_path)
+    args = update_args(tdx_root=str(root), baseline=str(tmp_path / "nope.csv"))
+    out, err = capture()
+
+    assert run_update_command(args, stdout=out, stderr=err) == 1
+    assert "边界清单不存在" in err.getvalue()
+
+
+def test_a_degraded_calendar_is_warned_about(tmp_path):
+    """`--limit` / `--symbols-file` 会削弱判据（市场日历不完整），故必须**警告**。
+
+    不警告的话，「区间内缺口看不见、尾部空缺偏小」会被当成「数据没问题」。
+    """
+    from mbt.cli import run_update_command
+
+    root, _ = make_dataroot(tmp_path)
+    args = update_args(tdx_root=str(root), limit=1)
+    out, err = capture()
+
+    run_update_command(args, stdout=out, stderr=err)
+
+    assert "警告" in err.getvalue()
+    assert "市场日历" in err.getvalue()
 
 
 def test_a_malformed_as_of_is_reported(tmp_path):

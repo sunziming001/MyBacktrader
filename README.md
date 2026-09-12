@@ -181,7 +181,7 @@ python -m venv .venv
 
 ## 用法
 
-命令行有两条命令。**内核始终是库**——CLI 只做参数搬运，全部逻辑在 `mbt.cli` 的两个纯函数里，
+`mbt` 有**三条**命令。**内核始终是库**——CLI 只做参数搬运，全部逻辑在 `mbt.cli` 的三个纯函数里，
 测试直接调库而不靠 shell 命令硬凑。
 
 ```powershell
@@ -203,6 +203,26 @@ python -m venv .venv
 
 `--strategy` 用**导入路径**（`module:Class`），与产物元数据里记的写法**同一种**，故复现时不必
 再翻译一次。当前工作目录会被加入 `sys.path`，所以站在自己的策略目录里就能直接跑。
+
+还有一条 `mbt update` 回答**「我的数据变了没有、变了要不要重跑」**（票据 [#9](https://github.com/sunziming001/MyBacktrader/issues/9)）：
+
+```powershell
+mbt update --tdx-root D:\Tools\new_tdx\vipdoc                          # 建立基线（首次）
+mbt update --tdx-root ... --baseline runs\boundaries.csv `
+           --save-baseline runs\boundaries.csv                          # 比对并更新基线
+```
+
+它**不落盘任何行情数据**——不做缓存、不改数据源，只比对边界并报告（唯一写入的是
+`--save-baseline` 指定的那份清单 CSV）。判据是**内容**（最后 5 根 K 线的日期与收盘价）
+而**不是 `mtime`**：通达信客户端每天重写这些文件，用 `mtime` 会每天报「全部标的都变了」。
+
+- **无变化 / 纯追加** → 退出码 `0`（旧结果仍有效）；
+- **回补/修正**、或标的**从数据源消失** → 退出码 `1`，并打印「旧回测结果不再可信，请重跑」；
+- **尾部空缺**只报事实，并显式标注**停牌与退市在本地数据里不可区分**（见
+  [ADR-0005](docs/adr/0005-data-gap-discipline.md) 的修订）。
+
+`--limit` / `--symbols-file` 会**削弱**这个判据（市场日历由被检查的标的构成，只查一部分会让
+区间内缺口看不见、尾部空缺偏小），故二者被使用时程序会打印警告。查全市场才是准确用法。
 
 两条默认值是刻意的，不是随手取的：
 
