@@ -1,9 +1,17 @@
 # 通达信 (TDX) 专业财务数据 format — `vipdoc/cw`
 
-**Scope.** Empirical (byte-level) investigation of the local TDX installation at `D:\Tools\tdx\vipdoc\cw`
-(Windows, Python 3.10.6). Every **[VERIFIED]** claim below was produced by reading the actual bytes on this
-machine; **[SECONDARY]** means it comes only from an external document/repository. No files outside
-`G:\MyProject\MyBacktrader` were modified. Research date: 2026-09-11.
+**Scope.** Empirical (byte-level) investigation of the local TDX installation's `vipdoc/cw` directory
+(Windows, Python 3.10.6). Every **[VERIFIED]** claim below was produced by reading actual bytes with an
+independent script; **[SECONDARY]** means it comes only from an external document/repository.
+
+> **路径已变更（2026-09-12 更正）**：本报告写于另一台机器状态上，当时记录的是 `D:\Tools\tdx\vipdoc\cw`，
+> 而**本机实际安装在 `D:\Tools\new_tdx\vipdoc\cw`**（`D:\Tools\tdx` 不存在）。文末提到的
+> `G:\MyProject\MyBacktrader\.scratch\cw_research\`（`G:` 盘现亦不存在）是**研究期间的临时脚本**，
+> 未提交、现已失。复现请用 [§Reproduce](#reproduce) 里描述的方法，不要去找那两个路径。
+>
+> **头部读法已更正**：下文 §2A 曾把头部写成一个 struct 串 `'<1hI1H3L'`，而该串只产出 **6** 个值、
+> 与它自己的偏移表（7 个字段：0/2/6/8/10/12/16）**对不上**。**偏移表是对的**——实现按显式偏移读，
+> 并在全部 147 个文件上验证了帧恒等式（见 §Reproduce）。以偏移表为准，不要用那个 struct 串。
 
 ---
 
@@ -128,7 +136,7 @@ The frame is not ambiguous in practice: the header self-describes `nstk`, index-
 All non-empty files use `index_entry = 11` and `block = 2336`; the 26 empty files are a bare 20-byte header with the
 block-size field set to `0xFFFFFFFC` (`nstk=0`, so the identity still holds).
 
-**Header — 20 bytes** (`struct '<1hI1H3L'`, little-endian) **[VERIFIED]**:
+**Header — 20 bytes. 按偏移读**（**不要**用 §2A 早先写的 struct 串 `'<1hI1H3L'`——它与本表对不上）**[VERIFIED]**:
 
 | Offset | Type | Value (20251231 / 19911231) | Meaning |
 |---|---|---|---|
@@ -328,6 +336,11 @@ usable = ann > period_end and ann.year >= 2005        # guard against placeholde
 report period; the 2001 file is internally inconsistent (median lag ≈700 days) — do not trust pre-2005 values
 without a sanity filter.
 
+**已由实现固化（2026-09-12）**：上述两条已成为代码行为，而不再只是研究结论——见
+`src/mbt/data/fundamental.py`（`MIN_ANNOUNCEMENT_YEAR = 2005`、`FinancialRecord.usable`）与
+`tests/test_fundamental.py`。取数一律走「评估日 → 该日**已公告**的最近一期」，不可用者视为
+「无财务数据」，相关过滤返回假（排除）并留痕。
+
 ---
 
 ## 5. Per-report-period vs per-report-type; 累计 vs 单季
@@ -435,7 +448,12 @@ Every source consulted, with what it was used for:
 
 ### Reproduce
 
-Scratch scripts used (all under `G:\MyProject\MyBacktrader\.scratch\cw_research\`, read-only w.r.t. `D:\Tools\tdx`):
+复现方式（2026-09-12 更正）：本报告的方法**已由实现固化**——`src/mbt/data/fundamental.py` 按显式偏移
+读头部、按帧恒等式校验，`tests/test_fundamental.py` 用真实切片（`tests/fixtures/cw/gpcw20251231.dat`，
+7,061 字节）锁住字段索引与公告日。要复核本报告的数字，直接读该模块的文档串与测试即可，
+**不必**去找文末提到的 `.scratch` 脚本（未提交，且 `G:` 盘已不存在）。
+
+原始研究脚本（已失，仅存档其名）：
 `final_evidence.py` → `out_final.txt` (inventory, header/layout, hex dumps, field table, coverage);
 `final_ann2.py` → `out_ann2.txt` (announcement-date stats); `cumq.py` (累计 vs 单季);
 `curve.py` → `out_curve.txt` (per-period record counts); `sizes.py` (histograms, zip check);

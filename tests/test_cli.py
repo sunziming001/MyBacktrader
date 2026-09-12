@@ -14,6 +14,7 @@ import io
 import struct
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from conftest import GBBQ_FIXTURE
 
@@ -83,6 +84,8 @@ def make_args(**overrides):
         benchmark="sh000300",
         tdx_root=None,
         gbbq=None,
+        cw_root=None,
+        non_loss=False,
         output_dir=None,
         limit=None,
         symbols_file=None,
@@ -100,6 +103,8 @@ def screen_args(**overrides):
         top_n=2,
         tdx_root=None,
         gbbq=None,
+        cw_root=None,
+        non_loss=False,
         output_dir=None,
         limit=None,
         symbols_file=None,
@@ -478,6 +483,71 @@ def test_a_screen_run_writes_a_ranked_candidate_list(tmp_path):
     run_dir = next((tmp_path / "screens").iterdir())
     assert (run_dir / "candidates.csv").is_file()
     assert (run_dir / "run.json").is_file()
+
+
+def test_non_loss_requires_a_cw_root(tmp_path):
+    """`--non-loss` 不给 `--cw-root` 要报错——而不是静默忽略那个开关。"""
+    root, gbbq = make_dataroot(tmp_path)
+    args = make_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+        non_loss=True,
+        cw_root=None,
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 1
+    assert "cw-root" in err.getvalue()
+
+
+def test_non_loss_excludes_symbols_without_usable_financials(tmp_path):
+    """启用「非亏损」后，fixture 里没有财务数据的标的应被**排除**，而不是照旧放行。
+
+    这条同时验证「过滤真的接进了股票池」——若没接上，两只都会成交。
+    """
+    root, gbbq = make_dataroot(tmp_path, symbol="sh600000", periods=80)
+    # 再加一只 fixture 里没有财务数据的标的
+    write_day(
+        root / "sz" / "lday" / "sz000001.day",
+        [
+            (int(f"{stamp:%Y%m%d}"), 1000, 1000, 1000, 1000, 0.0, 1000)
+            for stamp in pd.bdate_range("2024-01-02", periods=80)
+        ],
+    )
+    cw_root = Path(__file__).parent / "fixtures" / "cw"
+    args = make_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+        start=None,
+        end=None,
+        non_loss=True,
+        cw_root=str(cw_root),
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "基本面过滤" in out.getvalue()
+    # fixture 里的 600000 有 2025 年报（公告日 2026-03-31），而数据是 2024 年 → 区间内没有
+    # 可用财报，故两只都被排除；这正是「宁可少收」的方向。
+    assert "0/2" in out.getvalue()
+
+
+def test_the_extra_mask_is_loaded_from_the_cw_directory(tmp_path):
+    """`--cw-root` 指错时要报错并指出问题，而不是静默当成「没有财务数据」。"""
+    root, gbbq = make_dataroot(tmp_path)
+    args = make_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+        non_loss=True,
+        cw_root=str(tmp_path / "没有这个目录"),
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 1
+    assert "财务数据读取失败" in err.getvalue()
 
 
 def test_a_malformed_as_of_is_reported(tmp_path):

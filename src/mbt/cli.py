@@ -36,10 +36,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from mbt.data import TdxDataSource, load_universe_data, slice_markets, stock_symbols
+from mbt.data import (
+    TdxDataSource,
+    load_financials,
+    load_universe_data,
+    non_loss_mask,
+    slice_markets,
+    stock_symbols,
+)
 from mbt.report import DEFAULT_BENCHMARK_SYMBOL, write_run_artifacts
 from mbt.screen import SCREEN_FIELDS, momentum_screen
-from mbt.universe import UniverseRules
+from mbt.universe import UniverseRules, combine_masks
 
 #: 费用口径全可查的最早日期（沪主板过户费自该日起按成交金额计）。见模块说明。
 DEFAULT_START = "2015-08-01"
@@ -75,6 +82,16 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--benchmark", default=DEFAULT_BENCHMARK_SYMBOL, help="基准标的")
     backtest.add_argument("--tdx-root", required=True, help="通达信 vipdoc 根目录")
     backtest.add_argument("--gbbq", required=True, help="权息文件 gbbq 的路径")
+    backtest.add_argument(
+        "--cw-root",
+        default=None,
+        help="财务数据目录（vipdoc/cw）。用 --non-loss 时必填",
+    )
+    backtest.add_argument(
+        "--non-loss",
+        action="store_true",
+        help="启用「非亏损」过滤（按公告日的累计归母净利润；缺财报的标的排除）",
+    )
     backtest.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
     backtest.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     backtest.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
@@ -91,6 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--top-n", type=int, default=10, help="取前 N 名")
     screen.add_argument("--tdx-root", required=True, help="通达信 vipdoc 根目录")
     screen.add_argument("--gbbq", required=True, help="权息文件 gbbq 的路径")
+    screen.add_argument(
+        "--cw-root",
+        default=None,
+        help="财务数据目录（vipdoc/cw）。用 --non-loss 时必填",
+    )
+    screen.add_argument(
+        "--non-loss",
+        action="store_true",
+        help="启用「非亏损」过滤（按公告日的累计归母净利润；缺财报的标的排除）",
+    )
     screen.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
     screen.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     screen.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
@@ -143,7 +170,32 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         )
         return 1
 
+    if args.non_loss and not args.cw_root:
+        print("错误：--non-loss 需要 --cw-root 指定财务数据目录（vipdoc/cw）", file=stderr)
+        return 1
+
     from mbt.backtest import run_portfolio_backtest  # 延迟导入：backtrader 只在真跑时才需要
+    from mbt.data.fundamental import load_financials, non_loss_mask
+
+    extra_mask = None
+    if args.non_loss:
+        try:
+            financials = load_financials(args.cw_root)
+            closes = pd.DataFrame(
+                {market.symbol: market.prices["close"] for market in loaded.markets}
+            )
+            extra_mask = non_loss_mask(financials, closes.index, closes.columns)
+            # 汇总要说得有信息量：`any()` 数的是「有过任一天通过的标的」，那会让人以为没筛掉
+            # 任何东西。真正要看的是**每个评估日**有多少标的通过。
+            per_day = extra_mask.sum(axis=1)
+            print(
+                f"基本面过滤：每个评估日平均 {per_day.mean():.0f}/{len(closes.columns)} 个标的通过"
+                f"（首个评估日 {int(per_day.iloc[0])} 个）",
+                file=stdout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"错误：财务数据读取失败——{type(exc).__name__}: {exc}", file=stderr)
+            return 1
 
     try:
         result = run_portfolio_backtest(
@@ -155,7 +207,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             commission_min=args.commission_min,
             commission_mode=args.commission_mode,
             slippage=args.slippage,
-            universe_rules=UniverseRules(),
+            universe_rules=UniverseRules(extra_mask=extra_mask),
             **params,
         )
     except Exception as exc:  # noqa: BLE001
@@ -218,9 +270,24 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     try:
         panel = assemble_panel(list(loaded.markets), SCREEN_FIELDS)
         pool = build_universe(list(loaded.markets), rules=UniverseRules())
-        # 默认规则取自**库**（`momentum_screen`），CLI 只指名它——「不含独立业务逻辑」。
+        masks = [pool]
+        # AC 要求「非亏损」过滤**同时**接入股票池与选股规则。选股侧走的是 `Screen.apply` 的
+        # `universe_mask`——它只收一份掩码，故在这里把股票池与基本面**合成**一份
+        # （`combine_masks` 就是为了这件事存在的，不然它会是个没有生产调用者的测试专用品）。
+        if args.non_loss:
+            if not args.cw_root:
+                print("错误：--non-loss 需要 --cw-root 指定财务数据目录", file=stderr)
+                return 1
+            financials = load_financials(args.cw_root)
+            masks.append(
+                non_loss_mask(
+                    financials, panel.fields["close"].index, panel.fields["close"].columns
+                )
+            )
+            print("基本面过滤：已按公告日叠加「非亏损」条件", file=stdout)
+
         result = momentum_screen(window=20, top_n=args.top_n).apply(
-            panel, as_of=as_of, universe_mask=pool
+            panel, as_of=as_of, universe_mask=combine_masks(*masks)
         )
         candidates = result.candidates(as_of)
     except Exception as exc:  # noqa: BLE001
