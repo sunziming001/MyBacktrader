@@ -83,6 +83,57 @@ class _EngineClock:
         return latest
 
 
+class _NextOnEveryBar:
+    """把 ``prenext`` 接到 ``next``：**晚上市的标的不再阻塞其余标的**（票据 #31）。
+
+    默认的 backtrader 只在**所有** data feed 都就绪之后才调 ``next()``，在那之前调
+    ``prenext()``（空实现）。后果是：只消一只标的上得晚，**其余标的在整个前半段一次都不被
+    策略看一眼**——而它们当时都在正常交易、也有信号。
+
+    实测（34 个标的、区间自 2020 起）：一只 2026-08 才上市的标的，把 ``next()`` 的首次调用
+    推到了第 926 根 K 线，即净值曲线的**前 3 年多全被跳过**。而净值曲线、年化、夏普都按整段
+    算——**策略只动了 24 天，指标却按 4 年算**。它不报错，图上也只是「一条平线」。
+
+    .. warning::
+
+        **放开调用时点会同时放开一个静默危害，必须知道。** 一个**尚未上市**的标的，
+        ``close[0]`` 给的不是「没有」，而是它**最后一根的价格**（即未来价）——实测乙的价格
+        序列是 10,13,…,37，未上市时 ``close[0]`` 返回 37.0、``sma[0]`` 返回 31.0。
+
+        故策略读价格前**必须**查 :attr:`AStockBroker.tradability_mask`（停牌与未上市都为
+        ``False``）。这项工作本来就要做——停牌日的 ``close[0]`` 也是陈旧价——只是「忘了查」
+        的后果从「拿到陈旧价」升级成了「拿到未来价」。
+
+        这个危害在修掉本票之前**被默认的等待机制掩盖着**：``next()`` 从不早于全体就绪，
+        策略便永远见不到未上市的标的。所以本改动不是引入新规矩，而是把一个既有的规矩变成了
+        必须遵守。
+
+    .. note::
+
+        ``len(self)`` 现在是「引擎跑到第几根」，包括那些还没有任何标的就绪的日子。故
+        ``if len(self) < N: return`` 这类「先观望 N 根」的写法**语义正确**——在修掉本票之前
+        它会被推后到「最后一只标的上市之后 N 根」。
+    """
+
+    def prenext(self):
+        self.next()
+
+
+def _always_next(strategy):
+    """返回一个「不等最后一只标的」的等价策略类；用户自己实现了 ``prenext`` 时原样返回。
+
+    ``prenext`` 的常见写法就是 ``def prenext(self): self.next()``。若用户已经这么写，再包一层
+    会让 ``next()`` 每根被调**两次**——那是静默的双倍交易，比不修更糟。故**显式实现优先**。
+    """
+    if getattr(strategy, "prenext", None) is not bt.Strategy.prenext:
+        return strategy
+    return type(
+        strategy.__name__,
+        (_NextOnEveryBar, strategy),
+        {"__module__": strategy.__module__, "__qualname__": strategy.__qualname__},
+    )
+
+
 class _EquityRecorder(_EngineClock, bt.Analyzer):
     """逐根 K 线记录组合总资产。"""
 
@@ -361,7 +412,7 @@ def _drive_engine(
         data._name = market.symbol
         cerebro.adddata(data)
 
-    cerebro.addstrategy(strategy, **strategy_params)
+    cerebro.addstrategy(_always_next(strategy), **strategy_params)
     if sizer is None:
         # `sizer_options` 在这里也要生效：默认 sizer 的 `headroom`（留余地比例）是 AC 要求
         # **可配置**的那一项，只在自定义 sizer 那条路径生效会让它不可达。

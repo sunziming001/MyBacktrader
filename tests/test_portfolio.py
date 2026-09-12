@@ -475,3 +475,169 @@ def test_the_fill_log_dates_also_come_from_the_engine_clock(make_market, zero_co
     dates = pd.to_datetime(result.trades["date"])
     assert dates.max() <= result.equity_curve.index.max()
     assert result.equity_curve.index.min() <= dates.min()
+
+
+# --- 晚上市的标的不阻塞其余标的（票据 #31） -----------------------------------
+
+
+class BuyAnyTradable(bt.Strategy):
+    """任何**可交易**的标的一有机会就买 100 股。
+
+    「今天」取各标的当前日期的最大者，而不是 ``self.data0``——理由见
+    ``mbt.backtest.engine._EngineClock``。
+    """
+
+    def next(self):
+        today = pd.Timestamp(max(d.datetime.date(0) for d in self.datas if len(d)))
+        for data in self.datas:
+            if self.getposition(data).size:
+                continue
+            if not self.broker.tradability_mask.at[today, data._name]:
+                continue
+            self.buy(data=data, size=100)
+
+
+def test_a_late_listing_does_not_block_the_earlier_symbols(make_market, zero_cost_rules):
+    """**本票的核心**：一只标的还没上市，不该让其余标的在前半段无事可做。
+
+    构造：``sh600000`` 从第一天起就有 30 根；``sz000001`` **晚 15 个交易日**才上市。
+
+    修掉之前：策略的 ``next()`` 要等到 ``sz000001`` 上市那一刻才被调用，于是 ``sh600000``
+    在前 15 个交易日的信号**一次都不被看见**——它当时明明在正常交易。修掉之后，``sh600000``
+    应当在它自己的第 2 根就成交，远早于 ``sz000001`` 上市。
+    """
+    a = make_market("sh600000", flat_bars(30, 10.0))
+    c = make_market("sz000001", flat_bars(10, 20.0, start="2024-01-24"))
+    c_first = c.prices.index[0]
+
+    result = run_portfolio_backtest(
+        [a, c],
+        BuyAnyTradable,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    fills = result.trades.sort_values("date").reset_index(drop=True)
+    assert len(fills) == 2, "两只标的都应成交"
+
+    # 用价格区分是谁：甲恒 10.0，丙从 20.0 起。
+    assert fills.iloc[0]["price"] == 10.0, "第一笔是甲的"
+    assert fills.iloc[0]["date"] < c_first, "甲在**丙上市之前**就该成交"
+    assert fills.iloc[1]["price"] == 20.0
+    assert fills.iloc[1]["date"] >= c_first
+
+
+def test_the_strategy_is_called_from_the_first_bar(make_market, zero_cost_rules):
+    """策略从**第一根**就被调用——``len(self)`` 首次是 1，不是「全体就绪」那一刻。
+
+    这条钉住 ``len(self)`` 的语义：它是「引擎跑到第几根」，而**不是**「所有标的都开始交易之后
+    过了几根」。二者在单标的下相同，故这个坑总在多标的时才冒出来（且不报错）。
+    """
+    observed = []
+
+    class Observe(bt.Strategy):
+        def next(self):
+            if not observed:
+                observed.append(len(self))
+
+    a = make_market("sh600000", flat_bars(30, 10.0))
+    c = make_market("sz000001", flat_bars(10, 20.0, start="2024-01-24"))
+
+    run_portfolio_backtest(
+        [a, c],
+        Observe,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    assert observed == [1], f"首次调用时 len(self) 应是 1，实际是 {observed}"
+
+
+def test_a_symbol_that_has_not_listed_yet_reads_its_last_price_not_nan(
+    make_market, zero_cost_rules
+):
+    """**放开调用时点后必须知道的危害**：未上市的标的，``close[0]`` 不是 NaN，而是它**最后一根
+    的价格**——也就是**未来价**。
+
+    乙的价格序列是 10,13,16,…,37（10 根）。它还没上市时 ``len(data)==0``，可 ``close[0]``
+    读到的是 **37**（末根价）、``sma`` 读到的是末 5 根均值。
+
+    故策略读价格前**必须**查 ``self.broker.tradability_mask``（停牌与未上市都是 ``False``）。
+    这项工作本来就要做——停牌日的 ``close[0]`` 也是陈旧价——只是「忘了查」的后果从「拿到陈旧
+    价」升级成了「拿到未来价」，而后者正是 ADR-0006 最防的东西。
+
+    这条测试的作用是**把这个危害写成可核对的事实**，免得后人以为「数据没开始时指标会给 NaN」
+    而把守卫删掉。
+    """
+    observed = {}
+
+    class Observe(bt.Strategy):
+        def next(self):
+            if len(self) != 1:
+                return
+            for data in self.datas:
+                observed[data._name] = (len(data), float(data.close[0]))
+
+    rising = [10.0 + 3.0 * i for i in range(10)]
+    prices = flat_bars(10, 10.0, start="2024-01-24")
+    prices["open"] = rising
+    prices["high"] = rising
+    prices["low"] = rising
+    prices["close"] = rising
+
+    a = make_market("sh600000", flat_bars(30, 10.0))
+    c = make_market("sz000001", prices)
+
+    run_portfolio_backtest(
+        [a, c],
+        Observe,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    assert observed["sh600000"] == (1, 10.0)
+    length, close = observed["sz000001"]
+    assert length == 0, "丙此时尚未上市"
+    assert close == 37.0, "读到的是它的**末根价**（未来价），不是 NaN"
+
+
+def test_a_user_defined_prenext_is_respected_and_next_is_not_called_twice(
+    make_market, zero_cost_rules
+):
+    """用户自己写了 ``prenext`` 时，引擎**不再注入**——否则 ``next()`` 每根会被调两次。
+
+    ``prenext`` 最常见的写法就是 ``def prenext(self): self.next()``。若在那之上再包一层，
+    同一根 K 线里 ``next()`` 会跑两遍——那是**静默的双倍交易**，比不修更糟。
+
+    这里同时钉住「每根 K 线恰好一次回调」，故 ``len(calls)`` 必须等于总根数。
+    """
+    calls = []
+
+    class Custom(bt.Strategy):
+        def prenext(self):
+            calls.append("prenext")
+
+        def next(self):
+            calls.append("next")
+
+    a = make_market("sh600000", flat_bars(30, 10.0))
+    c = make_market("sz000001", flat_bars(10, 20.0, start="2024-01-24"))
+
+    result = run_portfolio_backtest(
+        [a, c],
+        Custom,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    total_bars = len(result.equity_curve)
+    assert "prenext" in calls, "用户自己的 prenext 必须仍然被调用"
+    assert len(calls) == total_bars, f"每根恰好一次回调，实际 {len(calls)} 次 / {total_bars} 根"
