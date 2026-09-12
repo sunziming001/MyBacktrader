@@ -37,6 +37,19 @@
 用累计同比而非单季是为了避开季节性；分母取**绝对值**，则「由亏转盈」这类负基数情形的符号
 仍有意义（否则负基数会让「增长」的符号反过来）。
 
+**增长率取哪一期的同比（``growth_lag_years``，默认 1）**：一份新财报 ``P`` 公告时，用它自己
+那份同比，还是用**上一年同期那一期** ``P−1y`` 的同比？
+
+- ``0`` —— 本期自己的同比 ``(NP(P) − NP(P−1y)) / |NP(P−1y)|``；
+- ``1``（默认）—— 上一年同期那一期的同比 ``(NP(P−1y) − NP(P−2y)) / |NP(P−2y)|``。
+
+选 1 的含义是「接受更**陈旧**的增长」：它避开最新一期的噪声与季节扰动，代价是与当期前景的
+关系更弱。实测茅台（2026-09-11）两种口径差一个符号——本期同比 **−1.95%**、上一年同期的同比
+**+8.89%**，而 ``0 < PEG`` 是买入条件之一，故这一项直接改变选股结果。
+
+两种口径都**时点正确**：``P−1y`` 的同比在 ``P`` 公告时早已可算（它只依赖更早的公告），
+故不引入未来信息。
+
 ## 时点正确性（ADR-0006）
 
 一切按**公告日**对齐：某交易日的估值用当天**已公告**的最近一期财报，而不是「报告期落在当天
@@ -76,6 +89,11 @@ _ANNUALISATION = {3: 4.0, 6: 2.0, 9: 4.0 / 3.0, 12: 1.0}
 
 #: 百分位的默认窗口（交易日）——约 4 年。
 DEFAULT_WINDOW = 1000
+
+#: PEG 的增长率默认取**几年之前那一期**的同比。``1`` = 上一年同期那一期。
+#:
+#: 口径与代价见模块文档的「PEG 取哪一期的同比」一节。
+DEFAULT_GROWTH_LAG_YEARS = 1
 
 
 def annualisation_factor(report_period: dt.date) -> float:
@@ -158,6 +176,7 @@ def build_valuation(
     financials,
     *,
     window: int = DEFAULT_WINDOW,
+    growth_lag_years: int = DEFAULT_GROWTH_LAG_YEARS,
 ) -> Valuation:
     """由收盘价与按期财务算出三个估值序列。
 
@@ -166,6 +185,9 @@ def build_valuation(
         financials: :class:`~mbt.data.fundamental.CwDataSource`（或任何提供 ``records(symbol)``
             的对象）。按**公告日**点取（ADR-0006）。
         window: 百分位窗口，默认 :data:`DEFAULT_WINDOW`。
+        growth_lag_years: PEG 的增长率取**几年之前那一期**的同比。默认
+            :data:`DEFAULT_GROWTH_LAG_YEARS`（1，即上一年同期）；传 ``0`` 即用本期自己那份
+            同比（改动前的行为）。
 
     返回:
         :class:`Valuation`。三个序列与 ``close`` 的索引、列完全一致。
@@ -181,6 +203,8 @@ def build_valuation(
         raise MarketDataError("收盘价的索引必须升序——按公告日点取依赖有序索引")
     if window < 1:
         raise ValueError(f"窗口至少为 1，收到 {window}")
+    if growth_lag_years < 0:
+        raise ValueError(f"增长率的滞后期数不能为负，收到 {growth_lag_years}")
 
     earnings = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
     growth = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
@@ -190,7 +214,9 @@ def build_valuation(
         if not records:
             continue
         earnings[symbol] = _point_in_time(_earnings_steps(records), close.index)
-        growth[symbol] = _point_in_time(_growth_steps(records), close.index)
+        growth[symbol] = _point_in_time(
+            _growth_steps(records, lag_years=growth_lag_years), close.index
+        )
 
     pe = price_earnings_ratio(close, earnings)
     return Valuation(
@@ -212,30 +238,48 @@ def _earnings_steps(records) -> list[tuple[dt.date, float]]:
     return sorted(steps, key=lambda step: step[0])
 
 
-def _growth_steps(records) -> list[tuple[dt.date, float]]:
+def _growth_steps(records, *, lag_years: int = 1) -> list[tuple[dt.date, float]]:
     """``(公告日, 归母净利润累计同比%)``，按公告日升序。
 
     去年同期那一期**必须也是可用记录**（公告日可信）——否则算出的同比会建立在一条占位符
     记录上，而那正是 :attr:`FinancialRecord.usable` 要挡的东西。
+
+    ``lag_years`` 决定**取哪一期的同比**：
+
+    - ``0`` —— 取**本期**的同比 ``(NP(P) − NP(P−1y)) / |NP(P−1y)|``；
+    - ``1``（默认）—— 取**上一年同期那一期**的同比 ``(NP(P−1y) − NP(P−2y)) / |NP(P−2y)|``。
+
+    即「一份新财报公告时，用它给自己算同比」还是「用它**一年前那一期**的同比」。后者更陈旧、
+    也更钝（避开了最新一期的噪声与季节扰动），见模块文档。
     """
     by_period = {record.report_period: record for record in records}
-    steps = []
-    for record in records:
-        previous = by_period.get(_same_period_last_year(record.report_period))
+
+    growth_by_period: dict[dt.date, float] = {}
+    for period, record in by_period.items():
+        previous = by_period.get(_shift_years(period, 1))
         if previous is None:
             continue
         before = previous.values["net_profit_ytd"]
         if before == 0:
             continue  # 基数为 0，同比无定义
         now = record.values["net_profit_ytd"]
-        steps.append((record.announcement_date, (now - before) / abs(before) * 100.0))
+        growth_by_period[period] = (now - before) / abs(before) * 100.0
+
+    steps = []
+    for record in records:
+        value = growth_by_period.get(_shift_years(record.report_period, lag_years))
+        if value is None:
+            continue
+        steps.append((record.announcement_date, value))
     return sorted(steps, key=lambda step: step[0])
 
 
-def _same_period_last_year(period: dt.date) -> dt.date | None:
-    """上年同期的报告期。2 月 29 日在季末不会出现，但仍防御一下。"""
+def _shift_years(period: dt.date, years: int) -> dt.date | None:
+    """同期往前推 ``years`` 年。2 月 29 日在季末不会出现，但仍防御一下。"""
+    if years == 0:
+        return period
     try:
-        return dt.date(period.year - 1, period.month, period.day)
+        return dt.date(period.year - years, period.month, period.day)
     except ValueError:
         return None
 
@@ -291,7 +335,13 @@ def clip_fields(
     return clipped
 
 
-def valuation_for(markets, financials, *, window: int = DEFAULT_WINDOW) -> Valuation:
+def valuation_for(
+    markets,
+    financials,
+    *,
+    window: int = DEFAULT_WINDOW,
+    growth_lag_years: int = DEFAULT_GROWTH_LAG_YEARS,
+) -> Valuation:
     """由一组**原始**行情算出估值三序列——库里唯一那个「组装」入口。
 
     .. warning::
@@ -308,6 +358,7 @@ def valuation_for(markets, financials, *, window: int = DEFAULT_WINDOW) -> Valua
         markets: 一组 :class:`~mbt.data.market.MarketData`（**原始价**）。
         financials: :class:`~mbt.data.fundamental.CwDataSource` 之类。
         window: 百分位窗口。
+        growth_lag_years: PEG 的增长率取**几年之前那一期**的同比，见 :func:`build_valuation`。
 
     返回:
         :class:`Valuation`，索引与列取自各标的收盘价的**并集**（与引擎时钟一致）。
@@ -318,7 +369,7 @@ def valuation_for(markets, financials, *, window: int = DEFAULT_WINDOW) -> Valua
         raise MarketDataError("算估值至少要有一个标的")
 
     close = assemble_panel(list(markets), ["close"])["close"]
-    return build_valuation(close, financials, window=window)
+    return build_valuation(close, financials, window=window, growth_lag_years=growth_lag_years)
 
 
 def _require_same_shape(left: pd.DataFrame, right: pd.DataFrame, left_name, right_name) -> None:

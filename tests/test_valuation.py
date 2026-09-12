@@ -261,31 +261,82 @@ def test_a_symbol_without_financials_gets_a_missing_series_not_zeros():
 # --- 同比增长率 ---------------------------------------------------------------
 
 
-def test_the_growth_is_year_on_year_of_cumulative_net_profit():
-    """累计同比：2022 年 100 → 2023 年 130，增长 30%。PEG 由 PE 15 得 0.5。"""
-    prices = frame([15.0] * 20, start="2023-03-01")
-    financials = FakeFinancials(
+def annual_since_2016():
+    """三条年报记录，年度归母净利 100 → 150 → 300（公告日在次年 3 月）。
+
+    三年是**故意**的：滞后一年的口径要取「上一年同期那一期」的同比，而那本身又需要再往前一年
+    的数据。故只有两年记录时它必然缺失——这正是下面几条测试要分辨的事。
+    """
+    return FakeFinancials(
         sh600000=[
+            record(
+                "sh600000",
+                dt.date(2020, 12, 31),
+                dt.date(2021, 3, 15),
+                net_profit_ytd=100.0,
+                eps_ytd=1.0,
+            ),
             record(
                 "sh600000",
                 dt.date(2021, 12, 31),
                 dt.date(2022, 3, 15),
-                net_profit_ytd=100.0,
+                net_profit_ytd=150.0,
                 eps_ytd=1.0,
             ),
             record(
                 "sh600000",
                 dt.date(2022, 12, 31),
                 dt.date(2023, 3, 15),
-                net_profit_ytd=130.0,
+                net_profit_ytd=300.0,
                 eps_ytd=1.0,
             ),
         ]
     )
 
-    valuation = build_valuation(prices, financials)
 
-    assert valuation.peg.loc[pd.Timestamp("2023-03-20"), "sh600000"] == pytest.approx(0.5)
+def test_the_growth_uses_the_prior_year_period_by_default():
+    """**默认口径：取「上一年同期那一期」的同比**，而不是最新一期自己的。
+
+    三条年报的同比分别是：2021 年 ``+50%``、2022 年 ``+100%``。故在 2022 年报公告后：
+
+    - 默认（``growth_lag_years=1``）→ 取 **2021 年那一期**的同比 ``+50%`` → PEG = 15/50 = **0.3**
+    - 传 ``0`` → 取 2022 年自己的同比 ``+100%`` → PEG = 15/100 = **0.15**
+
+    两者相差一倍，且这条会直接进「0 < PEG < 0.75」的买入条件——故必须能被分辨。
+    """
+    prices = frame([15.0] * 20, start="2023-03-01")
+
+    lagged = build_valuation(prices, annual_since_2016(), growth_lag_years=1)
+    current = build_valuation(prices, annual_since_2016(), growth_lag_years=0)
+
+    when = pd.Timestamp("2023-03-20")
+    assert lagged.peg.loc[when, "sh600000"] == pytest.approx(15.0 / 50.0)
+    assert current.peg.loc[when, "sh600000"] == pytest.approx(15.0 / 100.0)
+
+
+def test_the_default_lag_is_one_year():
+    """默认就是滞后一年——本票的核心口径，用常量钉住。"""
+    from mbt.data.valuation import DEFAULT_GROWTH_LAG_YEARS
+
+    assert DEFAULT_GROWTH_LAG_YEARS == 1
+
+
+def test_the_lagged_growth_needs_one_more_year_of_history():
+    """滞后一年需要**多一年**的历史：只有两年记录时它必然缺失。
+
+    评估日落在 2021 年报公告之后、2022 年报公告之前时，最新期是 2021 年，而「上一年同期那一期」
+    是 2020 年——它的同比还要再往前一年，故缺失。这不是 bug，是「取第二年」的字面代价。
+
+    对照：同一时点用 ``growth_lag_years=0`` 就有值（它只需要 2020 与 2021 两期）。
+    """
+    prices = frame([15.0] * 20, start="2022-03-21")
+
+    lagged = build_valuation(prices, annual_since_2016(), growth_lag_years=1)
+    current = build_valuation(prices, annual_since_2016(), growth_lag_years=0)
+
+    when = pd.Timestamp("2022-03-21")
+    assert pd.isna(lagged.peg.loc[when, "sh600000"])
+    assert current.peg.loc[when, "sh600000"] == pytest.approx(15.0 / 50.0)
 
 
 def test_a_loss_turning_into_a_profit_gets_a_positive_growth():
@@ -293,22 +344,32 @@ def test_a_loss_turning_into_a_profit_gets_a_positive_growth():
 
     不带绝对值时 ``(50 − (−100)) / (−100) = −150%``——符号反了，于是 PEG 变负，而「0 < PEG」
     这条买入条件会因此把一家刚扭亏的公司挡在门外。
+
+    这里用滞后一年的口径：三段年度净利 ``−100 → 50 → 60``，故 2021 年那一期的同比是
+    ``+150%``，而 2022 年自己的同比是 ``+20%``。默认口径取前者。
     """
     prices = frame([15.0] * 20, start="2023-03-01")
     financials = FakeFinancials(
         sh600000=[
             record(
                 "sh600000",
+                dt.date(2020, 12, 31),
+                dt.date(2021, 3, 15),
+                net_profit_ytd=-100.0,
+                eps_ytd=1.0,
+            ),
+            record(
+                "sh600000",
                 dt.date(2021, 12, 31),
                 dt.date(2022, 3, 15),
-                net_profit_ytd=-100.0,
+                net_profit_ytd=50.0,
                 eps_ytd=1.0,
             ),
             record(
                 "sh600000",
                 dt.date(2022, 12, 31),
                 dt.date(2023, 3, 15),
-                net_profit_ytd=50.0,
+                net_profit_ytd=60.0,
                 eps_ytd=1.0,
             ),
         ]
@@ -316,12 +377,12 @@ def test_a_loss_turning_into_a_profit_gets_a_positive_growth():
 
     valuation = build_valuation(prices, financials)
 
-    # 增长率 150% 时 PE=15 → PEG = 15 / 150 = 0.1（正数）
+    # 滞后口径取 2021 年那一期的同比 +150% → PEG = 15 / 150 = 0.1（正数）
     assert valuation.peg.loc[pd.Timestamp("2023-03-20"), "sh600000"] == pytest.approx(0.1)
 
 
 def test_a_missing_prior_year_record_yields_a_missing_peg():
-    """去年同期的记录缺失（或不可用）→ 同比无从算起 → PEG 缺失，而不是拿别的期间凑。"""
+    """同期记录缺失 → 同比无从算起 → PEG 缺失，而不是拿别的期间凑。"""
     prices = frame([15.0] * 20, start="2023-03-01")
     financials = FakeFinancials(
         sh600000=[
@@ -342,10 +403,21 @@ def test_a_missing_prior_year_record_yields_a_missing_peg():
 
 
 def test_a_zero_base_yields_a_missing_peg():
-    """基数为 0 → 同比无定义（不是无穷大）。"""
+    """基数为 0 → 同比无定义（不是无穷大）。
+
+    三年记录：``0 → 0 → 130``。滞后口径取 2021 那一期的同比，而它的基数是 2020 年的 0
+    → 无定义 → PEG 缺失（而不是 ``inf``）。
+    """
     prices = frame([15.0] * 20, start="2023-03-01")
     financials = FakeFinancials(
         sh600000=[
+            record(
+                "sh600000",
+                dt.date(2020, 12, 31),
+                dt.date(2021, 3, 15),
+                net_profit_ytd=0.0,
+                eps_ytd=1.0,
+            ),
             record(
                 "sh600000",
                 dt.date(2021, 12, 31),
@@ -364,6 +436,14 @@ def test_a_zero_base_yields_a_missing_peg():
     )
 
     assert pd.isna(build_valuation(prices, financials).peg.loc["2023-03-20", "sh600000"])
+
+
+def test_a_negative_lag_is_rejected():
+    """滞后期数不能为负——负值是笔误，猜一个值只会静默换掉口径。"""
+    with pytest.raises(ValueError, match="滞后期数不能为负"):
+        build_valuation(
+            frame([15.0] * 5, start="2023-03-01"), FakeFinancials(), growth_lag_years=-1
+        )
 
 
 # --- 契约与形状 ---------------------------------------------------------------
