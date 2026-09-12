@@ -87,6 +87,9 @@ class Screen:
                 准入规则与规则表，那会把这层从纯函数变成碰数据的函数，而 ``build_universe``
                 只有一个实现，重复一次必然漂移。
 
+                给了 ``as_of`` 时掩码会被**同样截断**到该日——否则两者的形状必然对不上
+                （面板截了、掩码没截），而这会以「形状不一致」报错的形式暴露出来。
+
         返回:
             :class:`ScreenResult`。
 
@@ -106,6 +109,10 @@ class Screen:
 
         working = _truncate(panel, as_of)
         index, columns = _shape_of(working)
+
+        if universe_mask is not None and as_of is not None:
+            # 掩码要跟着面板一起截，否则形状必然对不上——面板截了、掩码没截。
+            universe_mask = universe_mask.loc[: _timestamp(as_of, "评估日")]
 
         selected = pd.DataFrame(True, index=index, columns=columns)
         for i, one_filter in enumerate(self.filters):
@@ -170,6 +177,26 @@ class ScreenResult:
         scores = _row(self.scores, stamp, "因子值")
         ranked = sorted(picked, key=lambda symbol: (-scores[symbol], symbol))
         return ranked
+
+
+def momentum_screen(window: int = 20, top_n: int = 10) -> Screen:
+    """内置的默认选股规则：按 ``window`` 日动量排序取前 ``top_n``。
+
+    **它是库的一部分，不是 CLI 里的业务逻辑**——AC 明令「CLI 是库入口的薄映射，不含独立
+    业务逻辑」。CLI 只**指名**这条规则，规则的语义、默认值与测试都在这里。
+
+    为什么库要给一条默认规则：AC 要求「一条命令跑选股：指定评估日」，而没有任何规则的选股
+    没有东西可跑。这条规则足够具体、一跑就出结果，且用的是信号层既有的指标（ADR-0001：
+    选股规则消费信号，不自造一套）。
+
+    .. note::
+
+        它只是一个**可用的起点**，不是一条有依据的策略——动量的窗口与取前几名都没经过
+        论证。真正的选股规则应当由你自己组装并在回测里检验。
+    """
+    from mbt.signals import momentum
+
+    return Screen(factor=lambda p: momentum(p["close"], window), top_n=top_n)
 
 
 def _truncate(panel: Panel, as_of) -> Panel:

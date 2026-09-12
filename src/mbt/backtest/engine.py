@@ -57,7 +57,33 @@ class BacktestResult:
     rejected: pd.DataFrame
 
 
-class _EquityRecorder(bt.Analyzer):
+class _EngineClock:
+    """取**引擎主时钟**的混入：各标的当前日期里的最大者。
+
+    不能用 ``self.datas[0].datetime.date(0)``：若第一个标的的历史比回测区间短（次新股、
+    北交所早期、被 ``--limit`` 选中的任意一只），它的日期会**一直停在末根**，于是整条净值
+    曲线的时间索引变成同一个日期的重复——而基准对齐、年化、以及所有按日期的下游计算都会
+    因此算错，且**不报错**。
+
+    实跑 CLI 时撞到过：40 个标的（北交所排在最前）跑出来的 `period.start == period.end`，
+    而 `trading_days` 是 953。
+
+    与 :class:`~mbt.backtest.costs.AStockBroker` 的主时钟是同一个道理：有 K 线的标的其日期
+    正是时钟，停牌或未开始的落后，故最大值恰是时钟本身。
+    """
+
+    def _clock(self):
+        latest = None
+        for data in self.datas:
+            if len(data) == 0:
+                continue  # 该标的尚未开始（首根晚于当前 tick）
+            current = data.datetime.date(0)
+            if latest is None or current > latest:
+                latest = current
+        return latest
+
+
+class _EquityRecorder(_EngineClock, bt.Analyzer):
     """逐根 K 线记录组合总资产。"""
 
     def start(self):
@@ -65,7 +91,7 @@ class _EquityRecorder(bt.Analyzer):
         self._values = []
 
     def next(self):
-        self._dates.append(self.datas[0].datetime.date(0))
+        self._dates.append(self._clock())
         self._values.append(self.strategy.broker.getvalue())
 
     def get_analysis(self):
@@ -104,7 +130,7 @@ class _FillRecorder(bt.Analyzer):
         return pd.DataFrame(self._fills, columns=list(TRADE_COLUMNS))
 
 
-class _RejectionRecorder(bt.Analyzer):
+class _RejectionRecorder(_EngineClock, bt.Analyzer):
     """记录**未成交而终结**的订单。
 
     挂单失效（停牌过久）在 AC 里要求「留痕」。只把成交明细交出去，失效就查不到了——
@@ -122,7 +148,7 @@ class _RejectionRecorder(bt.Analyzer):
                 zip(
                     REJECT_COLUMNS,
                     (
-                        self.datas[0].datetime.date(0),
+                        self._clock(),
                         getattr(order.data, "_mbt_symbol", None),
                         order.created.size,
                         order.getstatusname(),
@@ -217,8 +243,11 @@ def run_portfolio_backtest(
 
     示例::
 
+        import pandas as pd
+
         def next(self):
-            today = self.data0.datetime.date(0)
+            # 掩码的索引是 DatetimeIndex，故要用 Timestamp 去取（用 datetime.date 会 KeyError）。
+            today = pd.Timestamp(self.data0.datetime.date(0))
             for data in self.datas:
                 if not self.broker.tradability_mask.at[today, data._name]:
                     continue          # 今天这根是陈旧的，不是新 K 线
@@ -227,6 +256,19 @@ def run_portfolio_backtest(
     markets = list(markets)
     if not markets:
         raise ValueError("组合回测至少要有一个标的")
+
+    # 与单标的入口同一道守卫。原先它只在 `run_backtest` 里，于是**组合入口**（CLI 走的
+    # 就是它）在 `commission_mode=None` 时会静默退回 "all_in"——替你选了一个成本口径，
+    # 而两种口径算出的成本方向相反地错。
+    if commission and commission_mode is None:
+        raise ValueError(
+            "commission > 0 时必须指定 commission_mode："
+            "'all_in'（券商「全佣」，费率已含经手费与证管费）或 "
+            "'net'（券商「净佣」，需另行叠加）。"
+            "两种口径的成本不同，替你猜会静默算错。"
+        )
+    if commission_mode not in (None, "all_in", "net"):
+        raise ValueError(f"commission_mode 只能是 'all_in' 或 'net'，收到 {commission_mode!r}")
 
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 

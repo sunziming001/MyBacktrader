@@ -220,9 +220,36 @@ def test_the_universe_mask_is_intersected(panel):
     assert not with_pool[["sz000001", "sz000002"]].any().any()
 
 
+def test_the_universe_mask_is_truncated_along_with_the_panel(panel):
+    """给了 ``as_of`` 时掩码也跟着截断——否则形状必然对不上（面板截了、掩码没截）。
+
+    这条是接 CLI 时暴露出来的：``apply(as_of=…, universe_mask=…)`` 原先会以「形状不一致」
+    报错，而任何调用方都会撞上它，不只是 CLI。
+    """
+    prices = price_panel(panel)
+    pool = pd.DataFrame(True, index=prices["close"].index, columns=prices["close"].columns)
+
+    result = Screen(filters=(lambda p: p["close"] > 5,)).apply(
+        prices, as_of=prices["close"].index[1], universe_mask=pool
+    )
+
+    assert len(result.selected) == 2, "结果应只到评估日为止"
+    assert result.selected.all().all(), "掩码全是 True，故交集就是选股结果本身"
+
+
 def test_a_misaligned_universe_mask_is_rejected(panel):
+    """标的集合对不上仍要报错——截断只处理日期，不处理标的。"""
     prices = price_panel(panel)
     pool = pd.DataFrame(True, index=prices["close"].index, columns=["sh600000"])
+
+    with pytest.raises(ValueError, match="必须与面板一致"):
+        Screen().apply(prices, universe_mask=pool)
+
+
+def test_a_mask_shorter_than_the_panel_is_still_rejected(panel):
+    """掩码比面板短（且没有 as_of 可截）时仍要报错——那是真的对不齐，不该被静默填上。"""
+    prices = price_panel(panel)
+    pool = pd.DataFrame(True, index=prices["close"].index[:2], columns=prices["close"].columns)
 
     with pytest.raises(ValueError, match="必须与面板一致"):
         Screen().apply(prices, universe_mask=pool)

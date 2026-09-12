@@ -401,3 +401,64 @@ def test_golden_case_of_a_three_symbol_portfolio(make_market, zero_cost_rules):
     assert result.final_value == pytest.approx(
         100_000.0 - spent + 3333 * 10.5 + 1666 * 20.0 + 1111 * 30.0
     )
+
+
+# --- 净值曲线的时间索引（实跑 CLI 时暴露出的真 bug） --------------------------
+
+
+def test_the_equity_curve_index_is_the_engine_clock_not_the_first_symbol(
+    make_market, zero_cost_rules
+):
+    """净值曲线的时间索引必须取自**引擎主时钟**，而不是 ``datas[0]``。
+
+    这条钉的是一个**真 bug**：原先用 ``datas[0].datetime.date(0)``，而若第一个标的的历史比
+    回测区间短（次新股、北交所早期、被 ``--limit`` 选中的任意一只），它的日期会一直停在
+    末根，于是整条曲线的索引成了同一个日期的重复——**基准对齐、年化、以及所有按日期的下游
+    计算都会因此算错，且不报错**。
+
+    实跑 CLI 时撞到过：40 个标的（北交所排在最前）跑出 ``period.start == period.end``，
+    而 ``trading_days`` 是 953。
+
+    构造：短的那个（2 根）排在前面，长的（6 根）在后面。
+    """
+    short_first = make_market("sz000001", flat_bars(2, 20.0))
+    long_second = make_market("sh600000", flat_bars(6, 10.0))
+
+    result = run_portfolio_backtest(
+        [short_first, long_second],
+        BuyEverything,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    index = result.equity_curve.index
+    assert index.is_monotonic_increasing
+    assert index.is_unique, "索引里有重复日期——说明日期取自了某个停滞的标的"
+    assert len(index) == 6, "时钟应走完两个标的日期的并集"
+    assert index[0].date() == pd.Timestamp("2024-01-02").date()
+    assert index[-1].date() == pd.Timestamp("2024-01-09").date()
+
+
+def test_the_fill_log_dates_also_come_from_the_engine_clock(make_market, zero_cost_rules):
+    """成交明细的日期同理——它是撮合当日的日期，不该来自某个停滞的标的。"""
+    short_first = make_market("sz000001", flat_bars(2, 20.0))
+    long_second = make_market("sh600000", flat_bars(6, 10.0))
+
+    result = run_portfolio_backtest(
+        [short_first, long_second],
+        BuyEverything,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    dates = pd.to_datetime(result.trades["date"])
+    assert dates.max() <= result.equity_curve.index.max()
+    assert result.equity_curve.index.min() <= dates.min()

@@ -168,6 +168,45 @@ python -m venv .venv
 
 ## 用法
 
+命令行有两条命令。**内核始终是库**——CLI 只做参数搬运，全部逻辑在 `mbt.cli` 的两个纯函数里，
+测试直接调库而不靠 shell 命令硬凑。
+
+```powershell
+# 跑一次组合回测
+.venv\Scripts\mbt.exe backtest `
+    --strategy examples.strategies:BuyAndHold `
+    --tdx-root D:\Tools\new_tdx\vipdoc `
+    --gbbq     D:\Tools\new_tdx\T0002\hq_cache\gbbq `
+    --cash 200000 --max-positions 20 `
+    --commission 0.0003 --commission-mode all_in `
+    --output-dir D:\runs
+
+# 在指定评估日跑一次选股
+.venv\Scripts\mbt.exe screen --as-of 2026-09-10 --top-n 5 `
+    --tdx-root D:\Tools\new_tdx\vipdoc `
+    --gbbq     D:\Tools\new_tdx\T0002\hq_cache\gbbq `
+    --output-dir D:\screens
+```
+
+`--strategy` 用**导入路径**（`module:Class`），与产物元数据里记的写法**同一种**，故复现时不必
+再翻译一次。当前工作目录会被加入 `sys.path`，所以站在自己的策略目录里就能直接跑。
+
+两条默认值是刻意的，不是随手取的：
+
+- **`--start` 默认 `2015-08-01`**，即**费用口径**全可查的最早日期（沪主板过户费的覆盖起点）。
+  不默认「全历史」是因为实测 37% 的股票数据起于 1997–2014，那段区间**涨跌幅查得到、费用查不到**，
+  一成交就报 `RuleTableError`。要更早请显式传 `--start`——我们如实报错，不替你截断。
+- **`--output-dir` 必填**，不给默认落盘位置：CLI 可能在任意工作目录下被执行。
+
+退出码：`0` 跑完且有可用结果（含「个别标的被跳过」）；`1` 数据或运行期错误，或**跳过率超过
+30%**（「几乎全跳过」不该被脚本当成成功）；`2` 参数用法错误。
+
+跑批时**跳过是常态且有据可查**：实测全市场 12,243 个文件里只有 5,898 个是股票，另有一批因
+北交所 2021-11-15 之前的历史、以及除权判定（见下）而失败。每次都会打印「成功多少、跳过多少、
+各按什么原因」，并在产物元数据里记下清单。**绝不静默跳过。**
+
+### 作为库使用
+
 数据源根路径即通达信安装目录下的 `vipdoc`。`symbol` 是必填的——交易制度按它取板块与
 ST 状态，缺了它过户费与涨跌幅限制就无从确定。
 
