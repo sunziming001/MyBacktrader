@@ -120,6 +120,7 @@ def test_the_trade_details_are_persisted(tmp_path):
         [
             {
                 "date": pd.Timestamp("2024-01-03"),
+                "symbol": "sh600000",
                 "size": 100,
                 "price": 10.0,
                 "value": 1000.0,
@@ -130,6 +131,7 @@ def test_the_trade_details_are_persisted(tmp_path):
     run_dir = write_run_artifacts(make_result(trades=trades), output_dir=tmp_path)
 
     saved = pd.read_csv(run_dir / "trades.csv")
+    assert list(saved["symbol"]) == ["sh600000"], "成交必须能归属到具体标的"
     assert list(saved["size"]) == [100]
     assert list(saved["price"]) == [10.0]
 

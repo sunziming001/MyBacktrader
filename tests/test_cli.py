@@ -900,8 +900,12 @@ def test_the_ma_cross_example_both_buys_and_sells(tmp_path):
     run_dir = next((tmp_path / "runs").iterdir())
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["closed_trades"] > 0, "示例策略一笔都没平仓——卖出那一支多半又没走到"
-    # 有平仓就意味着有过买入；若买入为 0 则不可能有平仓，故两者都已被覆盖。
-    assert metrics["win_rate"] is not None and metrics["payoff_ratio"] is not None
+    assert metrics["win_rate"] is not None, "有平仓交易就该有胜率"
+
+    # 盈亏比在「**没有亏损笔**」时本就无定义（``mean(亏损)`` 的分母是空的），且原因会写进
+    # ``notes``。这条断言把两种情况分开说清，而不是含糊地要求它非空——后者会逼出一个假数字。
+    if metrics["payoff_ratio"] is None:
+        assert any("没有亏损" in note for note in metrics["notes"]), "缺失必须给出理由"
 
 
 def test_the_ma_cross_example_on_a_flat_price_series_never_trades(tmp_path):

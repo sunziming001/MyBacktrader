@@ -207,6 +207,72 @@ def test_selling_more_than_held_is_rejected():
         closed_trade_pnls(trades_table([(0, 100, 10.0, 0.0), (1, -200, 12.0, 0.0)]))
 
 
+# --- 配对必须**按标的分别**做（多标的组合） ----------------------------------
+
+
+def test_a_buy_in_one_symbol_is_not_paired_with_a_sell_in_another():
+    """**本组核心**：组合里 A 的买入不得被当成 B 卖出的对手方。
+
+    这两个标的一个买、一个卖，在时间上相邻。若共用一条队列，就会算出
+    ``(30 − 10) × 100 = 2000`` 这样**无意义的盈亏**——而胜率与盈亏比都建在它上面。
+
+    正确行为是：B 在没有持仓的情况下卖出，本身就是明细不可信，**报错并点名标的**。
+    """
+    a = trades_table([(0, 100, 10.0, 0.0)], symbol="sh600000")
+    b = trades_table([(1, -100, 30.0, 0.0)], symbol="sz000001")
+    mixed = pd.concat([a, b], ignore_index=True)
+
+    with pytest.raises(ValueError, match="sz000001"):
+        closed_trade_pnls(mixed)
+
+
+def test_two_symbols_each_round_tripped_are_paired_separately():
+    """两个标的各自完成一次往返 → 两笔平仓，盈亏**各归各的**。
+
+    A 赚 200、B 亏 100。若按单一队列配对，A 的买入会与 B 的卖出（或反之）配错，
+    ``2000``、``-1500`` 这类数字就会冒出来——故这里逐笔断言。
+    """
+    a = trades_table([(0, 100, 10.0, 0.0), (3, -100, 12.0, 0.0)], symbol="sh600000")
+    b = trades_table([(1, 100, 20.0, 0.0), (2, -100, 19.0, 0.0)], symbol="sz000001")
+    mixed = pd.concat([a, b], ignore_index=True)
+
+    pnls = closed_trade_pnls(mixed)
+
+    assert sorted(pnls) == pytest.approx([-100.0, 200.0])
+
+
+def test_interleaved_symbols_do_not_leak_into_each_other():
+    """交错下单：A 买、B 买、A 卖、B 卖——每一笔都只与自己标的的买入配对。
+
+    A：100@10 → 100@11，赚 100；B：100@20 → 100@18，亏 200。
+    单一队列会把「先买先配」错用到跨标的上，得出的数字与这两个都不符。
+    """
+    a = trades_table(
+        [(0, 100, 10.0, 0.0), (2, -100, 11.0, 0.0)],
+        symbol="sh600000",
+    )
+    b = trades_table(
+        [(1, 100, 20.0, 0.0), (3, -100, 18.0, 0.0)],
+        symbol="sz000001",
+    )
+    mixed = pd.concat([a, b], ignore_index=True)
+
+    pnls = closed_trade_pnls(mixed)
+
+    assert sorted(pnls) == pytest.approx([-200.0, 100.0])
+
+
+def test_a_trades_frame_without_a_symbol_column_is_rejected():
+    """缺 ``symbol`` 列 → 报错，而不是**退回**「混着配对」。
+
+    退回去就等于把上面那个错悄悄算出来；而它不会报错，只会让胜率与盈亏比失真。
+    """
+    frame = trades_table([(0, 100, 10.0, 0.0), (1, -100, 12.0, 0.0)]).drop(columns=["symbol"])
+
+    with pytest.raises(ValueError, match="缺少 symbol 列"):
+        closed_trade_pnls(frame)
+
+
 # --- 胜率与盈亏比 ------------------------------------------------------------
 
 
