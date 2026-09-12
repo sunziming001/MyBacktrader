@@ -24,11 +24,18 @@ import pandas as pd
 import pytest
 
 from mbt.backtest import run_backtest
-from mbt.data import GbbqDataSource, TdxDataSource, backward_adjusted, find_anomalies
+from mbt.data import (
+    GbbqDataSource,
+    SecurityMasterDataSource,
+    TdxDataSource,
+    backward_adjusted,
+    find_anomalies,
+)
 from mbt.data.tdx import DAY_RECORD_SIZE
 
 ROOT_VARIABLE = "MBT_TDX_ROOT"
 GBBQ_VARIABLE = "MBT_TDX_GBBQ"
+MASTER_VARIABLE = "MBT_TDX_MASTER"
 
 pytestmark = pytest.mark.realmdata
 
@@ -61,6 +68,15 @@ def real_gbbq():
     path = _from_environment(GBBQ_VARIABLE, "权息文件 gbbq")
     if not path.is_file():
         pytest.fail(f"{GBBQ_VARIABLE}={path} 不是文件")
+    return path
+
+
+@pytest.fixture
+def real_master():
+    """证券主表 `base.dbf`。它**不在** `vipdoc` 之内，故单独一个环境变量。"""
+    path = _from_environment(MASTER_VARIABLE, "证券主表 base.dbf")
+    if not path.is_file():
+        pytest.fail(f"{MASTER_VARIABLE}={path} 不是文件")
     return path
 
 
@@ -215,6 +231,87 @@ def test_real_share_reform_event_does_not_create_a_fake_jump(real_root, real_gbb
     fixed_gap = float(fixed.loc[on]) / float(fixed.loc[before]) - 1
     assert fixed_gap == pytest.approx(raw_gap, abs=1e-9), "判定后应回到原始价的真实变动"
     assert raw_gap == pytest.approx(-0.06, abs=0.01)
+
+
+def test_real_base_dbf_satisfies_the_frame_identity(real_master):
+    """**在真实的 3.95 MB 主表上**验帧恒等式。
+
+    fixture 是手工重组的切片（记录数被改写），故它的帧恒等式是**因构造而真**的——这条测试
+    才是对「本模块的布局假设在本机真实文件上成立」的正面证据。
+    """
+    import struct
+
+    raw = real_master.read_bytes()
+    count = struct.unpack_from("<I", raw, 4)[0]
+    header_length = struct.unpack_from("<H", raw, 8)[0]
+    record_length = struct.unpack_from("<H", raw, 10)[0]
+
+    assert raw[0] == 0x03, "dBase III"
+    assert raw[-1] == 0x1A, "EOF 标记"
+    assert len(raw) == header_length + count * record_length + 1
+    assert count > 8_000, "本机主表应有八千量级记录"
+
+
+def test_real_listing_dates_agree_with_the_first_day_bar(real_master, real_root):
+    """**上市日与行情首根逐一吻合**——这是「SSDATE 是真实上市日」最硬的证据。
+
+    对**窗口内上市**（首根晚于 2015-06）的标的，本地 ``.day`` 恰好从上市日开始，故两者相差
+    0 天。抽样若干只验证；若哪天不符，说明主表或行情的口径变了。
+    """
+    import datetime as dt
+
+    from mbt.data import TdxDataSource, instrument_type
+
+    source = TdxDataSource(real_root)
+    master = SecurityMasterDataSource(
+        real_master,
+        symbols=[s for s in source.symbols() if instrument_type(s) == "股票"],
+    )
+    dates = master.listing_dates()
+
+    checked = 0
+    for symbol in sorted(dates):
+        if checked >= 30:
+            break
+        try:
+            index = source.daily(symbol).index
+        except Exception:  # noqa: BLE001
+            continue
+        first = index[0].date()
+        if first <= dt.date(2015, 6, 1):
+            continue  # 窗口前上市的老股，首根会被窗口截断
+        assert first == dates[symbol], f"{symbol}: 首根 {first} 与上市日 {dates[symbol]} 不符"
+        checked += 1
+
+    assert checked >= 10, f"抽样样本不足（{checked}）"
+
+
+def test_real_master_has_a_material_share_of_unknown_listing_dates(real_master, real_root):
+    """**把「5.2% 的股票没有上市日」这件事钉住**，并确认它们几乎全是已停更的。
+
+    这条的作用是让「回退到行情根数」的**规模**可见：若哪天这个比例暴涨，说明主表变了。
+    """
+    from mbt.data import TdxDataSource, instrument_type
+
+    source = TdxDataSource(real_root)
+    stocks = [s for s in source.symbols() if instrument_type(s) == "股票"]
+    known = SecurityMasterDataSource(real_master, symbols=stocks).listing_dates()
+
+    unknown = [s for s in stocks if s not in known]
+    assert len(unknown) > 0, "本机确实有一批标的没有上市日"
+    ratio = len(unknown) / len(stocks)
+    assert 0.01 < ratio < 0.15, f"无上市日的比例是 {ratio:.1%}，与实测的 5.2% 差得太多"
+
+    # 它们应当**几乎全是**已停更的（末根早于全市场最新交易日）。
+    latest = source.daily("sh600000").index[-1]
+    stale = 0
+    for symbol in unknown[:60]:
+        try:
+            if source.daily(symbol).index[-1] < latest:
+                stale += 1
+        except Exception:  # noqa: BLE001
+            continue
+    assert stale >= 55, f"抽样的 {len(unknown[:60])} 只里只有 {stale} 只已停更——与预期不符"
 
 
 def test_real_dilution_judgement_does_not_bankrupt_the_universe(real_root, real_gbbq):

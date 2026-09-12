@@ -12,11 +12,18 @@ ADR-0001 说「行 = 截面」，而「今天哪些可买」正是一行截面�
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 import pytest
 
 from mbt.rules import RuleTable
-from mbt.universe import MAIN_BOARD, UniverseRules, build_universe
+from mbt.universe import (
+    MAIN_BOARD,
+    UniverseRules,
+    build_universe,
+    why_not_in_universe,
+)
 
 
 def closes(n, value=10.0):
@@ -277,6 +284,167 @@ def test_non_stock_instruments_are_excluded_even_when_the_rule_table_knows_them(
     assert not got["sh000001"].any()
     # sh688981 在合成表里自 2024-01-01 起被登记为 ST，故应被排除
     assert not got["sh688981"].any()
+
+
+# --- 真实上市日（票据 #25） ---------------------------------------------------
+
+
+def test_a_stock_is_excluded_by_its_real_listing_date_even_with_plenty_of_bars(
+    make_prices, make_market
+):
+    """**本票的核心**：次新股门槛按**真实上市日**算，而不是按本地行情根数。
+
+    构造：某标的在窗口内有 **200 根**（远超门槛 60），但它的**真实上市日**就在窗口开始后不久
+    ——故它在窗口前段是次新、应当被排除。按行情根数的近似口径会**放行**它（200 ≫ 60），
+    因为那只标的的数据恰好从上市日开始，「数据够多」被误当成「上市很久了」。
+    """
+    market = make_market("sh600000", make_prices(closes(200)))
+    first = market.prices.index[0].date()
+    listing = first  # 真实上市日 = 窗口首根（数据恰好从上市日开始，正是要挡的那种）
+
+    got = build_universe(
+        [market], rules=UniverseRules(min_trading_days=60), listing_dates={"sh600000": listing}
+    )["sh600000"]
+
+    assert not got.iloc[:59].any(), "上市不足 60 个交易日 → 前段应被排除"
+    assert bool(got.iloc[59]) is True, "第 60 个交易日起在池内"
+    assert got.iloc[59:].all()
+
+
+def test_the_real_listing_date_and_the_bar_count_agree_for_an_old_stock(make_prices, make_market):
+    """对**窗口之前**上市的老股，两个口径结论相同（都不是次新）——故这次改动不会误伤它们。"""
+    market = make_market("sh600000", make_prices(closes(200)))
+    listing = market.prices.index[0].date() - dt.timedelta(days=365 * 20)
+
+    by_listing = build_universe(
+        [market], rules=UniverseRules(min_trading_days=60), listing_dates={"sh600000": listing}
+    )["sh600000"]
+    by_bars = build_universe([market], rules=UniverseRules(min_trading_days=60))["sh600000"]
+
+    assert by_listing.equals(by_bars)
+
+
+def test_an_unknown_listing_date_falls_back_to_the_bar_count(make_prices, make_market):
+    """**上市日未知 → 回退到「本地行情根数」**，而不是整列排除。
+
+    这是票据 AC 明确要求保留的那条退路。若改成整列排除，会把**任何**主表里查不到的标的
+    无声丢掉——而实测本机 304 只没有上市日的股票**全部已停更**（多为退市股），它们的本地
+    首根就是上市日，故回退结果对它们本来就准。
+
+    构造：70 根、上市日不在字典里，门槛 60 → 前 59 根不在池、第 60 根起在池。
+    """
+    market = make_market("sh600000", make_prices(closes(70)))
+
+    got = build_universe([market], rules=UniverseRules(min_trading_days=60), listing_dates={})[
+        "sh600000"
+    ]
+
+    assert not got.iloc[:59].any(), "回退口径：不足 60 根时不在池"
+    assert bool(got.iloc[59]) is True
+
+
+def test_a_known_date_and_an_unknown_one_are_treated_differently_in_one_call(
+    make_prices, make_market
+):
+    """同一次调用里，**有上市日的**按真实口径、**没有的**按回退口径——两列并存。
+
+    这条钉住「回退是**逐标的**的」，而不是「整批都给了才用真实口径」。
+    """
+    fresh = make_market("sz000001", make_prices(closes(200)))
+    unknown = make_market("sh600000", make_prices(closes(200)))
+
+    got = build_universe(
+        [fresh, unknown],
+        rules=UniverseRules(min_trading_days=60),
+        listing_dates={"sz000001": fresh.prices.index[0].date()},
+    )
+
+    assert not got["sz000001"].iloc[:59].any(), "真实口径：窗口内上市 → 前段排除"
+    assert got["sh600000"].iloc[59:].all(), "回退口径：200 根远够 60"
+
+
+def test_listing_dates_absent_falls_back_to_the_bar_count(make_prices, make_market):
+    """不给上市日（或没传该字典）→ 回退到「本地行情根数」的近似口径。
+
+    主表只是**细化**规则，不该让库因为缺一份可有可无的 TDX 文件而不可用。
+    """
+    market = make_market("sh600000", make_prices(closes(70)))
+
+    got = build_universe([market], rules=UniverseRules(min_trading_days=60))["sh600000"]
+
+    assert not got.iloc[:59].any()
+    assert bool(got.iloc[59]) is True
+
+
+def test_a_listing_date_after_the_data_leaves_the_symbol_out(make_prices, make_market):
+    """上市日晚于数据末根 → 整列排除（它还没上市，或数据里没有它）。"""
+    market = make_market("sh600000", make_prices(closes(200)))
+    listing = market.prices.index[-1].date() + dt.timedelta(days=30)
+
+    got = build_universe(
+        [market], rules=UniverseRules(min_trading_days=0), listing_dates={"sh600000": listing}
+    )["sh600000"]
+
+    assert not got.any()
+
+
+def test_the_reason_agrees_with_the_mask_when_the_date_is_unknown(make_prices, make_market):
+    """上市日未知时，**理由说的口径必须与掩码实际用的口径一致**。
+
+    这条防的是「理由说回退、掩码却在排除」这类自相矛盾——评审正是在这里抓到过一个真缺陷
+    （文档承诺回退、实现却整列排除）。
+    """
+    market = make_market("sh600000", make_prices(closes(10)))
+    rules = UniverseRules(min_trading_days=60)
+
+    reason = why_not_in_universe([market], rules=rules, listing_dates={})["sh600000"]
+    mask = build_universe([market], rules=rules, listing_dates={})["sh600000"]
+
+    assert not mask.any()
+    assert "行情只有" in reason, f"理由应与回退口径一致，而实际是：{reason}"
+
+
+def test_the_reason_says_which_rule_was_used(make_prices, make_market):
+    """「为什么被排除」的措辞要分得清**用的是哪个口径**（票据 #25）。
+
+    旧措辞「行情只有 N 根」在有了真实上市日之后会**误导**——读者会以为规则还是按行情根数算的。
+    """
+    market = make_market("sh600000", make_prices(closes(10)))
+    listing = market.prices.index[0].date()
+
+    with_real = why_not_in_universe(
+        [market], rules=UniverseRules(min_trading_days=60), listing_dates={"sh600000": listing}
+    )["sh600000"]
+    without = why_not_in_universe([market], rules=UniverseRules(min_trading_days=60))["sh600000"]
+    unknown = why_not_in_universe(
+        [market], rules=UniverseRules(min_trading_days=60), listing_dates={}
+    )["sh600000"]
+
+    assert "上市仅" in with_real and "个交易日" in with_real
+    assert "行情只有" in without
+    assert "上市日未知" in unknown
+    assert len({with_real, without, unknown}) == 3, "三种情形的措辞必须互不相同"
+
+
+# --- `min_bars` 的旧名（改名后的兼容） ----------------------------------------
+
+
+def test_the_old_name_still_works(make_prices, make_market):
+    """`min_bars` 是旧名，仍可用——40 处既有调用点与测试因此不受影响。"""
+    rules = UniverseRules(min_bars=3)
+
+    assert rules.threshold == 3
+    assert rules.min_trading_days == 3
+
+
+def test_giving_both_names_the_same_value_is_fine():
+    assert UniverseRules(min_trading_days=5, min_bars=5).threshold == 5
+
+
+def test_giving_both_names_different_values_is_an_error():
+    """同时给两个名却是不同的值 → 报错，而不是替人挑一个（那会静默改变口径）。"""
+    with pytest.raises(ValueError, match="不能给出不同的值"):
+        UniverseRules(min_trading_days=5, min_bars=10)
 
 
 # --- 附加过滤（基本面）：与结构性准入**取与**，失败原因分得开（票据 #8） --------

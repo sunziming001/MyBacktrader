@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -70,9 +71,10 @@ class UniverseRules:
 
     属性:
         boards: 纳入哪些**板块**（用 `CONTEXT.md` 的四个概念名）。默认四个全收。
-        min_bars: 至少需要多少根 K 线才可进入。默认 60，即「排除上市不足 60 个交易日的
-            次新股」。该门槛度量的是**本地数据的可得量**，不是真实上市日——见
-            :func:`build_universe` 的说明。
+        min_trading_days: 至少需要**上市以来**多少个交易日才可进入。默认 60，即「排除上市
+            不足 60 个交易日的次新股」。口径取决于是否给了真实上市日——见下面的字段注释与
+            :func:`build_universe`。
+        min_bars: ``min_trading_days`` 的**旧名**，仅为兼容而保留；两者只能给一个。
 
     **品种不在这里配置**：股票池只从判为**股票**的品种中构建（ADR-0004）。做成可配置的
     参数是没有意义的——非股票标的本就没有板块，规则层的 :func:`mbt.rules.board_of` 对它们
@@ -80,7 +82,19 @@ class UniverseRules:
     """
 
     boards: frozenset[str] = field(default_factory=lambda: ALL_BOARDS)
-    min_bars: int = 60
+    #: 至少需要**上市以来**多少个交易日才可进入。默认 60，即「排除上市不足 60 个交易日的次新股」。
+    #:
+    #: 口径取决于是否给了真实上市日（票据 #25）：
+    #:
+    #: - 有该标的的上市日 → 数的是**自上市日起的交易日**（真实口径）；
+    #: - 没有（或整批都没给）→ **回退**为「本地行情根数」的近似口径。
+    #:
+    #: 两个口径对**数据窗口之前**上市的老股结论相同；只在**窗口内上市的新股**上不同——
+    #: 近似口径会把「数据刚好从上市日开始」当成「上市很久了」而放行。
+    min_trading_days: int | None = None
+    #: `min_trading_days` 的**旧名**（原 `min_bars`）。仅为兼容既有调用方而保留。
+    #: **两者只能给一个**；同时给且值不同会报错，相同则视作一次重复声明。
+    min_bars: int | None = None
     #: 附加的准入掩码（boolean 标的宽表），由**调用方**提供并与上述结构性条件**取与**。
     #:
     #: 它存在的理由：**基本面过滤**（如「非亏损」）不是结构性条件——品种、板块、次新答的是
@@ -89,43 +103,77 @@ class UniverseRules:
     #: 这个区别。
     extra_mask: pd.DataFrame | None = None
 
+    def __post_init__(self):
+        """把旧名 `min_bars` 与新名 `min_trading_days` 调和成一个门槛。
+
+        `frozen=True` 下不能直接赋值，故用 ``object.__setattr__``。
+
+        **新名不给默认值**（默认 ``None``）是刻意的：早先版本把新名的默认写成字面 ``60``，
+        于是「同时给两个名」时无法分辨新名是**显式给的**还是**吃了默认值**——`min_bars=10`
+        会静默压过 `min_trading_days=60`。改成 ``None`` 之后关系就能逐情形说清：
+
+        - 都不给 → 60（出厂设定）；
+        - 只给一个 → 用它；
+        - 两个都给 → 必须相同，否则**报错**（而不是替你挑一个，那会静默改变口径）。
+        """
+        if self.min_bars is None and self.min_trading_days is None:
+            object.__setattr__(self, "min_trading_days", 60)
+            return
+        if self.min_bars is None or self.min_trading_days is None:
+            chosen = self.min_bars if self.min_bars is not None else self.min_trading_days
+            object.__setattr__(self, "min_trading_days", chosen)
+            return
+        if self.min_bars != self.min_trading_days:
+            raise ValueError(
+                f"min_bars（旧名）={self.min_bars} 与 "
+                f"min_trading_days（新名）={self.min_trading_days} 不能给出不同的值"
+            )
+
+    @property
+    def threshold(self) -> int:
+        """门槛（交易日数）。读旧名与新名都得到它。"""
+        return self.min_trading_days
+
 
 def why_not_in_universe(
     markets,
     *,
     rules: UniverseRules | None = None,
     rule_table: RuleTable | None = None,
+    listing_dates: dict[str, dt.date] | None = None,
 ) -> pd.Series:
     """逐个标的给出「为什么它不在池内」的一句话，供人工抽查。
 
-    与 :func:`build_universe` 共用**同一份**判据（:func:`_exclusion_reasons` 产出有序的
+    与 :func:`build_universe` 共用**同一份**判据（:func:`_structural_failures` 产出有序的
     (条件, 理由) 列表，两者都按它走），故「为什么被排除」讲错的风险只有一处。
     """
     rules = rules or UniverseRules()
-    frame = build_universe(markets, rules=rules, rule_table=rule_table)
+    frame = build_universe(markets, rules=rules, rule_table=rule_table, listing_dates=listing_dates)
     reasons = {}
     for market in markets:
         symbol = market.symbol
         if symbol not in frame.columns:
             continue
         reasons[symbol] = (
-            "在池内" if frame[symbol].any() else _first_reason(market, rules, rule_table)
+            "在池内"
+            if frame[symbol].any()
+            else _first_reason(market, rules, rule_table, listing_dates)
         )
     return pd.Series(reasons, name="reason")
 
 
-def _first_reason(market, rules: UniverseRules, rule_table) -> str:
+def _first_reason(market, rules: UniverseRules, rule_table, listing_dates=None) -> str:
     """第一条不通过的理由，**顺序与 :func:`build_universe` 一致**。
 
     两者共用 :func:`_structural_failures`，故此处的顺序不会与那边漂移——而「讲错为什么被排除」
     比不讲更糟：它会把人引到错误的方向去查。
     """
-    for reason in _structural_failures(market, rules, rule_table):
+    for reason in _structural_failures(market, rules, rule_table, listing_dates):
         return reason
     return "未通过准入"
 
 
-def _structural_failures(market, rules: UniverseRules, rule_table):
+def _structural_failures(market, rules: UniverseRules, rule_table, listing_dates=None):
     """按与 :func:`build_universe` **相同的顺序**列出不通过的理由（可能多条）。"""
     symbol = market.symbol
     if not is_stock(symbol):
@@ -141,10 +189,22 @@ def _structural_failures(market, rules: UniverseRules, rule_table):
     if board not in rules.boards:
         yield f"板块 {board} 未纳入"
 
-    # 注意顺序：`build_universe` 先判根数、再判附加掩码、最后判 ST——这里必须一致，
+    # 次新股门槛的措辞**分三种**，因为它们的可信度不同（票据 #25）：真实上市日、
+    # 回退到行情根数、以及两者都不足以判断。旧措辞「行情只有 N 根」在有了真实上市日之后
+    # 会**误导**——读者会以为规则还是按行情根数算的。
+    listing = None if listing_dates is None else listing_dates.get(symbol)
+    if listing_dates is not None:
+        if listing is None:
+            yield f"上市日未知，且行情只有 {len(market.prices)} 根，无从判定是否次新"
+        else:
+            days = _trading_days_since(market, listing)
+            if days < rules.threshold:
+                yield f"上市仅 {days} 个交易日，不足 {rules.threshold}"
+    elif len(market.prices) < rules.threshold:
+        yield f"行情只有 {len(market.prices)} 根，不足 {rules.threshold} 根"
+
+    # 注意顺序：`build_universe` 先判根数/上市日、再判附加掩码、最后判 ST——这里必须一致，
     # 否则「为什么被排除」会指向另一条其实没拦住它的条件。
-    if len(market.prices) < rules.min_bars:
-        yield f"行情只有 {len(market.prices)} 根，不足 {rules.min_bars} 根"
 
     if rules.extra_mask is not None and symbol in rules.extra_mask.columns:
         if not rules.extra_mask[symbol].any():
@@ -154,6 +214,14 @@ def _structural_failures(market, rules: UniverseRules, rule_table):
 
     if rule_table is not None and rule_table.has_st_period(symbol):
         yield "期间内有 ST 登记（被排除）"
+
+
+def _trading_days_since(market, listing) -> int:
+    """该标的的行情里，自上市日起有多少个交易日（首根若晚于上市日，就从首根算起）。"""
+    index = market.prices.index
+    if len(index) == 0:
+        return 0
+    return int((index >= pd.Timestamp(listing)).sum())
 
 
 def combine_masks(*masks: pd.DataFrame) -> pd.DataFrame:
@@ -185,11 +253,66 @@ def combine_masks(*masks: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
+def _threshold_dates(index: pd.Index, days: int, calendar: pd.Index) -> pd.Series:
+    """每个交易日对应的**门槛日**：该日往前数 ``days`` 个交易日（**含当日**）的那个日期。
+
+    于是「某标的在某日是否次新」= 「它的上市日是否晚于该日的门槛日」——**一次向量化比较**，
+    不必对每个 (标的, 日期) 各数一遍交易日。
+
+    偏移取 ``days − 1`` 而不是 ``days``，是因为**含当日**：某标的在第 ``i`` 个交易日恰好上市满
+    ``days`` 个交易日（即当日往回数第 ``days`` 个交易日就是它的上市日），它就不再是次新。
+    这与「本地行情恰好 ``days`` 根」这一近似口径在边界上**一致**——两者不该差一根。
+
+    窗口最前面的 ``days − 1`` 个交易日没有足够的日历可回看，故返回 ``NaT``；消费方
+    （:func:`_by_listing_date`）把那些格判为**不在池**（保守：宁可少收）。
+    """
+    offset = max(days - 1, 0)
+    positions = pd.Series(range(len(calendar)), index=calendar)
+    shifted = positions.reindex(index) - offset
+    # 门槛落在日历之前（即窗口最前面的若干交易日）时无法判定 → 用 NaT 表示。
+    valid = shifted >= 0
+    values = pd.Series(pd.NaT, index=index, dtype="datetime64[ns]")
+    values[valid.to_numpy()] = calendar[shifted[valid].astype(int).to_numpy()]
+    return values
+
+
+def _by_listing_date(closes, listing_dates, days: int, bars_so_far) -> pd.DataFrame:
+    """按**真实上市日**算次新股门槛（票据 #25）。
+
+    某个标的在某交易日「上市不足 ``days`` 个交易日」⟺ 它的上市日**晚于**该日的门槛日。
+
+    三条边界：
+
+    - **上市日未知** → **回退**到「本地行情根数」的近似口径（``bars_so_far >= days``）。
+      这是票据 AC 明确要求保留的那条退路，也是**必须**保留的：实测本机 304 只没有上市日的
+      股票**全部已停更**（多为退市股），而它们的本地首根就是上市日，故回退结果对它们本来就准。
+      若改成整列排除，会把**任何**主表里查不到的标的无声丢掉。
+    - **门槛日无法判定**（窗口最前面的 ``days - 1`` 个交易日，日历不够长）→ 该**格**为假
+      （保守：宁可少收）。注意这只影响窗口开头那一小段。
+    - **上市日晚于数据末根** → 整列为假（它还没上市，或数据里没有它）。
+    """
+    calendar = pd.DatetimeIndex(sorted(set(closes.index)))
+    threshold = _threshold_dates(closes.index, days, calendar)
+
+    frame = pd.DataFrame(False, index=closes.index, columns=closes.columns)
+    for symbol in closes.columns:
+        listing = listing_dates.get(symbol)
+        if listing is None:
+            frame[symbol] = bars_so_far[symbol] >= days  # 回退口径
+            continue
+        stamp = pd.Timestamp(listing)
+        # 「在池内」= **不是**次新股 = 上市日**不晚于**该日的门槛日。
+        # （次新的定义是「上市日 > 门槛日」——距上市不足 days 个交易日。）
+        frame[symbol] = (stamp <= threshold).fillna(False)
+    return frame
+
+
 def build_universe(
     markets,
     *,
     rules: UniverseRules | None = None,
     rule_table: RuleTable | None = None,
+    listing_dates: dict[str, dt.date] | None = None,
 ) -> pd.DataFrame:
     """由一组已质检的行情算出股票池。
 
@@ -199,6 +322,10 @@ def build_universe(
         rules: 准入规则，默认 :class:`UniverseRules` 的出厂设定。
         rule_table: 规则表，用于查 **ST 期间**。``None`` 时不判 ST。请注意出厂表不登记
             任何 ST 期间，故默认情形下 ST 排除**不生效**（见模块说明）。
+        listing_dates: **真实上市日**（``{符号: 日期}``），来自
+            :class:`~mbt.data.master.SecurityMasterDataSource`（票据 #25）。给了它，次新股的
+            门槛就按「自上市日起的交易日」算（**真实口径**）；**某个标的不在字典里**（上市日未知）
+            时，该标的**回退**到「本地行情根数」的近似口径。
 
     返回:
         boolean 标的宽表（ADR-0009）：索引是各标的交易日的**并集**（与引擎时钟一致），
@@ -206,10 +333,9 @@ def build_universe(
 
     .. note::
 
-        ``min_bars`` 度量的是**本地行情可得量**，不是真实上市日。对本机数据窗口
-        （`sh600000` 自 1999-11-10 起，各标的起止不一）之前上市的老股，其首根即窗口起点，
-        故 60 日门槛永不触发。结果正确（它们确实不是次新），但它不等于「自 IPO 起已满
-        60 日」——真实上市日需要数据源提供带日期的上市信息，一期不含。
+        两个口径的差别只在**窗口内上市的新股**上：近似口径看到「数据刚好从上市日开始」，
+        会把它当成「上市很久了」而放行；真实口径才知道它是次新。对**窗口之前**上市的老股，
+        两者结论相同（都不是次新）。
     """
     rules = rules or UniverseRules()
 
@@ -220,7 +346,11 @@ def build_universe(
 
     # 截至当日的累计 K 线根数（含当日）。用累计而非整段长度，是时点正确性的落点。
     bars_so_far = closes.notna().cumsum()
-    in_universe = bars_so_far >= rules.min_bars
+    in_universe = (
+        bars_so_far >= rules.threshold
+        if listing_dates is None
+        else _by_listing_date(closes, listing_dates, rules.threshold, bars_so_far)
+    )
 
     for market in markets:
         symbol = market.symbol
