@@ -251,7 +251,12 @@ def run_portfolio_backtest(
 
         def next(self):
             # 掩码的索引是 DatetimeIndex，故要用 Timestamp 去取（用 datetime.date 会 KeyError）。
-            today = pd.Timestamp(self.data0.datetime.date(0))
+            #
+            # 「今天」取各标的当前日期的**最大者**，不要用 `self.data0.datetime.date(0)`：
+            # 若第一个标的的历史比区间短（次新股、北交所早期、或 `--limit` 随手选中的某一只），
+            # 它的日期会一直停在末根，于是掩码查到的是**另一天**——不报错，只是结果错。
+            # 引擎内部记账用的是同一个办法（见 `_EngineClock`）。
+            today = pd.Timestamp(max(data.datetime.date(0) for data in self.datas if len(data)))
             for data in self.datas:
                 if not self.broker.tradability_mask.at[today, data._name]:
                     continue          # 今天这根是陈旧的，不是新 K 线
