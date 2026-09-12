@@ -14,17 +14,21 @@ def curve(values, start="2024-01-02"):
     return pd.Series(values, index=pd.bdate_range(start, periods=len(values)), dtype=float)
 
 
-def trades_table(rows, start="2024-01-02", periods=10):
+def trades_table(rows, start="2024-01-02", periods=10, symbol="sh600000"):
     """由 ``(日期序号, size, price, commission)`` 构造成交明细。
 
     列与命名都与 ``mbt.backtest.TRADE_COLUMNS`` 一致；``value`` 由 ``size × price`` 得出
     （与撮合层记录的口径相同）。
+
+    ``symbol`` 默认为单一标的——**平仓配对按标的分别做**，故这一列不是装饰：测跨标的场景时
+    请分别构造两份再拼起来（不同 ``symbol``），否则测不到「不被误配」这件事。
     """
     index = pd.bdate_range(start, periods=periods)
     return pd.DataFrame(
         [
             {
                 "date": index[day],
+                "symbol": symbol,
                 "size": size,
                 "price": price,
                 "value": size * price,

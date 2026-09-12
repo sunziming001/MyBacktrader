@@ -86,9 +86,10 @@ def compute_metrics(
 
     参数:
         equity: 净值曲线，交易日为索引（升序）、组合总资产为值。
-        trades: 成交明细，列同 ``mbt.backtest.TRADE_COLUMNS``（``date`` / ``size`` /
-            ``price`` / ``value`` / ``commission``）。``None`` 或空表示没有成交——那是合法
-            情形，只有依赖成交的指标会变成缺失。
+        trades: 成交明细，列同 ``mbt.backtest.TRADE_COLUMNS``（``date`` / ``symbol`` /
+            ``size`` / ``price`` / ``value`` / ``commission``）。``None`` 或空表示没有成交
+            ——那是合法情形，只有依赖成交的指标会变成缺失。``symbol`` 列是**必需的**：平仓
+            配对按标的分别做，缺了它会把一个标的的买入当成另一个标的卖出的对手方。
         periods_per_year: 年化口径的每年期数，默认 252（交易日）。
         risk_free: **年化**无风险利率（如 0.02 表示 2%）。默认 0，即不扣无风险收益。
         benchmark_equity: 基准的净值/价格序列（与 ``equity`` 同一区间口径）。给了它才算
@@ -202,8 +203,13 @@ def compute_metrics(
 def closed_trade_pnls(trades: pd.DataFrame | None) -> list[float]:
     """把成交明细配成**平仓交易**，返回每笔的已实现盈亏（元）。
 
-    配对规则是 **FIFO、按股数**：买入进队列（成本含手续费），卖出从队首扣减，逐段实现。
-    **每笔卖出产生一条**平仓记录，其盈亏是本次卖出的各段之和（部分平仓因此只算一笔）。
+    配对规则是 **FIFO、按股数、且按标的分别进行**：买入进队列（成本含手续费），卖出从队首
+    扣减，逐段实现。**每笔卖出产生一条**平仓记录，其盈亏是本次卖出的各段之和（部分平仓因此
+    只算一笔）。
+
+    「按标的分别」这件事**必须有**：组合里 A 的买入与 B 的卖出在时间上相邻，若共用一条队列，
+    A 的买入就会被当成 B 卖出的对手方，于是算出一个**无意义的盈亏**——而胜率与盈亏比都建在
+    它上面。故 ``trades`` 必须带 ``symbol`` 列（:data:`mbt.backtest.TRADE_COLUMNS` 的契约）。
 
     卖出量超过持仓时**报错**——那说明成交明细本身不可信，而在此静默按可用量截断，会让
     胜率的分母凭空变小。
@@ -216,10 +222,27 @@ def closed_trade_pnls(trades: pd.DataFrame | None) -> list[float]:
     if trades is None or trades.empty:
         return []
 
+    if "symbol" not in trades.columns:
+        raise ValueError(
+            "成交明细缺少 symbol 列，无法按标的分别配对——"
+            "缺了它会把一个标的的买入当成另一个标的卖出的对手方，"
+            "算出的胜率与盈亏比没有意义。"
+            "列应如 ('date', 'symbol', 'size', 'price', 'value', 'commission')"
+        )
+
+    pnls: list[float] = []
+    ordered = trades.sort_values("date")
+    for symbol, group in ordered.groupby("symbol", sort=False):
+        pnls.extend(_pair_one_symbol(group, symbol))
+    return pnls
+
+
+def _pair_one_symbol(trades: pd.DataFrame, symbol) -> list[float]:
+    """单个标的的 FIFO 配对（口径见 :func:`closed_trade_pnls`）。"""
     open_lots: list[list[float]] = []  # [剩余股数, 每股成本(含费)]
     pnls: list[float] = []
 
-    for row in trades.sort_values("date").itertuples(index=False):
+    for row in trades.itertuples(index=False):
         size = float(row.size)
         value = float(row.value)
         commission = float(row.commission or 0.0)
@@ -233,8 +256,8 @@ def closed_trade_pnls(trades: pd.DataFrame | None) -> list[float]:
         available = sum(lot[0] for lot in open_lots)
         if remaining > available + _SHARE_EPSILON:
             raise ValueError(
-                f"卖出 {remaining:g} 股超过当时持仓 {available:g} 股——成交明细不可信，"
-                f"配对算出的胜率也就没有意义"
+                f"{symbol} 卖出 {remaining:g} 股超过当时持仓 {available:g} 股——"
+                f"成交明细不可信，配对算出的胜率也就没有意义"
             )
 
         unit_proceeds = (abs(value) - commission) / remaining

@@ -33,7 +33,23 @@ from .sizing import EqualWeightSizer
 DEFAULT_RULES_PATH = SHIPPED_RULES_PATH
 
 #: 成交明细的列。
-TRADE_COLUMNS = ("date", "size", "price", "value", "commission")
+#:
+#: ``value`` 是**成交金额** ``size × price``，**带符号**（买入为正、卖出为负）。
+#:
+#: .. warning::
+#:
+#:     **不要**改成 backtrader 的 ``order.executed.value``。那是「本次成交所对应的持仓
+#:     **成本基础**」——买入手上是成本，而**平仓时它仍是当初的买入成本**，不是卖出所得。
+#:     实测：买 100@10、卖 100@12，两行的 ``executed.value`` **都是 1000**（而卖出应当记
+#:     1200）。用它会静默毁掉两处：
+#:
+#:     - 平仓配对（:func:`mbt.metrics.closed_trade_pnls`）用 ``value`` 反推卖出所得，
+#:       于是买入价被当成卖出价，盈亏退化成「只等于手续费」——**胜率恒为 0**；
+#:     - 换手率（:func:`mbt.metrics.compute_metrics`）累加 ``|value|``，数的是成本基础。
+#:
+#:     这个坑一度真实存在，且被测试夹具掩盖着：夹具按 ``size × price`` 造数（与本文口径
+#:     一致），而引擎产出的却是 ``executed.value``——**测试与实现各说各话**，所以没被测出来。
+TRADE_COLUMNS = ("date", "symbol", "size", "price", "value", "commission")
 
 #: 未成交而终结的订单的列。**留痕**用：挂单失效、拒单、保证金不足都要能事后查到。
 REJECT_COLUMNS = ("date", "symbol", "size", "status", "reason")
@@ -161,15 +177,19 @@ class _FillRecorder(bt.Analyzer):
         executed = order.executed
         # 由 TRADE_COLUMNS 派生键，列改名时不会静默产生 NaN 列；
         # strict=True 让字段数与列数不符时立即报错，而非静默截断
+        #
+        # `value` 用 `size × price`（成交金额、带符号），**不是** `executed.value`——后者是
+        # 持仓的成本基础，平仓时仍按买入价计，见 TRADE_COLUMNS 的说明。
         self._fills.append(
             dict(
                 zip(
                     TRADE_COLUMNS,
                     (
                         bt.num2date(executed.dt),
+                        getattr(order.data, "_mbt_symbol", None),
                         executed.size,
                         executed.price,
-                        executed.value,
+                        executed.size * executed.price,
                         executed.comm,
                     ),
                     strict=True,

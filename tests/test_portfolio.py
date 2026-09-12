@@ -191,7 +191,7 @@ def test_a_buy_outside_the_universe_is_rejected(make_market, zero_cost_rules):
         sizer_options={"stake": 100},
     )
 
-    assert result.trades["price"].tolist() == [10.0], "只有主板那只该成交"
+    assert result.trades["symbol"].tolist() == ["sh600000"], "只有主板那只该成交"
     blocked = result.rejected[result.rejected["symbol"] == "sz300750"]
     assert len(blocked) == 1, "池外买入被拒必须留痕"
 
@@ -522,11 +522,11 @@ def test_a_late_listing_does_not_block_the_earlier_symbols(make_market, zero_cos
     fills = result.trades.sort_values("date").reset_index(drop=True)
     assert len(fills) == 2, "两只标的都应成交"
 
-    # 用价格区分是谁：甲恒 10.0，丙从 20.0 起。
-    assert fills.iloc[0]["price"] == 10.0, "第一笔是甲的"
-    assert fills.iloc[0]["date"] < c_first, "甲在**丙上市之前**就该成交"
-    assert fills.iloc[1]["price"] == 20.0
-    assert fills.iloc[1]["date"] >= c_first
+    first, second = fills.iloc[0], fills.iloc[1]
+    assert first["symbol"] == "sh600000"
+    assert first["date"] < c_first, "甲在**丙上市之前**就该成交"
+    assert second["symbol"] == "sz000001"
+    assert second["date"] >= c_first
 
 
 def test_the_strategy_is_called_from_the_first_bar(make_market, zero_cost_rules):
