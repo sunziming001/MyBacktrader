@@ -397,26 +397,14 @@ def run_portfolio_backtest(
 
 
 def _with_signals(panel, signals):
-    """把**额外字段形信号**并进行情面板，供选股规则消费。
+    """把额外字段形信号并进行情面板——实现在 :func:`mbt.data.panel.with_signals`。
 
-    选股规则（:class:`~mbt.screen.Screen`）吃的是 :class:`~mbt.data.panel.Panel`，而估值
-    这类信号不在 ``.day`` 行情里（它们来自财务数据），故必须并进去才能被过滤器取用。
-
-    对齐**必须**成立：:class:`Panel` 只允许各字段同日同标的，而这里的两个来源分别由
-    「行情」与「行情 + 财务」算出，任一处口径不同就会静默错位——故面板构造会直接报错，
-    不在此处做任何形状修补。
+    留这个薄封装只为让引擎内部的调用点读起来短一点；**逻辑不在这里**，否则 CLI 的选股路径
+    会需要第二份实现，而两份必然漂移。
     """
-    if not signals:
-        return panel
+    from mbt.data.panel import with_signals
 
-    from mbt.data.panel import Panel
-
-    fields = {name: panel[name] for name in panel.field_names}
-    for name, frame in signals.items():
-        if name in fields:
-            raise ValueError(f"信号字段 {name!r} 与行情字段重名，会静默覆盖行情")
-        fields[name] = frame
-    return Panel(fields)
+    return with_signals(panel, signals)
 
 
 def _drive_engine(

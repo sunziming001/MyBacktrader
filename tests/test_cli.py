@@ -134,6 +134,22 @@ def test_the_parser_has_three_subcommands():
     assert set(parser._subparsers._group_actions[0].choices) == {"backtest", "screen", "update"}
 
 
+def test_both_backtest_and_screen_accept_the_same_screen_switch():
+    """`backtest` 与 `screen` 都收 ``--screen``——否则「同一条件只写一遍」在选股侧不成立。
+
+    此前 ``screen`` 写死 ``momentum_screen``，于是 ``backtest --screen valuation`` 用估值规则
+    而 ``screen`` 仍按动量选，两边给出的候选完全不是一回事。这条把两者的**开关一致性**钉住。
+    """
+    parser = build_parser()
+    for command in ("backtest", "screen"):
+        args = parser.parse_args(
+            [command, "--tdx-root", "x", "--gbbq", "y", "--output-dir", "z"]
+            + (["--strategy", "m:S"] if command == "backtest" else ["--as-of", "2024-01-02"])
+        )
+        assert hasattr(args, "screen"), f"{command} 应当接受 --screen"
+        assert hasattr(args, "boards"), f"{command} 应当接受 --boards"
+
+
 def test_start_defaults_to_the_fully_priceable_window():
     """**本票最关键的一条默认值**：默认区间取「跑得对」的那个窗口。
 

@@ -105,6 +105,29 @@ class Panel:
         )
 
 
+def with_signals(panel: Panel, signals: Mapping[str, pd.DataFrame] | None) -> Panel:
+    """把**额外信号**并进面板，供选股规则取用；``None`` 或空则原样返回。
+
+    选股规则吃的是 :class:`Panel`，而估值这类信号不在 ``.day`` 行情里（它们来自财务数据），
+    故必须并进去才能被过滤器取用。
+
+    对齐**必须**成立：:class:`Panel` 只允许各字段同日同标的，而两个来源分别由「行情」与
+    「行情 + 财务」算出——任一处口径不同就会静默错位，故这里不做任何形状修补，让 ``Panel``
+    的校验直接报错。
+
+    与行情字段**重名**要报错而不是覆盖：覆盖会让行情字段静默消失，而下游会以为拿到的还是行情。
+    """
+    if not signals:
+        return panel
+
+    fields = {name: panel[name] for name in panel.field_names}
+    for name, frame in signals.items():
+        if name in fields:
+            raise ValueError(f"信号字段 {name!r} 与行情字段重名，会静默覆盖行情")
+        fields[name] = frame
+    return Panel(fields)
+
+
 def assemble_panel(markets: Sequence[MarketData], fields: Sequence[str]) -> Panel:
     """把若干个**已质检**的行情组建成面板，只取显式声明的字段。
 

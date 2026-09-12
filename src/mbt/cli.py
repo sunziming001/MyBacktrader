@@ -154,6 +154,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     screen.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     screen.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
+    screen.add_argument(
+        "--boards",
+        default=None,
+        help="纳入的板块，逗号分隔（默认四个全收：主板,创业板,科创板,北交所）",
+    )
+    screen.add_argument(
+        "--screen",
+        choices=("momentum", "valuation"),
+        default="momentum",
+        help="用哪条选股规则（valuation 需 --cw-root）。默认 momentum",
+    )
+    screen.add_argument(
+        "--screen-top-n",
+        type=int,
+        default=None,
+        help="规则取前 N 名（默认取 --top-n）",
+    )
 
     update = sub.add_parser("update", help="检查本地数据有没有变化（手动触发，不设定时任务）")
     update.add_argument("--tdx-root", required=True, help="通达信 vipdoc 根目录")
@@ -355,7 +372,12 @@ def _screen_and_signals(args, loaded, full_markets, stdout):
         return None, None
 
     # 候选集大小默认取最大持仓数：取前 N 却只持有 M < N 只，多出来的候选没有意义。
-    top_n = getattr(args, "screen_top_n", None) or args.max_positions or 5
+    top_n = (
+        getattr(args, "screen_top_n", None)
+        or getattr(args, "max_positions", None)
+        or getattr(args, "top_n", None)
+        or 5
+    )
 
     if name == "momentum":
         return momentum_screen(window=20, top_n=top_n), None
@@ -377,7 +399,13 @@ def _screen_and_signals(args, loaded, full_markets, stdout):
         f"估值：{covered}/{len(full_markets)} 个标的算出了动态PE（其余无可用财报）",
         file=stdout,
     )
-    signals = clip_fields(valuation.as_fields(), loaded.markets, start=args.start, end=args.end)
+    signals = clip_fields(
+        valuation.as_fields(),
+        loaded.markets,
+        # 选股命令没有 --start/--end（评估日由 --as-of 承担），故用 getattr 兜底。
+        start=getattr(args, "start", None),
+        end=getattr(args, "end", None),
+    )
     return valuation_screen(top_n=top_n), signals
 
 
@@ -424,7 +452,9 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         else:
             print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
         pool = build_universe(
-            list(loaded.markets), rules=UniverseRules(), listing_dates=listing_dates
+            list(loaded.markets),
+            rules=UniverseRules(boards=_boards(args)),
+            listing_dates=listing_dates,
         )
         masks = [pool]
         # AC 要求「非亏损」过滤**同时**接入股票池与选股规则。选股侧走的是 `Screen.apply` 的
@@ -442,8 +472,18 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             )
             print("基本面过滤：已按公告日叠加「非亏损」条件", file=stdout)
 
-        result = momentum_screen(window=20, top_n=args.top_n).apply(
-            panel, as_of=as_of, universe_mask=combine_masks(*masks)
+        # **与 backtest 用同一个 `_screen_and_signals`**，故 `--screen` 指名的那条规则在两处
+        # 是**同一个对象**（ADR-0001）。此前这里写死 `momentum_screen`，于是「同一条件只写一遍」
+        # 在选股侧并没有兑现——`backtest --screen valuation` 用估值规则，而 `screen` 仍按动量
+        # 选，两边给出的候选完全不是一回事。
+        screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout)
+        if screen is None:
+            screen = momentum_screen(window=20, top_n=args.top_n)
+
+        from mbt.data.panel import with_signals
+
+        result = screen.apply(
+            with_signals(panel, signals), as_of=as_of, universe_mask=combine_masks(*masks)
         )
         candidates = result.candidates(as_of)
     except Exception as exc:  # noqa: BLE001
