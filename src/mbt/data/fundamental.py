@@ -87,6 +87,13 @@ FIELDS = {
     "net_profit_ytd": 95,  # 归属于母公司所有者的净利润（元，累计）
     "revenue_quarter": 229,  # 营业收入（元，单季）
     "net_profit_quarter": 231,  # 归属于母公司所有者的净利润（元，单季）
+    # 通达信 `FINVALUE(n)` = 本表的**索引 n − 1**（在真实文件上核对过：
+    # FINVALUE(238)=总股本 ↔ 索引 237、FINVALUE(276)=利润TTM ↔ 索引 275、
+    # FINVALUE(184)=增历史 ↔ 索引 183）。下面三个就是「估值」那几个公式真正用的字段——
+    # 它们是**现成的整列**，不必自己拼或年化（见 mbt.data.valuation 的说明）。
+    "total_shares": 237,  # 总股本（股，时点）——FINVALUE(238)
+    "profit_ttm": 275,  # 归母净利润 TTM（元）——FINVALUE(276)
+    "growth_ytd": 183,  # 归母净利润累计同比（%）——FINVALUE(184)
     "announcement_date": 313,  # 财报公告日期（YYMMDD / YYYYMMDD 整数，存在 float32 里）
 }
 
