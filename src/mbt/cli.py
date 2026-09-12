@@ -625,6 +625,7 @@ def _report_result(result, run_dir, stdout) -> None:
     metrics = compute_metrics(
         result.equity_curve,
         result.trades,
+        rejected=result.rejected,
     )
     print("\n结果：", file=stdout)
     print(f"  期末总资产    {result.final_value:,.2f}", file=stdout)
@@ -633,8 +634,25 @@ def _report_result(result, run_dir, stdout) -> None:
     print(f"  夏普          {metrics.sharpe:.3f}", file=stdout)
     print(f"  最大回撤      {metrics.max_drawdown:.2%}", file=stdout)
     print(f"  成交笔数      {len(result.trades)}（平仓 {metrics.closed_trades}）", file=stdout)
+    print(
+        f"  拒单          {metrics.rejected_orders} 笔（占下单 {metrics.rejection_rate:.1%}）",
+        file=stdout,
+    )
     for note in metrics.notes:
         print(f"  注：{note}", file=stdout)
+
+    # 有下单却**一笔都没成交**：净值曲线与上面的指标不代表任何策略——这是本项目最防的那类
+    # 静默失败（实测撞到过两次：sizer 不给费用留余量、定量价与成交价之差）。
+    #
+    # 刻意**不**按「拒单率超过某个阈值」告警：名额有限时高拒单率是**正常**的（例如 34 个信号、
+    # 10 个名额，24 笔被拒是预期行为）。真正没有意义的是「零成交」，故只对它告警。
+    if len(result.rejected) and not len(result.trades):
+        print(
+            "  警告：有下单但**一笔都没成交**，上面的指标不代表任何策略；"
+            "理由见 rejected.csv（常见：资金不足 Margin、出池、挂单过期）",
+            file=stdout,
+        )
+
     print(f"\n产物：{run_dir}", file=stdout)
 
 

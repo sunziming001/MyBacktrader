@@ -7,7 +7,7 @@ AC 要求「多标的共享资金池，有最大持仓数与仓位分配」，�
 这里的词按 `CONTEXT.md` 的分工用：**持仓**是「组合拿着哪些标的」，**仓位**是「其中每一只
 占多大比例」。
 
-## 默认口径：等权
+## 默认口径：等权 + 按限幅留余地
 
 设最大持仓（标的数）为 ``M``、当前已持有 ``H`` 只标的（不含正在下单的这一只），本单可用
 资金为 ``C``，则本次买入的目标金额为::
@@ -17,6 +17,14 @@ AC 要求「多标的共享资金池，有最大持仓数与仓位分配」，�
 也就等于给每个持仓名额一个等额的**目标仓位**，依次把可用资金摊出去：第一笔用掉约 ``C/M``，
 第二笔用掉剩余资金的 ``1/(M−1)``，最后一笔把剩余全部投出。它的好处是**每一步都能手算**，
 且不会因为价格变动而需要回头修正既有的持仓。
+
+**买入数量再按「最坏成交价」求上界**——不是按当根收盘价。理由：订单在**本根收盘定量、在下一根
+成交**，而下一根的价格受「前收盘 × (1 + 涨跌幅限制)」约束，故最坏成交价是
+``收盘价 × (1 + 当日板块限幅)``，限幅从规则表按板块与成交日查出（票据 #32）。
+
+**代价是系统性少买约「限幅」那么多**（主板约 9%、北交所约 23%），这是**刻意承担**的：那份代价
+是确定的、可解释的，而「因下一根涨价而整笔被拒」是不确定且静默的。留余地的比例可用
+``headroom`` 覆盖，传 ``0.0`` 即回到按收盘价定量（那时请自己盯着拒单率）。
 
 ## 尚未建模
 
@@ -42,7 +50,7 @@ class EqualWeightSizer(bt.Sizer):
             ``BacktestResult.rejected``，不会悄无声息地发生。
     """
 
-    params = (("max_positions", None),)
+    params = (("max_positions", None), ("rules", None), ("headroom", None))
 
     def _getsizing(self, comminfo, cash, data, isbuy):
         if not isbuy:
@@ -61,7 +69,26 @@ class EqualWeightSizer(bt.Sizer):
         if price <= 0:
             return 0
 
-        return self._affordable(comminfo, cash / slots, price)
+        # 按**最坏成交价**定量，而不是按当根收盘价——见 `_headroom`。
+        worst = price * (1.0 + self._headroom(data))
+        return self._affordable(comminfo, cash / slots, worst)
+
+    def _headroom(self, data) -> float:
+        """成交价相对**定量价**的预留比例（见 :meth:`_affordable` 的说明）。
+
+        ``headroom`` 显式给了就用它；否则按规则表查该标的在成交日的**涨跌幅限制**——因为
+        订单在本根的收盘定量、在**下一根**成交，而下一根的价格受「前收盘 × (1 + 限幅)」
+        约束，所以限幅是那个缺口的**可靠上界**。
+
+        用 :meth:`~mbt.rules.RuleTable.limit_for` 而非 ``price_limit``：前者已按需叠加 ST
+        覆盖，故对 ST 标的给出的仍是上界（且更紧）。``rules`` 未给则**不留余地**——这是刻意
+        的向后兼容，调用方要么给规则表、要么自己给 ``headroom``。
+        """
+        if self.p.headroom is not None:
+            return self.p.headroom
+        if self.p.rules is None:
+            return 0.0
+        return self.p.rules.limit_for(data._mbt_symbol, data.datetime.date(0))
 
     @staticmethod
     def _affordable(comminfo, budget, price) -> int:
@@ -84,6 +111,16 @@ class EqualWeightSizer(bt.Sizer):
         ``broker.getcommissioninfo(data)``（本项目的 ``AStockBroker`` 在那里把**成交日与板块**
         注入费用对象），**再**调 ``_getsizing``。所以这里的 ``comminfo`` 已能算出当日当板块的
         真实费用——照抄一份费率表出来只会与之漂移（Shotgun Surgery）。
+
+        .. note::
+
+            传入的 ``price`` 是**最坏成交价**而非当根收盘价（见 :meth:`_headroom`）。代价是
+            系统性少买约「限幅」那么多（主板约 9%、北交所约 23%），**这是刻意承担的**：那份
+            代价是确定的、可解释的，而「整笔被拒」是不确定且静默的。
+
+            另两条路各自的问题：开 ``coc``／``coo`` 能让成交价等于定量价，但会改动成交时点
+            语义、让回测偏乐观；让撮合层在成交时**缩减**订单则更省资金，但要改 backtrader 的
+            订单模型。两条都留待将来，不在本口径内。
         """
         low, high = 0, int(budget / price)
         while low < high:

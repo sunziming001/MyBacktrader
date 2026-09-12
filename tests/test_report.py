@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import xml.etree.ElementTree as ET
@@ -60,7 +61,77 @@ def test_artifacts_land_in_one_directory_per_run(tmp_path):
         "equity.csv",
         "equity.svg",
         "drawdown.svg",
+        "trades.csv",
+        "rejected.csv",
     }
+
+
+def test_the_rejection_details_and_count_are_persisted(tmp_path):
+    """**拒单必须落盘**：明细进 `rejected.csv`，条数与拒单率进 `metrics.json`。
+
+    这条针对的是一次实测教训：拒单只存在内存里的 `BacktestResult.rejected`，CLI 跑完就没了，
+    于是「买单全被拒、零成交」这类事实在产物里**完全看不见**，只能靠临时加打印排查——而那种
+    排查不会留下任何可供事后核对的东西。
+    """
+    rejected = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2024-01-03"),
+                "symbol": "sh600000",
+                "size": 100,
+                "status": "Margin",
+                "reason": "",
+            },
+            {
+                "date": pd.Timestamp("2024-01-04"),
+                "symbol": "sz000001",
+                "size": 200,
+                "status": "Rejected",
+                "reason": "不在股票池",
+            },
+        ]
+    )
+    result = dataclasses.replace(make_result(), rejected=rejected)
+
+    run_dir = write_run_artifacts(result, output_dir=tmp_path)
+
+    saved = pd.read_csv(run_dir / "rejected.csv")
+    assert list(saved["symbol"]) == ["sh600000", "sz000001"]
+    assert list(saved["status"]) == ["Margin", "Rejected"]
+    # CSV 往返会把空字段读成 NaN（标准行为），故这里作归一后再比。
+    assert saved["reason"].fillna("").tolist() == ["", "不在股票池"]
+
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["rejected_orders"] == 2
+    assert metrics["rejection_rate"] == 1.0, "一笔成交都没有，故拒单率是 100%"
+
+
+def test_the_rejection_rate_is_zero_when_nothing_was_rejected(tmp_path):
+    run_dir = write_run_artifacts(make_result(), output_dir=tmp_path)
+
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["rejected_orders"] == 0
+    assert metrics["rejection_rate"] == 0.0
+
+
+def test_the_trade_details_are_persisted(tmp_path):
+    """成交明细也落盘——否则「有没有真的成交、按什么价」只能靠摘要里那个笔数。"""
+    trades = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2024-01-03"),
+                "size": 100,
+                "price": 10.0,
+                "value": 1000.0,
+                "commission": 0.5,
+            }
+        ]
+    )
+    run_dir = write_run_artifacts(make_result(trades=trades), output_dir=tmp_path)
+
+    saved = pd.read_csv(run_dir / "trades.csv")
+    assert list(saved["size"]) == [100]
+    assert list(saved["price"]) == [10.0]
 
 
 def test_the_output_directory_is_created_but_a_collision_is_refused(tmp_path):
