@@ -125,6 +125,8 @@ class AStockBroker(bt.brokers.BackBroker):
         ("universe", None),
         #: boolean 标的宽表：当日**选股结果**。给出时，未被选中的买入被拒、卖出不受限。
         ("selection", None),
+        #: 字段名 → 标的宽表：**额外信号**（如估值），供策略读取。引擎不解释它。
+        ("signals", None),
         #: 标的连续多少个交易日无 K 线后，挂单失效。默认 5。
         ("order_expiry_ticks", 5),
         #: 最大持仓**标的数**。``None`` 表示不限。
@@ -168,6 +170,19 @@ class AStockBroker(bt.brokers.BackBroker):
         """当日**候选集**的布尔标的宽表。与 ``universe_mask`` 分开给，因为策略要能分辨
         「它出池了」与「今天没选它」——后者只是今天不利，不等于该清仓。"""
         return self.p.selection
+
+    @property
+    def signals(self):
+        """**额外信号**：字段名 → 标的宽表（标量信号，如估值），没给时为 ``None``。
+
+        引擎**不解释**这些字段——它只是把调用方算好的帧转交给策略，好让「同一条件不必写两遍」
+        落地（ADR-0001）：选股规则用同一份帧做入场闸门，策略用它做卖出判断。
+
+        取数用 ``.at[Timestamp(当日), 标的]``；索引是各标的交易日的**并集**（与引擎时钟一致），
+        故当日一般都在。缺失处为 ``NaN``，而 ``NaN`` 的比较一律为假——**「不知道」因此天然表现为
+        「不动作」**，不会凭空触发卖出。
+        """
+        return self.p.signals
 
     # --- 费用：注入成交日与标的 ---
 

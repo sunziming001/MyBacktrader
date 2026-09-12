@@ -199,6 +199,55 @@ def momentum_screen(window: int = 20, top_n: int = 10) -> Screen:
     return Screen(factor=lambda p: momentum(p["close"], window), top_n=top_n)
 
 
+def valuation_screen(
+    *,
+    percentile_below: float = 0.08,
+    pe_above: float = 0.0,
+    peg_below: float = 0.75,
+    peg_above: float = 0.0,
+    top_n: int = 5,
+) -> Screen:
+    """内置的**估值筛选**买入条件：PE 百分位够低、PE 为正、PEG 在区间内，取最低估的前 N。
+
+    这是「同一条件不必写两遍」的落点（ADR-0001）：回测用它当入场闸门（引擎的 ``screen``），
+    选股用它出候选清单（``mbt screen``），两边是**同一个对象**。
+
+    三个过滤条件与需求一一对应：
+
+    - ``动态PE 百分位 < 8%`` —— 相对自身历史足够便宜；
+    - ``动态PE > 0`` —— 剔除亏损（负 PE 无估值含义）；
+    - ``0 < PEG < 0.75`` —— 增长要为正、且价格相对增长仍算便宜。
+
+    排序因子是 ``1 − 百分位``：**百分位越低越靠前**。信号层的契约是「因子越大越靠前」，故这里
+    把「低估程度」定义成 ``1 − 百分位``，而不是加一个反转开关——那个开关会让「因子一律同向」
+    的约定形同虚设（见 :class:`Screen` 的说明）。
+
+    .. note::
+
+        它只是一个**可用的起点**：三个阈值与 ``top_n`` 都直接来自需求方的设定，没有经过论证。
+        真正的口径应当由你自己在回测里检验后再改。
+    """
+    from mbt.data.valuation import PE, PE_PERCENTILE, PEG
+
+    def cheap(panel):
+        return panel[PE_PERCENTILE] < percentile_below
+
+    def profitable(panel):
+        return panel[PE] > pe_above
+
+    def growth_worth_paying(panel):
+        return (panel[PEG] > peg_above) & (panel[PEG] < peg_below)
+
+    def cheapness(panel):
+        return 1.0 - panel[PE_PERCENTILE]
+
+    return Screen(
+        filters=(cheap, profitable, growth_worth_paying),
+        factor=cheapness,
+        top_n=top_n,
+    )
+
+
 def _truncate(panel: Panel, as_of) -> Panel:
     """把面板截到评估日（含当日）——**时点正确性的落点**（AC 5，ADR-0006）。"""
     if as_of is None:

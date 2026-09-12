@@ -64,6 +64,75 @@ class EngineClock:
         return pd.Timestamp(latest)
 
 
+def signal_value(signals, field, today, name) -> float:
+    """从 ``broker.signals`` 取一个标量信号；缺失、越界、或没给信号时一律返回 ``NaN``。
+
+    **一律返回 NaN 是刻意的**：``NaN`` 的比较全部为假，故「不知道」天然表现为「不动作」。
+    若这里改成抛异常或返回 0，调用方就得自己分辨「没数据」与「数据是 0」，而漏掉一处就会
+    在无数据的日子凭空下单或凭空卖出。
+    """
+    if signals is None:
+        return float("nan")
+    frame = signals.get(field) if hasattr(signals, "get") else None
+    if frame is None or name not in frame.columns:
+        return float("nan")
+    if today not in frame.index:
+        return float("nan")
+    return float(frame.at[today, name])
+
+
+class ValuationReversal(bt.Strategy, EngineClock):
+    """估值便宜时买入，估值恢复或转亏时卖出。
+
+    **买入条件不在这里**：它是 :func:`mbt.screen.valuation_screen`（PE 百分位 < 8%、
+    动态PE > 0、0 < PEG < 0.75，按百分位最低取前 N），由引擎经 ``broker.selection_mask``
+    交进来。这样 ``mbt screen`` 与 ``mbt backtest`` 用的是**同一个对象**，条件不必写两遍
+    （ADR-0001）。
+
+    本类只管**卖出**——那三条都依赖「已经持有」与当日估值，是**路径依赖**的，而筛选规则按
+    定义不管持仓（见 :class:`~mbt.screen.Screen`）。
+
+    参数:
+        percentile_exit: 动态PE 百分位高于它就卖出。默认 0.70。
+        peg_exit: PEG 高于它就卖出。默认 1.1。
+
+    三条卖出条件（任一满足）:
+
+    1. 动态PE **≤ 0** —— 公司转亏，估值失去意义。与「买入要求 PE > 0」对称；
+    2. 百分位 > ``percentile_exit`` —— 已不再便宜；
+    3. PEG > ``peg_exit`` —— 价格相对增长已偏贵。
+    """
+
+    params = (("percentile_exit", 0.70), ("peg_exit", 1.1))
+
+    def next(self):
+        today = self.today()
+        signals = self.broker.signals
+
+        for data in self.datas:
+            name = data._name
+            if self.getposition(data).size:
+                if self._should_exit(signals, today, name):
+                    self.close(data=data)
+                continue
+
+            # 停牌或尚未上市时这根 K 线是**陈旧价/未来价**，先问掩码。
+            if not self.broker.tradability_mask.at[today, name]:
+                continue
+            # 买入条件来自选股规则算好的候选集，本类不再重复一遍。
+            selection = self.broker.selection_mask
+            if selection is None or not selection.at[today, name]:
+                continue
+            self.buy(data=data)
+
+    def _should_exit(self, signals, today, name) -> bool:
+        """三条卖出条件任一满足即真。缺信号时**三条件全假**（见 :func:`signal_value`）。"""
+        pe = signal_value(signals, "pe", today, name)
+        percentile = signal_value(signals, "pe_percentile", today, name)
+        peg = signal_value(signals, "peg", today, name)
+        return bool(pe <= 0 or percentile > self.p.percentile_exit or peg > self.p.peg_exit)
+
+
 class BuyAndHold(bt.Strategy, EngineClock):
     """第一次有机会就买满，其后不动。
 
