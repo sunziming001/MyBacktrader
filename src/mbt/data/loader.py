@@ -79,6 +79,8 @@ def load_universe_data(
     gbbq_path,
     rules=None,
     skip_errors: bool = True,
+    start=None,
+    end=None,
 ) -> UniverseLoad:
     """逐个标的走正门取数，把失败者与失败原因一并交出。
 
@@ -90,6 +92,10 @@ def load_universe_data(
         rules: 规则表（``RuleTable`` 或路径）。默认取出厂表。
         skip_errors: ``True``（默认）跳过加载失败的标的并留痕；``False`` 则让第一个失败
             直接抛出——**调试单个标的时用**，那时你正想知道它为什么失败。
+        start / end: **回测区间**，透给 :func:`~mbt.data.market.load_market_data` 决定
+            「越界检查做在哪一段」。这是**必须传对**的一项：不传就等于在整段历史上校验，
+            而历史上任何一处说不清的跳空都会让整只标的被拒收——哪怕它落在你的回测之外
+            （实测 5.7% 的标的是这个原因，其中九成的坏日子在 2015 之前，票据 #45）。
 
     返回:
         :class:`UniverseLoad`。失败率过高这件事留给调用方判断（CLI 用它决定退出码）。
@@ -104,7 +110,14 @@ def load_universe_data(
 
         try:
             markets.append(
-                load_market_data(symbol, tdx_root=tdx_root, gbbq_path=gbbq_path, rules=rules)
+                load_market_data(
+                    symbol,
+                    tdx_root=tdx_root,
+                    gbbq_path=gbbq_path,
+                    rules=rules,
+                    start=start,
+                    end=end,
+                )
             )
         except MarketDataError as exc:
             if not skip_errors:
@@ -127,7 +140,9 @@ def load_universe_data(
     return UniverseLoad(markets=tuple(markets), skipped=tuple(skipped))
 
 
-def slice_markets(markets: Sequence[MarketData], start=None, end=None) -> UniverseLoad:
+def slice_markets(
+    markets: Sequence[MarketData], start=None, end=None, *, skipped: Sequence[SkippedSymbol] = ()
+) -> UniverseLoad:
     """把行情切到 ``[start, end]``（含两端），落在区间外或区间内没有 K 线的标的**跳过并留痕**。
 
     为什么在库里而不是在 CLI：这是数据操作，且「区间选得不对会怎样」需要被定义与测试。
@@ -140,9 +155,16 @@ def slice_markets(markets: Sequence[MarketData], start=None, end=None) -> Univer
         markets: 已加载的行情。
         start: 起始日（含）。``None`` 表示不设下限。
         end: 结束日（含）。``None`` 表示不设上限。
+        skipped: **上游阶段已经记下的跳过项**，会原样并入返回值。
+
+            ``skipped`` 是**必须**传的：调用方（CLI）先取数、再切片，而本函数只收
+            ``markets``，于是「取数时跳过了谁」会在这里被整段丢掉、从报告里消失。实测一次
+            300 只的运行：取数阶段跳了 84 只，而回测摘要只报「跳过 2」（那 2 是切片的），
+            84 只无声无息（票据 #45 的「跳过要点名」正因此落空）。
 
     返回:
-        :class:`UniverseLoad`，其中 ``skipped`` 含 :data:`OUT_OF_RANGE` 一类。
+        :class:`UniverseLoad`，其中 ``skipped`` 含 :data:`OUT_OF_RANGE` 一类，以及 ``skipped``
+        参数带进来的那些。
     """
     import datetime as dt
 
@@ -163,7 +185,8 @@ def slice_markets(markets: Sequence[MarketData], start=None, end=None) -> Univer
         raise ValueError(f"起始日 {lower} 晚于结束日 {upper}，区间为空")
 
     kept: list[MarketData] = []
-    skipped: list[SkippedSymbol] = []
+    # 上游的跳过项**原样带上**，否则它们会从报告里消失（见 docstring）。
+    recorded: list[SkippedSymbol] = list(skipped)
     for market in markets:
         frame = market.prices
         if lower is not None:
@@ -172,7 +195,7 @@ def slice_markets(markets: Sequence[MarketData], start=None, end=None) -> Univer
             frame = frame.loc[: pd.Timestamp(upper)]
 
         if frame.empty:
-            skipped.append(
+            recorded.append(
                 SkippedSymbol(market.symbol, OUT_OF_RANGE, f"{lower}–{upper} 区间内没有 K 线")
             )
             continue
@@ -185,7 +208,7 @@ def slice_markets(markets: Sequence[MarketData], start=None, end=None) -> Univer
             )
         )
 
-    return UniverseLoad(markets=tuple(kept), skipped=tuple(skipped))
+    return UniverseLoad(markets=tuple(kept), skipped=tuple(recorded))
 
 
 def stock_symbols(symbols: Sequence[str]) -> list[str]:

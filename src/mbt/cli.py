@@ -212,7 +212,17 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         return 1
 
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
-    loaded = load_universe_data(symbols, tdx_root=args.tdx_root, gbbq_path=args.gbbq, rules=None)
+    loaded = load_universe_data(
+        symbols,
+        tdx_root=args.tdx_root,
+        gbbq_path=args.gbbq,
+        rules=None,
+        # **必须把区间传下去**：越界校验只在区间内做。不传就等于在整段历史上校验，而历史里
+        # 任何一处说不清的跳空都会让整只标的被拒收——哪怕它落在回测之外（实测 5.7% 的标的
+        # 是这个原因，票据 #45）。
+        start=args.start,
+        end=args.end,
+    )
 
     # **截断之前**先把完整行情留一份。估值的百分位要回看 1000 个交易日，故必须用完整历史
     # 去算、算完再截到回测区间——拿已截断的行情去算等于把回看窗口砍掉（见 `clip_fields`）。
@@ -221,7 +231,8 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     # 区间由**此处**落实：`--start` / `--end` 原先被解析了却没接上，回测因此永远跑全历史
     # ——而 README 还把默认值当作生效的行为写了理由。切片放在库里（可测、可复用）。
     try:
-        loaded = slice_markets(loaded.markets, args.start, args.end)
+        # 取数阶段的跳过项要**带进切片**——否则它们会从报告里消失（见 `slice_markets`）。
+        loaded = slice_markets(loaded.markets, args.start, args.end, skipped=loaded.skipped)
     except ValueError as exc:
         print(f"错误：{exc}", file=stderr)
         return 1
@@ -329,6 +340,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             "slippage": args.slippage,
         },
         universe={"rule": "出厂设定", "candidates": len(symbols), "loaded": len(loaded.markets)},
+        skipped=loaded.skipped,
         benchmark_prices=benchmark,
         benchmark_symbol=args.benchmark,
         snapshot_paths=_snapshot_paths(loaded, args),
@@ -427,7 +439,14 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         return 1
 
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
-    loaded = load_universe_data(symbols, tdx_root=args.tdx_root, gbbq_path=args.gbbq, rules=None)
+    loaded = load_universe_data(
+        symbols,
+        tdx_root=args.tdx_root,
+        gbbq_path=args.gbbq,
+        rules=None,
+        # 选股只看评估日及之前，故越界校验也只做到那一天（理由见 backtest 那条注释）。
+        end=args.as_of,
+    )
     _report_loading(loaded, stdout, stderr)
 
     if not loaded.markets:
@@ -738,7 +757,7 @@ def _report_loading(loaded, stdout, stderr) -> None:
     for kind, count in sorted(loaded.count_by_kind().items()):
         print(f"    跳过·{kind}：{count}", file=stdout)
     if loaded.skipped:
-        print("  被跳过的标的（最多列 10 个）：", file=stderr)
+        print("  被跳过的标的（最多列 10 个，完整名单见产物的 skipped.csv）：", file=stderr)
         for item in loaded.skipped[:10]:
             print(f"    {item.symbol}  [{item.kind}] {item.detail}", file=stderr)
 

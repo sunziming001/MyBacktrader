@@ -145,6 +145,7 @@ def write_run_artifacts(
     max_positions: int | None = None,
     costs: dict | None = None,
     universe=None,
+    skipped=None,
     benchmark_prices: pd.Series | None = None,
     benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
     snapshot_paths: Sequence[Path | str] = (),
@@ -250,6 +251,17 @@ def write_run_artifacts(
     # 里完全看不见——实测排查时只能临时加打印，而那种排查不会留下任何可供事后核对的东西。
     result.trades.to_csv(run_dir / "trades.csv", index=False)
     result.rejected.to_csv(run_dir / "rejected.csv", index=False)
+
+    # 被跳过的标的也落盘。控制台只列前几个（几十上百条会把输出冲垮），但**完整名单**必须
+    # 能事后查到——实测一次 300 只的抽样里就有 5.7% 因「数据不可信」被拒收，而其中可能
+    # 包括最要紧的那几只（票据 #45 的 sh600519 就是其一）。
+    pd.DataFrame(
+        [
+            {"symbol": item.symbol, "kind": item.kind, "detail": item.detail}
+            for item in (skipped or ())
+        ],
+        columns=["symbol", "kind", "detail"],
+    ).to_csv(run_dir / "skipped.csv", index=False)
 
     return run_dir
 

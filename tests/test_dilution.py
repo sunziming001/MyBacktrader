@@ -68,6 +68,28 @@ def wide_limit_rules(tmp_path):
     return RuleTable.load(path)
 
 
+#: 覆盖 1990 年起——测「停牌跨多个除权日」要用 2006 年的真实数据。
+LONG_HISTORY_RULES = """
+schema_version = 1
+
+[[price_limit]]
+board = "沪主板"
+effective_from = 1990-01-01
+limit = 0.10
+
+[[stamp_duty]]
+effective_from = 1990-01-01
+sell_rate = 0.001
+"""
+
+
+@pytest.fixture
+def long_history_rules(tmp_path):
+    path = tmp_path / "long-history.toml"
+    path.write_text(LONG_HISTORY_RULES, encoding="utf-8")
+    return RuleTable.load(path)
+
+
 def bars(closes, start="2024-01-02"):
     """只填 close 的极简价格表——判定只用收盘价。"""
     return pd.DataFrame(
@@ -354,3 +376,121 @@ def test_a_date_outside_the_rule_table_window_fails_rather_than_guessing():
 
     with pytest.raises(RuleTableError):
         resolve_dilution(prices, events, "sh600000", rules)
+
+
+# --- 同一复牌 bar 上的多条事件必须合并（票据 #45） -----------------------------
+
+
+def moutai_resumption():
+    """``sh600519`` 的真实数字：2006-04-25 收 91.41，停牌后 2006-05-25 复牌收 39.59。
+
+    两条除权事件都落在这段停牌里——停牌期间没有成交，故那一根 39.59 反映的是**两者叠加**。
+    """
+    import datetime as dt
+
+    prices = pd.DataFrame(
+        {"close": [91.41, 39.59]},
+        index=pd.DatetimeIndex(["2006-04-25", "2006-05-25"]),
+    )
+    events = [
+        AdjustmentEvent(
+            symbol="sh600519",
+            ex_date=dt.date(2006, 5, 19),
+            cash_per_10=3.0,
+            bonus_per_10=10.0,
+        ),
+        AdjustmentEvent(
+            symbol="sh600519",
+            ex_date=dt.date(2006, 5, 24),
+            cash_per_10=5.909999847412109,
+            bonus_per_10=1.2000000476837158,
+        ),
+    ]
+    return prices, events
+
+
+def test_neither_event_alone_explains_the_resumption_jump(long_history_rules):
+    """**为什么要合并**：逐条判定时两条的带都落不进实际价 39.59。
+
+    这条把「为什么必须合并」写成可核对的事实，而不只是「合并后不报错」：
+
+    - 只用 2006-05-19：参考价 ``(91.41 − 0.3) / (1 + 1.0) = 45.56``，带 ``[41.0, 50.12]``；
+    - 只用 2006-05-24：参考价 81.09，带 ``[72.98, 89.2]``。
+
+    两者都不含 39.59。而第二条单独存在时，它的稀释量只有 0.12、**低于**
+    :data:`~mbt.data.dilution.DILUTION_THRESHOLD`（0.25），于是连带判定都不会做——
+    那正是「逐条判」既漏掉它、又解释不了那一跳的原因。
+
+    合并之后还要**逐日顺序套用**（而不是一次求和）：顺序得 40.15、带 ``[36.14, 44.17]``；
+    求和得 42.70、带 ``[38.43, 46.97]``。两者都含 39.59，但只有前者满足股东价值恒等式
+    （1 股 → 2.24 股 + 1.482 元现金 ⇒ ``(91.41 − 1.482) / 2.24 = 40.15``）。
+    """
+    from mbt.data.adjust import combined_reference_price
+    from mbt.rules import limit_band, round_to_cent
+
+    prices, events = moutai_resumption()
+    prev_close = float(prices["close"].iloc[0])
+    actual = float(prices["close"].iloc[-1])
+    on = prices.index[-1].date()
+    limit = long_history_rules.limit_for("sh600519", on)
+
+    # 只用第一条：45.56，带 [41.0, 50.12] —— 39.59 在带外，这才是当初报错的原因。
+    first = round_to_cent(combined_reference_price(prev_close, [events[0]]))
+    low, high = limit_band(first, limit)
+    assert first == 45.56
+    assert not (low <= actual <= high), "只用第一条解释不了那一跳"
+
+    # 逐日顺序套用：40.15，带 [36.14, 44.17] —— 落进其内。
+    sequential = round_to_cent(combined_reference_price(first, [events[1]]))
+    sequential_low, sequential_high = limit_band(sequential, limit)
+    assert sequential == 40.15, "逐日顺序套用（anomaly 那边也是这么算的）"
+    assert sequential_low <= actual <= sequential_high, "两条一起算才解释得通"
+
+    # 对照：一次求和的 42.70 不满足股东价值恒等式，故不是正确的参考价。
+    summed = round_to_cent(combined_reference_price(prev_close, events))
+    assert summed == 42.70
+    assert (sequential - (prev_close - 1.482) / 2.24) == pytest.approx(0.0, abs=0.01)
+    assert abs(summed - sequential) > 2.0, "两种算法差 2 元以上，不能混用"
+
+
+def test_events_sharing_a_resumption_bar_are_judged_together(long_history_rules):
+    """**本票的核心**：两条一起判 → 参考价 40.15、带 ``[36.14, 44.17]``，39.59 落进其内。
+
+    参考价 40.15 来自**逐日顺序套用**（``91.41 → 45.56 → (45.56 − 0.591) / 1.12``），不是
+    「求和再代入」的 42.70——后者不满足股东价值恒等式，见 :func:`_reference_for_gap`。
+
+    合并后只有**一条**判定记录（单位是复牌 bar），其 ``ex_date`` 取该组**最早**的那条；
+    两条事件都参与复权。
+    """
+    import datetime as dt
+
+    prices, events = moutai_resumption()
+
+    effective, verdicts = resolve_dilution(prices, events, "sh600519", long_history_rules)
+
+    assert len(verdicts) == 1, "同一根复牌 bar 上的两条事件只该产生一条判定"
+    verdict = verdicts[0]
+    assert verdict.ex_date == dt.date(2006, 5, 19), "记录取该组最早的那条事件"
+    assert verdict.verdict == DILUTED
+    assert verdict.low_confidence is False
+    assert verdict.diluted_ratio == pytest.approx(40.15 / 91.41, abs=1e-6)
+    assert len(effective) == 2, "判为稀释，故两条都参与复权"
+
+
+def test_a_second_resumption_bar_gets_its_own_verdict(main_board_rules):
+    """**防过度合并**：落在**不同** bar 上的事件仍各自判定。
+
+    两段独立的除权各有自己的复牌 bar，把它们合并会算出一个既非甲、亦非乙的参考价。
+    """
+    index = pd.bdate_range("2024-01-02", periods=3)
+    prices = pd.DataFrame({"close": [10.0, 5.0, 2.5]}, index=index)
+    events = [
+        AdjustmentEvent(symbol="sh600000", ex_date=index[1].date(), bonus_per_10=10.0),
+        AdjustmentEvent(symbol="sh600000", ex_date=index[2].date(), bonus_per_10=10.0),
+    ]
+
+    effective, verdicts = resolve_dilution(prices, events, "sh600000", main_board_rules)
+
+    assert len(verdicts) == 2, "两根 bar 各一条判定"
+    assert all(verdict.verdict == DILUTED for verdict in verdicts)
+    assert len(effective) == 2

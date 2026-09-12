@@ -51,13 +51,25 @@ def test_load_carries_the_dilution_verdicts(fixture_root, gbbq_file):
 
     这条锁的是「判定接在正门上」——否则调用方拿到的是一份未判定的事件集，
     而复权与质检读到的就不是同一份东西了。
+
+    判定记录的单位是**复牌 bar**，不是单条事件：停牌期间横跨多个除权日时，那一根复牌 K 线
+    的价格反映的是它们**叠加**的结果（票据 #45）。本夹具上记录数恰好等于事件数（每条事件
+    各占一根 bar），但**那不是契约**——契约是「每条事件都被某个判定覆盖」，合并的情形另有
+    专门测试（``tests/test_dilution.py``）。
     """
     market = load_market_data(
         "sh600000", tdx_root=fixture_root, gbbq_path=gbbq_file, rules=LIMIT_RULES
     )
 
     assert market.verdicts, "判定记录应随行情交出"
-    assert len(market.verdicts) == len(market.events), "每条参与复权的事件都应有判定记录"
+
+    event_dates = sorted(event.ex_date for event in market.events)
+    verdict_dates = sorted(verdict.ex_date for verdict in market.verdicts)
+    assert verdict_dates == sorted(set(verdict_dates)), "判定记录不应重复"
+    assert verdict_dates, "每条事件都该被覆盖，故至少有一条记录"
+    assert set(verdict_dates) <= set(event_dates), "判定的日期必须来自事件"
+    assert verdict_dates[0] == event_dates[0], "最早的判定应对应最早的事件"
+    assert len(verdict_dates) <= len(event_dates), "合并只会减少记录数，不会凭空多出"
 
 
 def test_load_leaves_a_below_threshold_event_untouched(fixture_root, gbbq_file):
@@ -162,3 +174,72 @@ def test_loaded_data_feeds_the_backtest_end_to_end(fixture_root, gbbq_file):
 
     assert len(result.equity_curve) == len(market.prices)
     assert result.final_value > 0
+
+
+# --- 越界校验只在回测区间内做（票据 #45） --------------------------------------
+
+
+def test_a_bad_bar_before_the_window_does_not_condemn_the_whole_symbol(tmp_path, gbbq_file):
+    """**本票的核心改动**：区间之外的一根坏 K 线不该让整只标的被拒收。
+
+    构造：一根无法解释的十倍跳空（无任何权息事件）之后是一段平稳行情。不传区间时正门必须
+    报错（那是 ADR-0005 的纪律）；而把区间设在跳空**之后**时，那根 K 线不在回测里，标的
+    就完全可用。
+
+    真实世界的对应物是 ``sh600519``：它的 2006-05-25（股改复牌首日**不设涨跌幅**）越出
+    涨跌幅带，而本地数据无从得知那一点。实测全市场抽样里 5.7% 的标的栽在这类「历史早期
+    一处的说不清」上，其中九成的坏日子在 2015 之前。
+    """
+    root = tmp_path / "vipdoc"
+    target = root / "sh" / "lday"
+    target.mkdir(parents=True)
+    # 2024-01-02 收 10.00 → 01-03 收 100.00（十倍跳空，无事件可解释）→ 其后平稳。
+    target.joinpath("sh600000.day").write_bytes(
+        _day_file(
+            [
+                (20240102, 1000, 1000, 1000, 1000, 0.0, 1000),
+                (20240103, 10000, 10000, 10000, 10000, 0.0, 1000),
+                (20240104, 10000, 10000, 10000, 10000, 0.0, 1000),
+                (20240105, 10000, 10000, 10000, 10000, 0.0, 1000),
+            ]
+        )
+    )
+
+    with pytest.raises(MarketDataError):
+        load_market_data("sh600000", tdx_root=root, gbbq_path=gbbq_file, rules=LIMIT_RULES)
+
+    market = load_market_data(
+        "sh600000",
+        tdx_root=root,
+        gbbq_path=gbbq_file,
+        rules=LIMIT_RULES,
+        start="2024-01-04",
+    )
+
+    assert len(market.prices) == 4, "返回的仍是**完整历史**，切片由调用方负责"
+    assert market.prices.index[0].date() == dt.date(2024, 1, 2)
+
+
+def test_a_bad_bar_inside_the_window_is_still_rejected(tmp_path, gbbq_file):
+    """反过来：坏 K 线**落在区间内**时照样报错——区间限制不会变成放水开关。"""
+    root = tmp_path / "vipdoc"
+    target = root / "sh" / "lday"
+    target.mkdir(parents=True)
+    target.joinpath("sh600000.day").write_bytes(
+        _day_file(
+            [
+                (20240102, 1000, 1000, 1000, 1000, 0.0, 1000),
+                (20240103, 10000, 10000, 10000, 10000, 0.0, 1000),
+                (20240104, 10000, 10000, 10000, 10000, 0.0, 1000),
+            ]
+        )
+    )
+
+    with pytest.raises(MarketDataError):
+        load_market_data(
+            "sh600000",
+            tdx_root=root,
+            gbbq_path=gbbq_file,
+            rules=LIMIT_RULES,
+            start="2024-01-03",
+        )

@@ -74,10 +74,10 @@ OUTSIDE_SERIES = "outside_series"
 
 @dataclass(frozen=True)
 class DilutionVerdict:
-    """一条（或同日一组）事件的判定记录。
+    """一条（或同一**复牌 bar** 上的一组）事件的判定记录。
 
     属性:
-        ex_date: 除权除息日。
+        ex_date: 除权除息日。同一组内取**最早**的那条事件。
         dilution: 送转 + 配股的合计比例。
         actual_ratio: 实际比值 ``收盘 ÷ 前收盘``。
         diluted_ratio: **已稀释**假说下的理论比值（参考价 ÷ 前收盘）。
@@ -132,7 +132,7 @@ def resolve_dilution(
     effective: list[AdjustmentEvent] = []
     verdicts: list[DilutionVerdict] = []
 
-    for group in _group_by_date(ordered):
+    for position, group in _group_by_resumption_bar(ordered, index):
         dilution = sum(e.bonus_per_share + e.rights_per_share for e in group)
 
         if dilution < DILUTION_THRESHOLD:
@@ -140,7 +140,6 @@ def resolve_dilution(
             verdicts.append(_record(group[0], dilution, verdict=BELOW_THRESHOLD))
             continue
 
-        position = int(index.searchsorted(pd.Timestamp(group[0].ex_date), side="left"))
         if position == 0 or position >= len(index):
             # 事件落在序列之外——复权本就会忽略它，判定也无从谈起。
             effective.extend(group)
@@ -154,7 +153,7 @@ def resolve_dilution(
 
         # 两个假说各自的带。宽度按板块与成交日取自规则表，不用常数。
         plain_low, plain_high = limit_band(prev_close, limit)
-        reference = round_to_cent(combined_reference_price(prev_close, group))
+        reference = _reference_for_gap(prev_close, group)
         diluted_low, diluted_high = limit_band(reference, limit)
 
         in_plain = plain_low <= actual <= plain_high
@@ -198,8 +197,9 @@ def resolve_dilution(
 
         # 两个带的落不进：这个价格跳空**既不是**正常波动、**也不是**该事件造成的。
         # 它多半是长期停牌复牌后的一次大缺口——那是另一回事，不该被假装解释掉。
+        window = " 与 ".join(e.ex_date.isoformat() for e in group)
         raise MarketDataError(
-            f"{symbol} 在 {group[0].ex_date.isoformat()} 的除权事件判不动"
+            f"{symbol} 在 {window} 的除权事件判不动"
             f"（两个假说的带都落不进）："
             f"实际比值 {actual_ratio:.4f}（收盘 {actual:g} ÷ 前收 {prev_close:g}）；"
             f"未稀释假说期望 {1.0:.4f}（带 [{plain_low:g}, {plain_high:g}]）；"
@@ -212,8 +212,47 @@ def resolve_dilution(
     return tuple(effective), tuple(verdicts)
 
 
+def _group_by_resumption_bar(events, index) -> list[tuple[int, list[AdjustmentEvent]]]:
+    """把事件按**复牌 bar**（除权日当天或之后的第一根 K 线）分组，返回 ``(位置, 事件组)``。
+
+    **不能按除权日分组。** 停牌期间可以横跨多个除权日，而那一根复牌 K 线的价格反映的是
+    **它们叠加**的结果；逐日判定会把每个事件的参考价都算错，于是两个假说的带都落不进，
+    最后整只标的被判为不可信。
+
+    实测 ``sh600519``：2006-05-19（10送10派3）与 2006-05-24（10送1.2派5.91）都落在
+    2006-04-25 → 2006-05-25 这段停牌里。逐日判定时第一条的带是 ``[41.0, 50.12]``
+    （参考价 45.56），而实际收盘 39.59 落在带外——于是整只茅台被挡在数据正门之外。
+    合并后参考价 40.15、带 ``[36.14, 44.17]``，39.59 落在其内（票据 #45）。
+
+    同一根 bar 上的事件必须**一起**算参考价；组内跨日的还要**顺序**套用，见
+    :func:`_reference_for_gap`。这与「同日多条」是同一条理由，只是边界从「同一天」放宽到了
+    「同一段无成交的区间」。
+
+    序列**之外**的事件（在第一根之前、或最后一根之后）**不合并**：它们没有价格过渡可解释，
+    逐条留痕信息更全。
+    """
+    size = len(index)
+    groups: list[tuple[int, list[AdjustmentEvent]]] = []
+    mergeable_position: int | None = None
+
+    for event in events:
+        position = int(index.searchsorted(pd.Timestamp(event.ex_date), side="left"))
+        is_mergeable = 0 < position < size
+        if is_mergeable and mergeable_position == position:
+            groups[-1][1].append(event)
+        else:
+            groups.append((position, [event]))
+        mergeable_position = position if is_mergeable else None
+
+    return groups
+
+
 def _group_by_date(events) -> list[list[AdjustmentEvent]]:
-    """同日事件合为一组——参考价必须把同日各量求和后**一次**代入（同日多条不能逐个套用）。"""
+    """按**除权日**把一组事件切成若干「同日」子组。
+
+    同日的各量必须先求和再代入参考价公式（每一步的基数都不同，逐个套用会错），
+    这个切分就是为 :func:`~mbt.data.adjust.combined_reference_price` 服务的。
+    """
     groups: list[list[AdjustmentEvent]] = []
     for event in events:
         if groups and groups[-1][0].ex_date == event.ex_date:
@@ -221,6 +260,27 @@ def _group_by_date(events) -> list[list[AdjustmentEvent]]:
         else:
             groups.append([event])
     return groups
+
+
+def _reference_for_gap(prev_close: float, group) -> float:
+    """一根复牌 bar 之前的参考价：组内**逐日**套用参考价公式。
+
+    **跨日必须顺序套用，不能一次求和。** 后一条事件的现金分红是按**前一条之后**的股数发的，
+    故一条「求和再代入」的公式解不出正确的参考价。实测 ``sh600519`` 的两条事件同处一段停牌：
+
+    - 顺序套用：``91.41 → (91.41 − 0.3) / 2 = 45.56 → (45.56 − 0.591) / 1.12 = 40.15``
+    - 一次求和：``(91.41 − 0.891) / (1 + 1.12) = 42.70``
+
+    40.15 才是对的，因为它满足股东价值恒等式——持有 1 股最终变成 2.24 股 + 1.482 元现金
+    （``0.3×1 + 0.591×2``），故 ``(91.41 − 1.482) / 2.24 = 40.146``。
+
+    这一步也让本模块与 :mod:`mbt.data.anomaly` 用**同一个**参考价（两边都是逐日套用、逐步取整），
+    而 ADR-0002 要求两处的带必须一致——否则复权与质检会各说各话。
+    """
+    reference = prev_close
+    for same_day in _group_by_date(group):
+        reference = round_to_cent(combined_reference_price(reference, same_day))
+    return reference
 
 
 def _without_dilution(group) -> list[AdjustmentEvent]:
