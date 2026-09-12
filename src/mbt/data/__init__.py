@@ -37,6 +37,15 @@ from .loader import (
 from .market import MarketData, load_market_data
 from .panel import Panel, assemble_panel
 from .tdx import TdxDataSource
+from .updates import (
+    GapReport,
+    SymbolBoundary,
+    UpdateReport,
+    boundary_of,
+    check_updates,
+    load_boundaries,
+    save_boundaries,
+)
 
 __all__ = [
     "AdjustmentEvent",
@@ -50,22 +59,29 @@ __all__ = [
     "MarketData",
     "MarketDataError",
     "Panel",
+    "GapReport",
     "SkippedSymbol",
+    "SymbolBoundary",
     "TdxDataSource",
     "UniverseLoad",
+    "UpdateReport",
     "adjustment_factors",
     "assemble_panel",
     "backward_adjusted",
+    "boundary_of",
+    "check_updates",
     "combined_reference_price",
     "find_anomalies",
     "forward_adjusted",
     "instrument_type",
     "is_stock",
+    "load_boundaries",
     "load_financials",
     "load_market_data",
     "load_universe_data",
     "non_loss_mask",
     "require_no_anomalies",
+    "save_boundaries",
     "slice_markets",
     "stock_symbols",
 ]

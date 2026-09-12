@@ -1,29 +1,33 @@
-"""命令行：把库能力包成两条日常命令（票据 #11）。
+"""命令行：把库能力包成三条日常命令（票据 #9、#11）。
 
 ```
 mbt backtest --strategy mypkg.strategies:BuyAndHold --start 2015-08-01 \
              --cash 100000 --commission 0.0003 --commission-mode all_in \
              --output-dir D:\\runs
 mbt screen   --symbols-file my_universe.txt --as-of 2026-09-11 --output-dir D:\\screens
+mbt update   --tdx-root D:\\Tools\\tdx\\vipdoc [--baseline b.csv --save-baseline b.csv]
 ```
 
-## 两条硬规矩
+## 三条硬规矩
 
 **一、CLI 是库入口的薄映射。** 全部逻辑在 :func:`run_backtest_command` /
-:func:`run_screen_command` 这两个**纯函数**里：不收 ``sys.argv``、不调 ``sys.exit``、
-不直接写标准输出（由参数注入）。``main`` 只做三件事——解析参数、转交、返回退出码。测试因此
-可以直接调用它们，**不必靠 subprocess 硬凑**（AC 明令）。
+:func:`run_screen_command` / :func:`run_update_command` 这三个**纯函数**里：不收 ``sys.argv``、
+不调 ``sys.exit``、不直接写标准输出（由参数注入）。``main`` 只做三件事——解析参数、转交、
+返回退出码。测试因此可以直接调用它们，**不必靠 subprocess 硬凑**（AC 明令）。
 
 **二、默认区间取「跑得对」的那个窗口。** ``--start`` 默认 **2015-08-01**，即**费用口径**
 全可查的最早日期（沪主板过户费的覆盖起点，各板块里最晚的一个）。不默认「全历史」是因为实测
 37% 的股票数据起于 1997–2014，那段区间**涨跌幅查得到、费用查不到**，一成交就报
 ``RuleTableError``。要更早的区间请显式传 ``--start``——那是你的选择，我们如实报错而不替你截断。
 
+**三、输出必须能在中文 Windows 控制台上打印。** 控制台是 GBK，故**不输出 emoji 等非 GBK 字符**
+（实跑时 ``⚠️`` 曾让整个命令崩在 ``UnicodeEncodeError`` 上，而那与数据无关）。
+
 ## 退出码
 
 - ``0``：跑完了，且有可用的结果（**含「有个别标的被跳过」**）；
 - ``1``：数据或运行期错误，或**跳过率超过 :data:`MAX_FAILURE_RATE`**——「几乎全跳过」不该被
-  脚本当成成功；
+  脚本当成成功；``update`` 子命令在**有回补/修正**时也返回 ``1``（那意味着上次的回测结果作废）；
 - ``2``：参数用法错误（``argparse`` 的默认）。
 """
 
@@ -44,6 +48,7 @@ from mbt.data import (
     slice_markets,
     stock_symbols,
 )
+from mbt.data.errors import MarketDataError
 from mbt.report import DEFAULT_BENCHMARK_SYMBOL, write_run_artifacts
 from mbt.screen import SCREEN_FIELDS, momentum_screen
 from mbt.universe import UniverseRules, combine_masks
@@ -121,6 +126,21 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
     screen.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     screen.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
+
+    update = sub.add_parser("update", help="检查本地数据有没有变化（手动触发，不设定时任务）")
+    update.add_argument("--tdx-root", required=True, help="通达信 vipdoc 根目录")
+    update.add_argument(
+        "--baseline",
+        default=None,
+        help="上次的边界清单（CSV）。不给则建立基线；给了则与之比较并报出回补/修正",
+    )
+    update.add_argument("--limit", type=int, default=None, help="只检查前 N 个标的（试跑用）")
+    update.add_argument("--symbols-file", default=None, help="只检查文件里列出的标的（每行一个）")
+    update.add_argument(
+        "--save-baseline",
+        default=None,
+        help="把本次的边界清单写到这个路径，供下次 --baseline 用",
+    )
 
     return parser
 
@@ -304,6 +324,107 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     return 0
 
 
+def run_update_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
+    """检查数据有没有变化，返回退出码。**纯函数**，理由同另两条命令。
+
+    退出码：**有回补/修正 → 1**（那意味着上次的回测结果作废了，脚本应当知道），否则 0。
+    本命令的**唯一价值**就是回答「我的数据变了没有、变了要不要重跑」，而「有修正」正是
+    「要重跑」的信号。
+    """
+    from mbt.data.updates import (
+        APPENDED,
+        INSIDE_GAP,
+        MISSING,
+        NEW,
+        REVISED,
+        TAIL_GAP,
+        UNCHANGED,
+        check_updates,
+        load_boundaries,
+        save_boundaries,
+    )
+
+    symbols = _select_symbols(args, stderr)
+    if symbols is None:
+        return 1
+
+    previous = None
+    if args.baseline:
+        try:
+            previous = load_boundaries(args.baseline)
+        except MarketDataError as exc:
+            print(f"错误：{exc}", file=stderr)
+            return 1
+
+    try:
+        report = check_updates(symbols, tdx_root=args.tdx_root, previous=previous)
+    except MarketDataError as exc:
+        print(f"错误：{exc}", file=stderr)
+        return 1
+
+    counts = report.counts()
+    print(
+        f"检查 {sum(counts.values())} 个标的（市场交易日 {report.calendar_days} 天）：", file=stdout
+    )
+    for kind in (UNCHANGED, APPENDED, REVISED, MISSING, NEW):
+        if kind in counts:
+            print(f"  {kind}：{counts[kind]}", file=stdout)
+    if report.compared_with is None:
+        print("  首次运行——已建立基线，本次无可比对象", file=stdout)
+    if report.unreadable:
+        # 取不到数据 ≠ 没变化。必须说出来，否则它会静默地从基线里消失。
+        print(f"  取不到数据（未检查）：{len(report.unreadable)}", file=stdout)
+        for symbol in report.unreadable[:10]:
+            print(f"    {symbol}", file=stderr)
+
+    if args.limit or args.symbols_file:
+        # 市场日历来自**被检查的**那批标的；只查一部分会让两类缺口都失真
+        # （区间内缺口看不见、尾部空缺恒为零）。换个说法：这会削弱本命令的判据。
+        print(
+            "  警告：--limit / --symbols-file 使市场日历不完整——"
+            "区间内缺口会看不见、尾部空缺会偏小。要准确判定请检查全市场。",
+            file=stderr,
+        )
+
+    inside = report.gaps_by_kind(INSIDE_GAP)
+    tails = report.gaps_by_kind(TAIL_GAP)
+    if inside:
+        print(f"\n区间内无成交 {len(inside)} 处（前 5）：", file=stdout)
+        for gap in inside[:5]:
+            print(
+                f"  {gap.symbol}: 自 {gap.start} 至 {gap.end} 无成交，"
+                f"共缺 {gap.missing} 个交易日，{gap.resumed} 恢复",
+                file=stdout,
+            )
+    if tails:
+        print(f"\n尾部空缺 {len(tails)} 个标的（前 5）：", file=stdout)
+        for gap in sorted(tails, key=lambda item: -item.missing)[:5]:
+            print(
+                f"  {gap.symbol}: 最后一根 {gap.end}，其后缺 {gap.missing} 个交易日",
+                file=stdout,
+            )
+        print(
+            "  注：尾部空缺**无法**在本地数据里区分为停牌还是退市——只报事实，不猜。",
+            file=stdout,
+        )
+
+    if report.revised:
+        print(f"\n注：有回补/修正的标的 {len(report.revised)} 个（前 10）：", file=stdout)
+        for symbol in report.revised[:10]:
+            print(f"  {symbol}", file=stdout)
+        print("  这些标的的**旧回测结果不再可信**，请重跑。", file=stdout)
+
+    if args.save_baseline:
+        try:
+            path = save_boundaries(args.save_baseline, report.boundaries)
+        except OSError as exc:
+            print(f"错误：写入基线失败——{exc}", file=stderr)
+            return 1
+        print(f"\n基线已写入：{path}", file=stdout)
+
+    return 1 if report.needs_rerun else 0
+
+
 def main(argv=None) -> int:
     """入口：解析参数、转交、返回退出码。**这里不写业务逻辑。**
 
@@ -320,6 +441,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.command == "backtest":
         return run_backtest_command(args)
+    if args.command == "update":
+        return run_update_command(args)
     return run_screen_command(args)
 
 
