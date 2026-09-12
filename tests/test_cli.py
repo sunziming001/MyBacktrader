@@ -868,11 +868,12 @@ def test_the_cli_warns_when_orders_were_placed_but_none_filled(tmp_path):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "EqualWeightSizer 用 int(cash / slots / price) 定量，**不给交易费用留余量**。"
-        "max_positions 省略（slots=1）或为 1 时，买入金额几乎正好等于现金，加上过户费即"
-        "超出现金 → 每笔买单都以 Margin 被拒 → 零成交。"
-        "实测：max_positions=None/1 → 0 笔成交；2/10 → 9 笔。修好 sizer 后本测试会 XPASS，"
-        "届时请摘掉这个标记。"
+        "**定量价与成交价之差**：sizer 用 `close[0]` 定量，而订单在**下一根**成交。"
+        "若下一根的成交价高于定量价（本例的正弦路径上扬 3% 以上），"
+        "`数量 × 成交价 + 费用` 仍会超出预算 → 买单以 `Margin` 被拒。"
+        "费用那一半已在 #29 修掉（现按「含费用仍买得起的最大股数」定量，实测 sizer 自算 "
+        "99992.44 ≤ 100000 确实买得起），但**定量价与成交价之差**尚未处理，故本测试仍失败。"
+        "修好之后它会 XPASS，届时请摘掉这个标记。"
     ),
 )
 def test_the_ma_cross_example_both_buys_and_sells(tmp_path):
@@ -884,9 +885,9 @@ def test_the_ma_cross_example_both_buys_and_sells(tmp_path):
 
     .. warning::
 
-        它现在会失败，而且**失败的原因是库的 bug，不是示例的**——见上面的 ``xfail`` 说明：
-        ``EqualWeightSizer`` 不给交易费用留余量，故单标的（``max_positions=1`` 或省略）时
-        每笔买单都被拒。标成 ``strict=True`` 是为了在修好之后**主动**提醒摘掉它。
+        它现在仍会失败，且**失败的原因是库的，不是示例的**——见上面的 ``xfail`` 说明：
+        单标的时买单会以 ``Margin`` 被拒，因为 sizer 按``close[0]`` 定量而订单在下一根成交。
+        标成 ``strict=True`` 是为了在修好之后**主动**提醒摘掉它。
     """
     import json
     import math
