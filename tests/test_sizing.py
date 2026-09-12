@@ -184,6 +184,94 @@ def test_a_price_that_cannot_be_afforded_yields_no_order(make_market, make_price
     assert len(result.rejected) == 0
 
 
+def test_orders_pending_in_the_same_bar_still_count_as_taken_slots(
+    make_market, make_prices, zero_cost_rules
+):
+    """**同一 tick 里连下几笔买单时，挂单中的也要占名额。**
+
+    只数已成交持仓是不够的：持仓要等成交后才更新，于是同一根 K 线里的每笔订单都会看到同一个
+    ``held``、各自按「剩余名额」足额定量，合计必然超出现金——最先提交的成交，其余全部以
+    ``Margin`` 被拒。
+
+    实测（名额 2、同一 tick 提交 4 笔、现金 10 万）：每笔定 45,450 元 → 合计 181,800 →
+    2 笔成交、**2 笔 `Margin`**。真实回测里这类拒单占全部下单的 **61%**。
+
+    修好之后：第 3、4 笔看到名额已满，返回 0 股 → **不提交订单**，于是既不成交也不被拒。
+    """
+    import backtrader as bt
+
+    from mbt.data.market import MarketData
+
+    class BuyAll(bt.Strategy):
+        """每个 tick 对所有未持仓的标的下单——组合策略的自然写法。"""
+
+        def next(self):
+            for data in self.datas:
+                if self.getposition(data).size:
+                    continue
+                self.buy(data=data)
+
+    markets = [
+        MarketData(symbol=symbol, prices=make_prices([10.0] * 10), events=())
+        for symbol in ("sh600000", "sh600001", "sh600002", "sh600003")
+    ]
+
+    result = run_portfolio_backtest(
+        markets,
+        BuyAll,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    assert len(result.trades) == 2, "名额 2，就只该成交 2 笔"
+    assert len(result.rejected) == 0, "多出来的两笔应当**不下单**，而不是下了被拒"
+
+    spent = result.trades[result.trades["size"] > 0]["value"].sum()
+    assert spent <= 100_000.0, "两笔合计不得超过现金"
+
+
+def test_a_pending_buy_does_not_block_the_next_bar(make_market, make_prices, zero_cost_rules):
+    """挂单**成交之后**就不再占名额——下一根仍能继续建仓。
+
+    这条防的是「把挂单数记死了」这类改法：`broker.orders` 里保留着已成交的历史订单，故必须
+    用 ``alive()`` 过滤，否则名额会被永久占满、策略从此再也买不进。
+    """
+    import backtrader as bt
+
+    from mbt.data.market import MarketData
+
+    class BuyOnePerBar(bt.Strategy):
+        """每根只买一只还没持仓的——多根 K 线逐步建仓。"""
+
+        def next(self):
+            for data in self.datas:
+                if self.getposition(data).size:
+                    continue
+                self.buy(data=data)
+                return
+
+    markets = [
+        MarketData(symbol=symbol, prices=make_prices([10.0] * 10), events=())
+        for symbol in ("sh600000", "sh600001", "sh600002")
+    ]
+
+    result = run_portfolio_backtest(
+        markets,
+        BuyOnePerBar,
+        cash=100_000.0,
+        max_positions=3,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    assert len(result.trades) == 3, "三只都该买到（每根买一只）"
+
+
+# --- 卖出仍由策略决定 ----------------------------------------------------------
+
+
 def test_selling_is_still_left_to_the_strategy(make_market, make_prices, synthetic_rules):
     """sizer 不插手卖出：数量由策略决定（这里是全部持仓）。
 

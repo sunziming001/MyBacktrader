@@ -32,6 +32,8 @@ AC 要求「多标的共享资金池，有最大持仓数与仓位分配」，�
   可能不是 100 的倍数。这是一处**已知的乐观偏差**（真实下单会被拒或改单），已在 README 的
   风险清单里登记。
 - 单笔上限、按波动率加权、行业分散等更复杂的分配规则。
+- **卖出挂单不释放名额**：一笔尚未成交的卖单本会腾出一个名额，但 sizer 不把它算进去。按
+  「更少下单」估是稳妥的一侧（宁可少买，不可超支），代价是某些调仓日会晚一天才补上仓位。
 """
 
 from __future__ import annotations
@@ -58,10 +60,27 @@ class EqualWeightSizer(bt.Sizer):
             return self.broker.getposition(data).size
 
         held = sum(1 for position in self.broker.positions.values() if position.size)
+        # **挂单中的买单既占名额、也占现金。** 只数已成交持仓是不够的：同一根 K 线里连下几笔
+        # 买单时，持仓要等成交后才更新，于是每笔都会看到同一个 `held` 与同一个 `cash`、各自
+        # 按「剩余名额」足额定量，合计必然超出——结果是最先提交的成交，其余以 ``Margin`` 被拒。
+        #
+        # 实测（名额 2、同一 tick 提交 4 笔、现金 10 万）：每笔定 45,450 元 → 合计 181,800
+        # → 2 笔成交、**2 笔 ``Margin``**。真实回测里这类拒单占全部下单的 **61%**。
+        #
+        # 卖出**不**算释放名额或现金：挂单未成交前它并不确定会成交，按「更少下单」估是稳妥的
+        # 一侧（宁可少买，不可超支）。
+        pending = 0
+        spent = 0.0
+        for order in self.broker.orders:
+            if not order.isbuy() or not order.alive():
+                continue
+            pending += 1
+            spent += self._pending_spend(order)
+
         if self.p.max_positions is None:
             slots = 1
         else:
-            slots = self.p.max_positions - held
+            slots = self.p.max_positions - held - pending
             if slots <= 0:
                 return 0
 
@@ -71,7 +90,27 @@ class EqualWeightSizer(bt.Sizer):
 
         # 按**最坏成交价**定量，而不是按当根收盘价——见 `_headroom`。
         worst = price * (1.0 + self._headroom(data))
-        return self._affordable(comminfo, cash / slots, worst)
+        # 预算从**扣掉挂单已占用**的现金里分：不扣的话第二笔会以为自己独占全部现金。
+        free = max(cash - spent, 0.0)
+        return self._affordable(comminfo, free / slots, worst)
+
+    def _pending_spend(self, order) -> float:
+        """一笔挂单中的买单预计占用多少现金（按它自己的**最坏成交价**估）。
+
+        与 :meth:`_affordable` 同一口径（含涨跌幅留余地），否则预留额会小于实际成交额，
+        超支只是从「这笔」挪到「下一笔」。未成交部分才计入——部分成交的单已经花掉的钱在
+        ``cash`` 里扣过了。
+        """
+        data = order.data
+        if data is None or len(data) == 0:
+            return 0.0
+        remaining = abs(order.size) - abs(order.executed.size)
+        if remaining <= 0:
+            return 0.0
+        price = float(data.close[0])
+        if price <= 0:
+            return 0.0
+        return remaining * price * (1.0 + self._headroom(data))
 
     def _headroom(self, data) -> float:
         """成交价相对**定量价**的预留比例（见 :meth:`_affordable` 的说明）。
