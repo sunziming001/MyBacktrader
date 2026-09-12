@@ -83,6 +83,8 @@ def load_market_data(
     tdx_root: str | Path,
     gbbq_path: str | Path,
     rules: RuleTable | str | Path | None = None,
+    start=None,
+    end=None,
 ) -> MarketData:
     """读取一个股票的原始行情与权息事件，**并在返回前做越界检查**。
 
@@ -96,12 +98,25 @@ def load_market_data(
         gbbq_path: 权息事件文件路径。
         rules: 规则表，``RuleTable`` 或 TOML 路径。默认取出厂规则表
             ``src/mbt/rules/a_share.toml``。
+        start / end: **回测区间**（含两端），``None`` 表示不设该侧边界。
+
+    关于 ``start`` / ``end``::
+
+        越界检查**只在这个区间内做**。理由是纪律本身：ADR-0005 要的是「不在不可信的
+        数据上交易」，而区间之外的数据本来就不交易。本机实测——``sh600519`` 有一根
+        2006-05-25 的复牌 K 线越出涨跌幅带（股改复牌首日**不设涨跌幅**，而本地数据无从
+        得知这一点），逐条校验会让**整只茅台**被拒收；可那段数据落在任何 2010 年之后的
+        回测之外。全市场抽样里，同一现象涉及 5.7% 的标的，其中九成的坏日子都在 2015-08
+        之前（票据 #45）。
+
+        返回的 ``prices`` 仍是**完整历史**（不是切过的），故调用方照常自行切片；
+        判定记录与事件集则只覆盖区间内的事件。
 
     返回:
         含原始价与权息事件的 :class:`MarketData`。
 
     抛:
-        MarketDataError: 行情文件缺失 / 损坏，或存在无法用公司行为解释的越界跳空。
+        MarketDataError: 行情文件缺失 / 损坏，或**区间内**存在无法用公司行为解释的越界跳空。
         RuleTableError: 符号不是规则表覆盖的股票（指数、基金、债券）。
     """
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
@@ -109,10 +124,38 @@ def load_market_data(
     prices = TdxDataSource(tdx_root).daily(symbol)
     raw_events = tuple(GbbqDataSource(gbbq_path).events(symbol))
 
+    # 校验只做在**回测区间**内，理由见上面的 docstring。
+    window = _window_of(prices, start, end)
+
     # 判定一次，**复权与质检吃同一份**结果。否则会出现「复权已经不算它了，质检却还在按它
     # 报异常」这种自相矛盾（与 ADR-0002 里「涨跌停带必须与撮合共用同一个带」同类）。
-    events, verdicts = resolve_dilution(prices, raw_events, symbol, table)
+    events, verdicts = resolve_dilution(window, raw_events, symbol, table)
 
-    require_no_anomalies(prices, symbol, table, events)
+    require_no_anomalies(window, symbol, table, events)
 
     return MarketData(symbol=symbol, prices=prices, events=events, verdicts=verdicts)
+
+
+def _window_of(prices: pd.DataFrame, start, end) -> pd.DataFrame:
+    """把价格表切到 ``[start, end]``（含两端），并**往前多取一根**。两端都 ``None`` 时不切。
+
+    多取那一根是必需的：涨跌停带要用**前一根**算，而窗口首根如果就是切片的第一根，它上面的
+    跳空根本无从判定（没有基数）。多取一根之后，「窗口首根上的跳空」照样能被抓到，而窗口
+    **之前**那些说不清的日子仍然不参与判定——实测 ``sh600519`` 的坏日子在 2006-05-25，
+    窗口从 2015-08 起时它落在多取的那一根之外（票据 #45）。
+
+    切出来的窗口可能**为空**（该标的在区间内没有 K 线）：那是合法情形——调用方的
+    ``slice_markets`` 会以 ``OUT_OF_RANGE`` 把它记为跳过，比在这里报错更合适。
+    """
+    if start is None and end is None:
+        return prices
+
+    left = 0
+    if start is not None:
+        left = max(int(prices.index.searchsorted(pd.Timestamp(start), side="left")) - 1, 0)
+
+    right = len(prices)
+    if end is not None:
+        right = int(prices.index.searchsorted(pd.Timestamp(end), side="right"))
+
+    return prices.iloc[left:right]

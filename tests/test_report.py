@@ -63,6 +63,7 @@ def test_artifacts_land_in_one_directory_per_run(tmp_path):
         "drawdown.svg",
         "trades.csv",
         "rejected.csv",
+        "skipped.csv",
     }
 
 

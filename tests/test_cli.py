@@ -970,3 +970,37 @@ def test_the_ma_cross_example_on_a_flat_price_series_never_trades(tmp_path):
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["closed_trades"] == 0
     assert "没有平仓交易" in out.getvalue(), "产物与摘要都该如实说明没有平仓"
+
+
+def test_the_report_counts_the_skips_from_loading_not_just_from_slicing(tmp_path):
+    """取数阶段的跳过必须**带进切片**，否则会从报告里消失（票据 #45）。
+
+    实测一次 300 只的运行：取数阶段跳了 84 只，而回测摘要只报「跳过 2」——那 2 是切片阶段
+    的，84 只无声无息。根因是 ``slice_markets(markets, ...)`` 只收 markets，上游的跳过被
+    整段丢掉。这条钉住「两段跳过都要出现在报告里」。
+    """
+    import pandas as pd
+
+    from mbt.data import UniverseLoad, slice_markets
+    from mbt.data.loader import NOT_STOCK, SkippedSymbol
+    from mbt.data.market import MarketData
+
+    earlier = [SkippedSymbol("sh000001", NOT_STOCK, "品种不是股票")]
+    index = pd.bdate_range("2024-01-02", periods=5)
+    frame = pd.DataFrame(
+        {
+            "open": [10.0] * 5,
+            "high": [10.0] * 5,
+            "low": [10.0] * 5,
+            "close": [10.0] * 5,
+            "volume": [1000] * 5,
+        },
+        index=index,
+    )
+    markets = [MarketData(symbol="sh600000", prices=frame, events=())]
+
+    sliced = slice_markets(markets, start="2024-01-02", end="2024-01-05", skipped=earlier)
+
+    assert isinstance(sliced, UniverseLoad)
+    assert [item.symbol for item in sliced.skipped] == ["sh000001"], "上游的跳过被丢掉了"
+    assert len(sliced.markets) == 1
