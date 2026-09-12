@@ -43,6 +43,7 @@ import pandas as pd
 from mbt.data import (
     TdxDataSource,
     load_financials,
+    load_listing_dates,
     load_universe_data,
     non_loss_mask,
     slice_markets,
@@ -98,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="启用「非亏损」过滤（按公告日的累计归母净利润；缺财报的标的排除）",
     )
     backtest.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
+    backtest.add_argument(
+        "--master",
+        default=None,
+        help="证券主表 base.dbf 的路径（提供则次新股门槛按**真实上市日**算）",
+    )
     backtest.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     backtest.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
     backtest.add_argument(
@@ -124,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="启用「非亏损」过滤（按公告日的累计归母净利润；缺财报的标的排除）",
     )
     screen.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
+    screen.add_argument(
+        "--master",
+        default=None,
+        help="证券主表 base.dbf 的路径（提供则次新股门槛按**真实上市日**算）",
+    )
     screen.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     screen.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
 
@@ -217,6 +228,32 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             print(f"错误：财务数据读取失败——{type(exc).__name__}: {exc}", file=stderr)
             return 1
 
+    # 主表缺失或某标的上市日未知 → 回退到「本地行情根数」的近似口径。**退化必须可见**，
+    # 否则「用的是哪个口径」就成了谜。
+    listing_dates = None
+    if args.master:
+        try:
+            every = load_listing_dates(
+                args.master, symbols=[market.symbol for market in loaded.markets]
+            )
+            # **只留本次用到的标的**：`load_listing_dates` 给的是整表（本机 8,088 条），
+            # 直接报它会把「本次有几个标的有上市日」说成一个无意义的数字。
+            listing_dates = {
+                market.symbol: every[market.symbol]
+                for market in loaded.markets
+                if market.symbol in every
+            }
+            print(
+                f"证券主表：{len(listing_dates)}/{len(loaded.markets)} 个标的有真实上市日"
+                f"（其余回退到行情根数）",
+                file=stdout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"错误：主表读取失败——{type(exc).__name__}: {exc}", file=stderr)
+            return 1
+    else:
+        print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
+
     try:
         result = run_portfolio_backtest(
             list(loaded.markets),
@@ -228,6 +265,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             commission_mode=args.commission_mode,
             slippage=args.slippage,
             universe_rules=UniverseRules(extra_mask=extra_mask),
+            listing_dates=listing_dates,
             **params,
         )
     except Exception as exc:  # noqa: BLE001
@@ -289,7 +327,21 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     try:
         panel = assemble_panel(list(loaded.markets), SCREEN_FIELDS)
-        pool = build_universe(list(loaded.markets), rules=UniverseRules())
+        listing_dates = None
+        if args.master:
+            every = load_listing_dates(args.master, symbols=[m.symbol for m in loaded.markets])
+            # 只留本次用到的标的（理由同 backtest 那条注释）。
+            listing_dates = {m.symbol: every[m.symbol] for m in loaded.markets if m.symbol in every}
+            print(
+                f"证券主表：{len(listing_dates)}/{len(loaded.markets)} 个标的有真实上市日"
+                f"（其余回退到行情根数）",
+                file=stdout,
+            )
+        else:
+            print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
+        pool = build_universe(
+            list(loaded.markets), rules=UniverseRules(), listing_dates=listing_dates
+        )
         masks = [pool]
         # AC 要求「非亏损」过滤**同时**接入股票池与选股规则。选股侧走的是 `Screen.apply` 的
         # `universe_mask`——它只收一份掩码，故在这里把股票池与基本面**合成**一份

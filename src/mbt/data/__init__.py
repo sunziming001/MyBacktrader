@@ -35,6 +35,7 @@ from .loader import (
     stock_symbols,
 )
 from .market import MarketData, load_market_data
+from .master import SecurityInfo, SecurityMasterDataSource, load_listing_dates
 from .panel import Panel, assemble_panel
 from .tdx import TdxDataSource
 from .updates import (
@@ -60,6 +61,8 @@ __all__ = [
     "MarketDataError",
     "Panel",
     "GapReport",
+    "SecurityInfo",
+    "SecurityMasterDataSource",
     "SkippedSymbol",
     "SymbolBoundary",
     "TdxDataSource",
@@ -77,6 +80,7 @@ __all__ = [
     "is_stock",
     "load_boundaries",
     "load_financials",
+    "load_listing_dates",
     "load_market_data",
     "load_universe_data",
     "non_loss_mask",

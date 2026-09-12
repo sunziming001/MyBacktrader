@@ -86,6 +86,7 @@ def make_args(**overrides):
         gbbq=None,
         cw_root=None,
         non_loss=False,
+        master=None,
         output_dir=None,
         limit=None,
         symbols_file=None,
@@ -105,6 +106,7 @@ def screen_args(**overrides):
         gbbq=None,
         cw_root=None,
         non_loss=False,
+        master=None,
         output_dir=None,
         limit=None,
         symbols_file=None,
@@ -742,6 +744,54 @@ def test_a_degraded_calendar_is_warned_about(tmp_path):
 
     assert "警告" in err.getvalue()
     assert "市场日历" in err.getvalue()
+
+
+def test_the_master_report_counts_only_the_symbols_in_this_run(tmp_path):
+    """`--master` 的汇总只能数**本次用到**的标的。
+
+    实跑撞到过：`load_listing_dates` 返回整表（本机 8,088 条），直接拿它报数会印出
+    「8088/53 个标的有真实上市日」——一个无意义的数字，且会让人以为数据有问题。
+    """
+    from mbt.cli import run_backtest_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    master_fixture = Path(__file__).parent / "fixtures" / "master" / "base.dbf"
+    args = make_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+        master=str(master_fixture),
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    line = next(line for line in out.getvalue().splitlines() if "证券主表" in line)
+    # fixture 里只有 000001/600000/600519/160605 四条；本次只有一个标的（sh600000）。
+    assert "1/1" in line, f"应只数本次的标的，而实际是：{line}"
+
+
+def test_without_a_master_the_cli_says_which_rule_it_used(tmp_path):
+    """不给主表时**必须说明用的是近似口径**——否则「用的哪个口径」成了谜。"""
+    from mbt.cli import run_backtest_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    args = make_args(tdx_root=str(root), gbbq=str(gbbq), output_dir=str(tmp_path / "runs"))
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "近似口径" in out.getvalue()
+
+
+def test_the_screen_command_says_which_rule_it_used(tmp_path):
+    """选股命令也要说明口径——否则「用的哪个口径」成了谜（原先只有 backtest 会打印）。"""
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = screen_args(tdx_root=str(root), gbbq=str(gbbq), output_dir=str(tmp_path / "screens"))
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "近似口径" in out.getvalue()
 
 
 def test_a_malformed_as_of_is_reported(tmp_path):

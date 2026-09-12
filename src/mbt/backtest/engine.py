@@ -185,6 +185,7 @@ def run_portfolio_backtest(
     max_positions=None,
     rules=None,
     universe_rules=None,
+    listing_dates=None,
     screen=None,
     sizer=None,
     sizer_options=None,
@@ -210,8 +211,11 @@ def run_portfolio_backtest(
             ``None`` 时用出厂设定（排除次新股、纳入四个板块）。
 
             **股票池没有开关**：本函数一律建池、一律由撮合层强制「池外不可买」。要放宽
-            只能改这里的准入规则（如 ``min_bars=0``），而不是绕过它——能绕开的开关迟早
+            只能改这里的准入规则（如 ``min_trading_days=0``），而不是绕过它——能绕开的开关迟早
             会被打开然后忘记关。
+        listing_dates: **真实上市日**（``{符号: 日期}``），来自
+            :class:`~mbt.data.master.SecurityMasterDataSource`（票据 #25）。给了它，次新股门槛
+            按「自上市日起的交易日」算；不给则回退到「本地行情根数」的近似口径。
         screen: 选股规则（:class:`~mbt.screen.Screen`）。给了它就与股票池**一同**构成
             买入闸门，且选股结果单独挂在 broker 上供策略查看（``broker.selection_mask``）。
             两种闸门分开检查，故 ``BacktestResult.rejected`` 里的 ``reason`` 能说清是
@@ -284,7 +288,9 @@ def run_portfolio_backtest(
         for market in markets
     ]
 
-    universe_mask = build_universe(adjusted, rules=universe_rules, rule_table=table)
+    universe_mask = build_universe(
+        adjusted, rules=universe_rules, rule_table=table, listing_dates=listing_dates
+    )
 
     selection_mask = None
     if screen is not None:
