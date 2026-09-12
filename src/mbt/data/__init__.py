@@ -19,6 +19,12 @@ from .adjust import (
 )
 from .anomaly import Anomaly, find_anomalies, require_no_anomalies
 from .errors import MarketDataError
+from .fundamental import (
+    CwDataSource,
+    FinancialRecord,
+    load_financials,
+    non_loss_mask,
+)
 from .gbbq import GbbqDataSource, GbbqError, GbbqRecord
 from .instrument import instrument_type, is_stock
 from .loader import (
@@ -35,7 +41,9 @@ from .tdx import TdxDataSource
 __all__ = [
     "AdjustmentEvent",
     "Anomaly",
+    "CwDataSource",
     "DilutionVerdict",
+    "FinancialRecord",
     "GbbqDataSource",
     "GbbqError",
     "GbbqRecord",
@@ -53,8 +61,10 @@ __all__ = [
     "forward_adjusted",
     "instrument_type",
     "is_stock",
+    "load_financials",
     "load_market_data",
     "load_universe_data",
+    "non_loss_mask",
     "require_no_anomalies",
     "slice_markets",
     "stock_symbols",

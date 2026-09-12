@@ -13,6 +13,7 @@ ADR-0001 说「行 = 截面」，而「今天哪些可买」正是一行截面�
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from mbt.rules import RuleTable
 from mbt.universe import MAIN_BOARD, UniverseRules, build_universe
@@ -276,3 +277,110 @@ def test_non_stock_instruments_are_excluded_even_when_the_rule_table_knows_them(
     assert not got["sh000001"].any()
     # sh688981 在合成表里自 2024-01-01 起被登记为 ST，故应被排除
     assert not got["sh688981"].any()
+
+
+# --- 附加过滤（基本面）：与结构性准入**取与**，失败原因分得开（票据 #8） --------
+
+
+def test_an_extra_mask_is_intersected_with_the_structural_rules(make_prices, make_market):
+    """基本面过滤与品种/板块/次新**取与**，不是替代。"""
+    markets = [
+        make_market("sh600000", make_prices(closes(80))),
+        make_market("sz000001", make_prices(closes(80))),
+    ]
+    prices = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    extra = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+    extra["sz000001"] = False  # 它「亏损」
+
+    got = build_universe(markets, rules=UniverseRules(min_bars=0, extra_mask=extra))
+
+    assert got["sh600000"].all()
+    assert not got["sz000001"].any()
+
+
+def test_a_symbol_absent_from_the_extra_mask_is_excluded_not_passed(make_prices, make_market):
+    """掩码里没有这个标的 → 它**没被评估过**，故不放行。
+
+    与「没有可用财报就排除」同一方向：入场过滤宁可少收，不可把没评估过的当合格。
+    """
+    markets = [make_market("sh600000", make_prices(closes(80)))]
+    prices = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    extra = pd.DataFrame(False, index=prices.index, columns=["sh601999"])  # 另一只
+
+    got = build_universe(markets, rules=UniverseRules(min_bars=0, extra_mask=extra))
+
+    assert not got["sh600000"].any()
+
+
+def test_without_an_extra_mask_nothing_changes(make_prices, make_market):
+    """不给附加掩码时行为与从前一致——既有调用方不受影响。"""
+    markets = [make_market("sh600000", make_prices(closes(80)))]
+
+    got = build_universe(markets, rules=UniverseRules(min_bars=0))
+
+    assert got.all().all()
+
+
+def test_why_not_in_universe_separates_fundamental_from_structural_reasons(
+    make_prices, make_market
+):
+    """「为什么不在池内」要分得清是**结构性**原因还是**基本面**原因。
+
+    这正是把基本面过滤做成 `extra_mask` 而不是塞进品种/板块那几条的理由——排查时最需要的
+    就是这个区别。
+    """
+    from mbt.universe import why_not_in_universe
+
+    markets = [
+        make_market("sh600000", make_prices(closes(80))),
+        make_market("sz000001", make_prices(closes(80))),
+        make_market("sz000002", make_prices(closes(10))),  # 次新（不足 60 根）
+    ]
+    prices = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    extra = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+    extra["sz000001"] = False
+
+    reasons = why_not_in_universe(markets, rules=UniverseRules(min_bars=60, extra_mask=extra))
+
+    assert reasons["sh600000"] == "在池内"
+    assert "非亏损" in reasons["sz000001"]
+    assert "不足" in reasons["sz000002"]
+    assert reasons["sz000001"] != reasons["sz000002"], "两类原因必须分得开"
+
+
+# --- combine_masks ------------------------------------------------------------
+
+
+def test_combine_masks_ands_the_frames(make_prices, make_market):
+    from mbt.universe import combine_masks
+
+    markets = [make_market("sh600000", make_prices(closes(3)))]
+    prices = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    pool = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+    fundamental = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+    fundamental.iloc[0] = False
+
+    got = combine_masks(pool, fundamental)
+
+    assert got.iloc[0].eq(False).all()
+    assert got.iloc[1:].all().all()
+
+
+def test_combine_masks_rejects_misaligned_frames(make_prices, make_market):
+    """形状不一致要报错并指出是哪一份——`&` 会静默按标签对齐，得到一张看着正常的表。"""
+    from mbt.universe import combine_masks
+
+    markets = [make_market("sh600000", make_prices(closes(3)))]
+    prices = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    good = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+    bad = pd.DataFrame(True, index=prices.index[:2], columns=prices.columns)
+
+    with pytest.raises(ValueError, match="第 2 份掩码"):
+        combine_masks(good, bad)
+
+
+def test_combine_masks_needs_at_least_one(make_prices):
+    from mbt.universe import combine_masks
+
+    with pytest.raises(ValueError, match="至少要给一份"):
+        combine_masks()

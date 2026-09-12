@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from mbt.data.instrument import is_stock
+from mbt.data.instrument import instrument_type, is_stock
 from mbt.rules import RuleTable, board_of
 
 #: 主板的概念名。规则表内部把它拆成「沪主板」与「深主板」两行（过户费沪深不同），
@@ -81,6 +81,108 @@ class UniverseRules:
 
     boards: frozenset[str] = field(default_factory=lambda: ALL_BOARDS)
     min_bars: int = 60
+    #: 附加的准入掩码（boolean 标的宽表），由**调用方**提供并与上述结构性条件**取与**。
+    #:
+    #: 它存在的理由：**基本面过滤**（如「非亏损」）不是结构性条件——品种、板块、次新答的是
+    #: 「这是什么、够不够格」，而财务条件答的是「它经营得怎么样」。混进上面那几条会让两者的
+    #: 失败原因分不开（「它不在池内」到底是因为次新还是因为亏损？），而排查时最需要的就是
+    #: 这个区别。
+    extra_mask: pd.DataFrame | None = None
+
+
+def why_not_in_universe(
+    markets,
+    *,
+    rules: UniverseRules | None = None,
+    rule_table: RuleTable | None = None,
+) -> pd.Series:
+    """逐个标的给出「为什么它不在池内」的一句话，供人工抽查。
+
+    与 :func:`build_universe` 共用**同一份**判据（:func:`_exclusion_reasons` 产出有序的
+    (条件, 理由) 列表，两者都按它走），故「为什么被排除」讲错的风险只有一处。
+    """
+    rules = rules or UniverseRules()
+    frame = build_universe(markets, rules=rules, rule_table=rule_table)
+    reasons = {}
+    for market in markets:
+        symbol = market.symbol
+        if symbol not in frame.columns:
+            continue
+        reasons[symbol] = (
+            "在池内" if frame[symbol].any() else _first_reason(market, rules, rule_table)
+        )
+    return pd.Series(reasons, name="reason")
+
+
+def _first_reason(market, rules: UniverseRules, rule_table) -> str:
+    """第一条不通过的理由，**顺序与 :func:`build_universe` 一致**。
+
+    两者共用 :func:`_structural_failures`，故此处的顺序不会与那边漂移——而「讲错为什么被排除」
+    比不讲更糟：它会把人引到错误的方向去查。
+    """
+    for reason in _structural_failures(market, rules, rule_table):
+        return reason
+    return "未通过准入"
+
+
+def _structural_failures(market, rules: UniverseRules, rule_table):
+    """按与 :func:`build_universe` **相同的顺序**列出不通过的理由（可能多条）。"""
+    symbol = market.symbol
+    if not is_stock(symbol):
+        yield f"品种不是股票（{instrument_type(symbol)}）"
+        return
+
+    try:
+        board = _BOARD_TO_CONCEPT[board_of(symbol)]
+    except KeyError:
+        yield "板块命名与词汇表不一致"
+        return
+
+    if board not in rules.boards:
+        yield f"板块 {board} 未纳入"
+
+    # 注意顺序：`build_universe` 先判根数、再判附加掩码、最后判 ST——这里必须一致，
+    # 否则「为什么被排除」会指向另一条其实没拦住它的条件。
+    if len(market.prices) < rules.min_bars:
+        yield f"行情只有 {len(market.prices)} 根，不足 {rules.min_bars} 根"
+
+    if rules.extra_mask is not None and symbol in rules.extra_mask.columns:
+        if not rules.extra_mask[symbol].any():
+            yield "未通过附加过滤（如「非亏损」）"
+    elif rules.extra_mask is not None:
+        yield "不在附加过滤的掩码里（未被评估）"
+
+    if rule_table is not None and rule_table.has_st_period(symbol):
+        yield "期间内有 ST 登记（被排除）"
+
+
+def combine_masks(*masks: pd.DataFrame) -> pd.DataFrame:
+    """把若干 boolean 标的宽表逐格取与。
+
+    它存在的理由：**股票池与基本面过滤是两份掩码**，而消费它们的地方（`Screen.apply` 的
+    ``universe_mask``、撮合的闸门）只收**一份**。合成这一步要显式、要有形状校验——静默按
+    标签对齐得到一张看着正常的表，正是 ADR-0009 记的那类错答。
+
+    形状不一致时报错并指出是哪一份，而不是 `&` 之后悄悄补缺失值。
+    """
+    if not masks:
+        raise ValueError("至少要给一份掩码")
+
+    reference = masks[0]
+    if not isinstance(reference, pd.DataFrame):
+        raise ValueError(f"掩码必须是 DataFrame，第 1 份是 {type(reference).__name__}")
+    for position, mask in enumerate(masks[1:], start=2):
+        if not isinstance(mask, pd.DataFrame):
+            raise ValueError(f"掩码必须是 DataFrame，第 {position} 份是 {type(mask).__name__}")
+        if not mask.index.equals(reference.index) or not mask.columns.equals(reference.columns):
+            raise ValueError(
+                f"第 {position} 份掩码的日期与标的必须与第 1 份一致，否则取与会静默错位"
+            )
+
+    combined = reference.astype(bool)
+    for mask in masks[1:]:
+        combined &= mask.astype(bool)
+    return combined
 
 
 def build_universe(
@@ -139,6 +241,15 @@ def build_universe(
         if board not in rules.boards:
             in_universe[symbol] = False
             continue
+
+        if rules.extra_mask is not None:
+            if symbol not in rules.extra_mask.columns:
+                # 掩码里没有这个标的——它没被评估过，故不放行（与「没有可用财报就排除」同一方向）。
+                in_universe[symbol] = False
+                continue
+            for on in in_universe.index:
+                if not bool(rules.extra_mask.at[on, symbol]):
+                    in_universe.loc[on, symbol] = False
 
         if rule_table is not None and rule_table.has_st_period(symbol):
             for on in in_universe.index:
