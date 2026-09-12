@@ -862,20 +862,11 @@ def test_the_cli_warns_when_orders_were_placed_but_none_filled(tmp_path):
     rejected = pd.read_csv(run_dir / "rejected.csv")
     assert set(rejected["status"]) == {"Rejected"}
     assert rejected["reason"].str.contains("不在股票池").all(), "理由要能看出为什么被拒"
+
+
 # --- 示例策略（examples/strategies.py） ---------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "**定量价与成交价之差**：sizer 用 `close[0]` 定量，而订单在**下一根**成交。"
-        "若下一根的成交价高于定量价（本例的正弦路径上扬 3% 以上），"
-        "`数量 × 成交价 + 费用` 仍会超出预算 → 买单以 `Margin` 被拒。"
-        "费用那一半已在 #29 修掉（现按「含费用仍买得起的最大股数」定量，实测 sizer 自算 "
-        "99992.44 ≤ 100000 确实买得起），但**定量价与成交价之差**尚未处理，故本测试仍失败。"
-        "修好之后它会 XPASS，届时请摘掉这个标记。"
-    ),
-)
 def test_the_ma_cross_example_both_buys_and_sells(tmp_path):
     """均线上穿的示例必须**真的买、也真的卖**。
 
@@ -883,11 +874,10 @@ def test_the_ma_cross_example_both_buys_and_sells(tmp_path):
     `continue`），于是**永远不卖**——而产物只把它记成「没有平仓交易」，**不报错**。
     手工跑一遍才发现。这条测试就是那次手工发现的固化：买卖任一为 0 就失败。
 
-    .. warning::
-
-        它现在仍会失败，且**失败的原因是库的，不是示例的**——见上面的 ``xfail`` 说明：
-        单标的时买单会以 ``Margin`` 被拒，因为 sizer 按``close[0]`` 定量而订单在下一根成交。
-        标成 ``strict=True`` 是为了在修好之后**主动**提醒摘掉它。
+    它一度标着 ``xfail(strict=True)``，因为那时它撞到了**库的**两个独立缺陷，而错都在库、
+    不在示例：sizer 不给交易费用留余量（#29 修掉），以及定量用的是当根收盘价、而订单在
+    **下一根**成交（#32 修掉）。两处修完后它转绿，标记随之摘除——这正是当初用
+    ``strict=True`` 的目的：不修就一直是红的，修好了会 XPASS 主动提醒。
     """
     import json
     import math
