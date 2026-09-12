@@ -52,7 +52,7 @@ from mbt.data import (
 from mbt.data.errors import MarketDataError
 from mbt.report import DEFAULT_BENCHMARK_SYMBOL, write_run_artifacts
 from mbt.screen import SCREEN_FIELDS, momentum_screen
-from mbt.universe import UniverseRules, combine_masks
+from mbt.universe import ALL_BOARDS, UniverseRules, combine_masks
 
 #: 费用口径全可查的最早日期（沪主板过户费自该日起按成交金额计）。见模块说明。
 DEFAULT_START = "2015-08-01"
@@ -106,6 +106,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     backtest.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
+    backtest.add_argument(
+        "--boards",
+        default=None,
+        help="纳入的板块，逗号分隔（默认四个全收：主板,创业板,科创板,北交所）",
+    )
+    backtest.add_argument(
+        "--screen",
+        choices=("none", "momentum", "valuation"),
+        default="none",
+        help="入场闸门：指名库里的一条选股规则（valuation 需 --cw-root）",
+    )
+    backtest.add_argument(
+        "--screen-top-n",
+        type=int,
+        default=None,
+        help="选股规则取前 N 名（默认取 --max-positions，未给则为 5）",
+    )
     backtest.add_argument(
         "--param",
         action="append",
@@ -179,6 +196,10 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
     loaded = load_universe_data(symbols, tdx_root=args.tdx_root, gbbq_path=args.gbbq, rules=None)
+
+    # **截断之前**先把完整行情留一份。估值的百分位要回看 1000 个交易日，故必须用完整历史
+    # 去算、算完再截到回测区间——拿已截断的行情去算等于把回看窗口砍掉（见 `clip_fields`）。
+    full_markets = list(loaded.markets)
 
     # 区间由**此处**落实：`--start` / `--end` 原先被解析了却没接上，回测因此永远跑全历史
     # ——而 README 还把默认值当作生效的行为写了理由。切片放在库里（可测、可复用）。
@@ -255,6 +276,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
 
     try:
+        screen, signals = _screen_and_signals(args, loaded, full_markets, stdout)
         result = run_portfolio_backtest(
             list(loaded.markets),
             strategy,
@@ -264,8 +286,10 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             commission_min=args.commission_min,
             commission_mode=args.commission_mode,
             slippage=args.slippage,
-            universe_rules=UniverseRules(extra_mask=extra_mask),
+            universe_rules=UniverseRules(boards=_boards(args), extra_mask=extra_mask),
             listing_dates=listing_dates,
+            screen=screen,
+            signals=signals,
             **params,
         )
     except Exception as exc:  # noqa: BLE001
@@ -295,6 +319,66 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     _report_result(result, run_dir, stdout)
     return 0
+
+
+def _boards(args) -> frozenset:
+    """``--boards`` 解析成板块集合；未给即出厂设定（四个全收）。
+
+    板块名用 `CONTEXT.md` 的**四个概念名**，其中「主板」已经合并了沪、深两个交易所口径
+    （规则表按交易所分列是为了过户费，那是另一回事）。故要「主板+创业板+科创板」就写
+    ``--boards 主板,创业板,科创板``。
+    """
+    raw = getattr(args, "boards", None)
+    if not raw:
+        return ALL_BOARDS
+    names = [piece.strip() for piece in raw.split(",") if piece.strip()]
+    unknown = [name for name in names if name not in ALL_BOARDS]
+    if unknown:
+        raise ValueError(f"未知板块 {unknown}；可用的有 {sorted(ALL_BOARDS)}")
+    return frozenset(names)
+
+
+def _screen_and_signals(args, loaded, full_markets, stdout):
+    """按 ``--screen`` **指名**一条库里的规则，并备好它需要的信号。
+
+    本函数只做「指名 + 备料」，规则的语义、默认值与测试都在库里（:mod:`mbt.screen`）——AC
+    明令 CLI 是库入口的薄映射，不含独立业务逻辑。
+
+    ``full_markets`` 是**截断之前**的行情：估值要用完整历史算（百分位回看 1000 个交易日），
+    算完再截到回测区间。故它不能等于 ``loaded.markets``。
+
+    返回 ``(screen, signals)``：``screen`` 交引擎当入场闸门，``signals`` 同时交给策略
+    （``broker.signals``），于是**同一个条件不必写两遍**（ADR-0001）。
+    """
+    name = getattr(args, "screen", None) or "none"
+    if name == "none":
+        return None, None
+
+    # 候选集大小默认取最大持仓数：取前 N 却只持有 M < N 只，多出来的候选没有意义。
+    top_n = getattr(args, "screen_top_n", None) or args.max_positions or 5
+
+    if name == "momentum":
+        return momentum_screen(window=20, top_n=top_n), None
+
+    if name != "valuation":
+        raise ValueError(f"未知的 --screen {name!r}")
+
+    if not args.cw_root:
+        raise ValueError("--screen valuation 需要 --cw-root：估值的每股收益来自财务数据")
+
+    from mbt.data.fundamental import CwDataSource
+    from mbt.data.valuation import clip_fields, valuation_for
+    from mbt.screen import valuation_screen
+
+    # 传的是**原始**行情：PE 要用当时的成交价，而后复权价以首根为基准放大（见 valuation_for）。
+    valuation = valuation_for(full_markets, CwDataSource(args.cw_root))
+    covered = int(valuation.pe.notna().any().sum())
+    print(
+        f"估值：{covered}/{len(full_markets)} 个标的算出了动态PE（其余无可用财报）",
+        file=stdout,
+    )
+    signals = clip_fields(valuation.as_fields(), loaded.markets, start=args.start, end=args.end)
+    return valuation_screen(top_n=top_n), signals
 
 
 def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
@@ -650,6 +734,16 @@ def _report_result(result, run_dir, stdout) -> None:
         print(
             "  警告：有下单但**一笔都没成交**，上面的指标不代表任何策略；"
             "理由见 rejected.csv（常见：资金不足 Margin、出池、挂单过期）",
+            file=stdout,
+        )
+    elif not len(result.trades):
+        # **一笔订单都没下过**：与上面那条不同——那里是「下了单被拒」，这里是策略根本没动。
+        # 实测撞到过：股票池把北交所排除了，而 `--limit` 取到的标的全是北交所，于是池子为空、
+        # 选股规则一个候选都没有 → 净值是一条平线、退出码 0，看着像个「本来就没信号」的正常结果。
+        print(
+            "  警告：全程**没有下达任何订单**，上面的指标不代表任何策略。"
+            "通常意味着股票池或选股规则在整段期间没有产出候选——"
+            "请检查 --boards / --symbols-file / --limit 选出的标的，以及 --screen 的阈值",
             file=stdout,
         )
 

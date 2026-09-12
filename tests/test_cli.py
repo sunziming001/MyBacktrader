@@ -867,6 +867,28 @@ def test_the_cli_warns_when_orders_were_placed_but_none_filled(tmp_path):
 # --- 示例策略（examples/strategies.py） ---------------------------------------
 
 
+def test_placing_no_order_at_all_is_reported_differently_from_all_rejected(tmp_path):
+    """「一笔订单都没下过」与「下了单全被拒」要分开说——两者的排查方向完全不同。
+
+    后者去 ``rejected.csv`` 看理由；前者是**什么都没发生**，通常是股票池或选股规则在整段
+    期间没产出候选。实测撞到过前者：股票池排除了北交所，而 ``--limit`` 取到的全是北交所，
+    于是回测零成交、退出码 0，看着像个「本来就没信号」的正常结果。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=30)  # 不足门槛 60 → 股票池为空
+    args = make_args(
+        strategy="examples.strategies:ValuationReversal",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    text = out.getvalue()
+    assert "没有下达任何订单" in text
+    assert "一笔都没成交" not in text, "没下过单就别说「有下单」"
+
+
 def test_the_ma_cross_example_both_buys_and_sells(tmp_path):
     """均线上穿的示例必须**真的买、也真的卖**。
 

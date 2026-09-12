@@ -258,6 +258,7 @@ def run_portfolio_backtest(
     universe_rules=None,
     listing_dates=None,
     screen=None,
+    signals=None,
     sizer=None,
     sizer_options=None,
     commission=0.0,
@@ -371,7 +372,8 @@ def run_portfolio_backtest(
     selection_mask = None
     if screen is not None:
         selection_mask = screen.apply(
-            assemble_panel(adjusted, SCREEN_FIELDS), universe_mask=universe_mask
+            _with_signals(assemble_panel(adjusted, SCREEN_FIELDS), signals),
+            universe_mask=universe_mask,
         ).selected
 
     return _drive_engine(
@@ -380,6 +382,7 @@ def run_portfolio_backtest(
         table=table,
         universe_mask=universe_mask,
         selection_mask=selection_mask,
+        signals=signals,
         cash=cash,
         max_positions=max_positions,
         sizer=sizer,
@@ -393,6 +396,29 @@ def run_portfolio_backtest(
     )
 
 
+def _with_signals(panel, signals):
+    """把**额外字段形信号**并进行情面板，供选股规则消费。
+
+    选股规则（:class:`~mbt.screen.Screen`）吃的是 :class:`~mbt.data.panel.Panel`，而估值
+    这类信号不在 ``.day`` 行情里（它们来自财务数据），故必须并进去才能被过滤器取用。
+
+    对齐**必须**成立：:class:`Panel` 只允许各字段同日同标的，而这里的两个来源分别由
+    「行情」与「行情 + 财务」算出，任一处口径不同就会静默错位——故面板构造会直接报错，
+    不在此处做任何形状修补。
+    """
+    if not signals:
+        return panel
+
+    from mbt.data.panel import Panel
+
+    fields = {name: panel[name] for name in panel.field_names}
+    for name, frame in signals.items():
+        if name in fields:
+            raise ValueError(f"信号字段 {name!r} 与行情字段重名，会静默覆盖行情")
+        fields[name] = frame
+    return Panel(fields)
+
+
 def _drive_engine(
     markets,
     strategy,
@@ -400,6 +426,7 @@ def _drive_engine(
     table,
     universe_mask,
     selection_mask,
+    signals,
     cash,
     max_positions,
     sizer,
@@ -447,6 +474,7 @@ def _drive_engine(
         tradability=tradability,
         universe=universe_mask,
         selection=selection_mask,
+        signals=signals,
         max_positions=max_positions,
         order_expiry_ticks=order_expiry_ticks,
     )
@@ -568,6 +596,8 @@ def run_backtest(
         # 单标的入口不设股票池闸门，理由见本函数的说明。
         universe_mask=None,
         selection_mask=None,
+        # 单标的入口没有额外信号：它的调用方是库的直接使用者，要信号可以走组合入口。
+        signals=None,
         cash=cash,
         max_positions=1,
         # 沿用 backtrader 的默认 sizer（每次 1 股），以保住既有黄金值。组合入口的默认是
