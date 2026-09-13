@@ -152,6 +152,28 @@ class RuleTable:
         """
         return bool(self._st_periods.get(symbol))
 
+    def st_period_count(self) -> int:
+        """登记了多少条 ST 期间（跨标的合计）。供产物记录「这张表认识多少 ST」。"""
+        return sum(len(spans) for spans in self._st_periods.values())
+
+    def with_st_periods(self, periods) -> RuleTable:
+        """返回一张**叠加**了这些 ST 期间的新表；**不改动原表**。
+
+        为什么返回新表而不就地修改：规则表是共享对象（出厂表由 :meth:`load` 每次读盘新建，
+        但调用方常把它传来传去）。就地修改会让「谁改了它」变成跨模块的隐式耦合，而回测的
+        可复现性依赖于「同一份规则 => 同一个结果」。
+
+        参数:
+            periods: ``{符号: [(起, 止), …]}``。``止`` 为 ``None`` 表示延续到数据末端。
+        """
+        clone = RuleTable({})
+        clone.__dict__.update(self.__dict__)
+        merged = {symbol: list(spans) for symbol, spans in self._st_periods.items()}
+        for symbol, spans in periods.items():
+            merged.setdefault(symbol, []).extend(spans)
+        clone._st_periods = merged
+        return clone
+
     def limit_for(self, symbol: str, on: dt.date) -> float:
         """标的在成交日的**涨跌幅限制**，已按需叠加 ST 覆盖。
 
