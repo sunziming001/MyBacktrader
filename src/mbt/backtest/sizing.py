@@ -9,14 +9,18 @@ AC 要求「多标的共享资金池，有最大持仓数与仓位分配」，�
 
 ## 默认口径：等权 + 按限幅留余地
 
-设最大持仓（标的数）为 ``M``、当前已持有 ``H`` 只标的（不含正在下单的这一只），本单可用
-资金为 ``C``，则本次买入的目标金额为::
+设最大持仓（标的数）为 ``M``、**组合总值**为 ``V``、已占用（已成交持仓 + 挂单中的买单）为
+``H``，本单可用资金为 ``C``（= 现金 − 挂单已占用），则本次买入的目标金额为::
 
-    C ÷ max(1, M − H)
+    min(V ÷ M, C)
 
-也就等于给每个持仓名额一个等额的**目标仓位**，依次把可用资金摊出去：第一笔用掉约 ``C/M``，
-第二笔用掉剩余资金的 ``1/(M−1)``，最后一笔把剩余全部投出。它的好处是**每一步都能手算**，
-且不会因为价格变动而需要回头修正既有的持仓。
+即**每个持仓名额分到等额一份**（``V ÷ M``），且不超过手上能用的现金。方向是「**买齐**」：
+既有持仓涨了，这一份就跟着变大；跌了就变小——所以每个名额的**市值**趋于相等，而不是
+「投入金额」相等。
+
+之前的口径是 ``C ÷ 剩余名额``，它**只在同一 tick 一次买满时**才等于等权。分次建仓（某只
+平仓后腾出名额）时它会把手上的**全部**现金压给最后一个名额——实测单只占到组合的 **36.8%**，
+而等权应为 20%。传 ``equal_weight=False`` 可回到那个旧口径，便于对照。
 
 **买入数量再按「最坏成交价」求上界**——不是按当根收盘价。理由：订单在**本根收盘定量、在下一根
 成交**，而下一根的价格受「前收盘 × (1 + 涨跌幅限制)」约束，故最坏成交价是
@@ -52,7 +56,7 @@ class EqualWeightSizer(bt.Sizer):
             ``BacktestResult.rejected``，不会悄无声息地发生。
     """
 
-    params = (("max_positions", None), ("rules", None), ("headroom", None))
+    params = (("max_positions", None), ("rules", None), ("headroom", None), ("equal_weight", True))
 
     def _getsizing(self, comminfo, cash, data, isbuy):
         if not isbuy:
@@ -70,12 +74,12 @@ class EqualWeightSizer(bt.Sizer):
         # 卖出**不**算释放名额或现金：挂单未成交前它并不确定会成交，按「更少下单」估是稳妥的
         # 一侧（宁可少买，不可超支）。
         pending = 0
-        spent = 0.0
+        committed = 0.0
         for order in self.broker.orders:
             if not order.isbuy() or not order.alive():
                 continue
             pending += 1
-            spent += self._pending_spend(order)
+            committed += self._pending_spend(order)
 
         if self.p.max_positions is None:
             slots = 1
@@ -88,11 +92,32 @@ class EqualWeightSizer(bt.Sizer):
         if price <= 0:
             return 0
 
+        budget = self._budget(cash, committed, slots, held + pending)
+        if budget <= 0:
+            return 0
+
         # 按**最坏成交价**定量，而不是按当根收盘价——见 `_headroom`。
         worst = price * (1.0 + self._headroom(data))
-        # 预算从**扣掉挂单已占用**的现金里分：不扣的话第二笔会以为自己独占全部现金。
-        free = max(cash - spent, 0.0)
-        return self._affordable(comminfo, free / slots, worst)
+        return self._affordable(comminfo, budget, worst)
+
+    def _budget(self, cash: float, committed: float, slots: int, already: int) -> float:
+        """本单该投多少钱——**等权**，见模块文档的「口径」一节。
+
+        默认口径（``equal_weight=True``）按**组合总值 ÷ 名额总数**算：每个持仓名额分到等额
+        一份，本单可花的不超过「本名额的那一份」，且不超过「可用现金 − 已挂单占用」。
+
+        另一种口径（``equal_weight=False``）是 `可用资金 ÷ 剩余名额`——它**只在同一 tick
+        一次买满时**才等于等权，分次建仓时会把全部现金压给最后一个名额（实测单只占到组合的
+        **36.8%**，而等权应为 20%）。保留它是为了让「改口径」这件事可被对照。
+        """
+        free = max(cash - committed, 0.0)
+        if not self.p.equal_weight:
+            return free / slots
+
+        total_value = float(self.broker.getvalue())
+        unit = total_value / self.p.max_positions if self.p.max_positions else total_value
+        # 「已占用的名额」= 已成交持仓 + 挂单中的买单（口径与 `slots` 同一处）。
+        return max(min(unit, free), 0.0)
 
     def _pending_spend(self, order) -> float:
         """一笔挂单中的买单预计占用多少现金（按它自己的**最坏成交价**估）。

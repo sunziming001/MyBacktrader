@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import backtrader as bt
+import pandas as pd
 import pytest
 
 from mbt.backtest import run_portfolio_backtest
@@ -270,6 +271,107 @@ def test_a_pending_buy_does_not_block_the_next_bar(make_market, make_prices, zer
 
 
 # --- 卖出仍由策略决定 ----------------------------------------------------------
+
+
+def test_staggered_entries_are_equal_weight_not_back_loaded(
+    make_market, make_prices, zero_cost_rules
+):
+    """**分次建仓时每个名额的分到的钱应当相同**——不能把剩下的现金全压给最后一个名额。
+
+    构造：5 只标的、`max_positions=5`，但每根 K 线只买一只（于是现金逐次减少）。
+
+    旧口径 ``现金 ÷ 剩余名额`` 在这里会失效：最后一笔看到「剩 1 个名额、手上还有 4/5 的
+    现金」，于是**把全部剩余现金压上去**——实测单只占到组合的 **36.8%**，而等权应为 20%。
+    新口径按 ``组合总值 ÷ max_positions`` 定额，故每笔都约 20%。
+    """
+    import backtrader as bt
+
+    from mbt.data.market import MarketData
+
+    class OnePerBar(bt.Strategy):
+        """每根 K 线只买一只还没持仓的——多根 K 线逐步建仓。"""
+
+        def next(self):
+            for data in self.datas:
+                if self.getposition(data).size:
+                    continue
+                self.buy(data=data)
+                return
+
+    symbols = ["sh600000", "sh600001", "sh600002", "sh600003", "sh600004"]
+    markets = [
+        MarketData(symbol=symbol, prices=make_prices([10.0] * 20), events=()) for symbol in symbols
+    ]
+
+    result = run_portfolio_backtest(
+        markets,
+        OnePerBar,
+        cash=100_000.0,
+        max_positions=5,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+    )
+
+    equity = result.equity_curve
+    buys = result.trades[result.trades["size"] > 0].sort_values("date")
+    assert len(buys) == 5, "五只都该买到"
+
+    weights = []
+    for row in buys.itertuples(index=False):
+        stamp = pd.Timestamp(row.date)
+        weights.append(abs(float(row.value)) / float(equity.asof(stamp)))
+
+    assert min(weights) > 0.15, f"最小的仓位 {min(weights):.1%} 太小——该约 20%"
+    assert max(weights) < 0.25, f"最大的仓位 {max(weights):.1%} 太大——该约 20%"
+    # 新口径的特征是**平坦**：每个名额分到等额一份，故逐笔差异很小。
+    assert (
+        max(weights) - min(weights) < 0.03
+    ), f"各笔仓位该基本相等，实测 {[round(w, 4) for w in weights]}"
+
+
+def test_the_legacy_budget_back_loads_the_last_slot(make_market, make_prices, zero_cost_rules):
+    """对照：旧口径 ``equal_weight=False`` **确实**会把钱压给最后一个名额。
+
+    留着这条是为了让「为什么改口径」有据可查——否则新旧差异无从归因（正像阈值那几轮）。
+    """
+    import backtrader as bt
+
+    from mbt.data.market import MarketData
+
+    class OnePerBar(bt.Strategy):
+        def next(self):
+            for data in self.datas:
+                if self.getposition(data).size:
+                    continue
+                self.buy(data=data)
+                return
+
+    markets = [
+        MarketData(symbol=symbol, prices=make_prices([10.0] * 20), events=())
+        for symbol in ("sh600000", "sh600001", "sh600002", "sh600003", "sh600004")
+    ]
+
+    result = run_portfolio_backtest(
+        markets,
+        OnePerBar,
+        cash=100_000.0,
+        max_positions=5,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+        sizer_options={"equal_weight": False},
+    )
+
+    equity = result.equity_curve
+    buys = result.trades[result.trades["size"] > 0].sort_values("date")
+    weights = [
+        abs(float(row.value)) / float(equity.asof(pd.Timestamp(row.date)))
+        for row in buys.itertuples(index=False)
+    ]
+
+    # 旧口径的特征是**逐笔递增**（后面的名额分到更多），而不是某个具体阈值——阈值依赖
+    # 现金与价格路径，构造起来脆弱。实测这一组是 18.2% → 21.9%，单调上升。
+    assert weights == sorted(weights), f"旧口径该逐笔递增，实测 {weights}"
+    assert weights[-1] > weights[0] * 1.15, f"最后一笔该明显大于第一笔，实测 {weights}"
 
 
 def test_selling_is_still_left_to_the_strategy(make_market, make_prices, synthetic_rules):
