@@ -21,6 +21,7 @@ import pytest
 from mbt.data.errors import MarketDataError
 from mbt.data.fundamental import FinancialRecord
 from mbt.data.valuation import (
+    EQUITY,
     MARKET_CAP,
     PE,
     PE_PERCENTILE,
@@ -267,7 +268,30 @@ def test_as_fields_exposes_the_documented_names():
     valuation = build_valuation(frame([10.0] * 3), FakeFinancials())
 
     assert tuple(valuation.as_fields()) == VALUATION_FIELDS
-    assert (PE, PE_PERCENTILE, PEG, MARKET_CAP, ROE) == VALUATION_FIELDS
+    assert (PE, PE_PERCENTILE, PEG, MARKET_CAP, ROE, EQUITY) == VALUATION_FIELDS
+
+
+def test_equity_is_the_point_in_time_book_value_and_never_a_substitute_for_roe():
+    """``equity`` 原样暴露「归母股东权益」（净资产）。
+
+    它存在的理由是「ROE 拦不住净资产为负」：**净利与净资产同时为负时 ROE 是正的**。
+    这条测试把这个反例钉死——若哪天有人把 ``equity`` 当成 ROE 的冗余而删掉，这里会先红。
+    """
+    financials = FakeFinancials(
+        sh600000=[
+            record(
+                dt.date(2023, 12, 31),
+                dt.date(2024, 1, 1),
+                ttm=-500_000_000.0,  # 巨亏
+                equity=-1_000_000_000.0,  # 资不抵债
+            )
+        ]
+    )
+
+    valuation = build_valuation(frame([20.0] * 3), financials)
+
+    assert valuation.equity.iloc[0, 0] == pytest.approx(-1_000_000_000.0)
+    assert valuation.roe.iloc[0, 0] == pytest.approx(50.0), "两负相除得正 ROE——正是要拦的情形"
 
 
 def test_roe_is_ttm_profit_over_equity_in_percent():
@@ -350,6 +374,33 @@ def test_a_symbol_without_shares_data_gets_a_missing_market_cap():
     valuation = build_valuation(frame([20.0] * 3), FakeFinancials())
 
     assert valuation.market_cap.isna().all().all()
+
+
+def test_a_symbol_without_financials_gets_a_missing_equity():
+    """无可用财报 → 净资产缺失，而不是 0。
+
+    这与「净资产为 0」必须区分：0 是「资不抵债到刚好归零」，缺失是「不知道」。过滤条件
+    两者都拦，但把它填成 0 会让下游以为拿到了一个真实的账面值。
+    """
+    valuation = build_valuation(frame([20.0] * 3), FakeFinancials())
+
+    assert valuation.equity.isna().all().all()
+
+
+def test_equity_is_point_in_time_like_the_other_financial_fields():
+    """公告日之前拿不到净资产——与 PE/ROE 同一道门（ADR-0006）。"""
+    financials = FakeFinancials(
+        sh600000=[
+            record(dt.date(2023, 12, 31), dt.date(2024, 4, 1), equity=7e8),
+        ]
+    )
+
+    valuation = build_valuation(frame([20.0] * 315, start="2023-01-02"), financials)
+
+    before = valuation.equity.loc[:"2024-03-31", "sh600000"]
+    after = valuation.equity.loc["2024-04-01":, "sh600000"]
+    assert before.isna().all(), "公告前不可知"
+    assert (after == pytest.approx(7e8)).all(), "公告当天起生效"
 
 
 def test_a_non_datetime_index_is_rejected():

@@ -15,7 +15,7 @@ import pytest
 from mbt.backtest import run_portfolio_backtest
 from mbt.data.errors import MarketDataError
 from mbt.data.panel import clip_fields
-from mbt.data.valuation import MARKET_CAP, ROE
+from mbt.data.valuation import EQUITY, MARKET_CAP, ROE
 from mbt.screen import (
     DRAWDOWN_FIELD,
     Screen,
@@ -50,9 +50,9 @@ def columns_of(markets):
 
 
 def growth_frames(index, columns, **overrides):
-    """加跌幅、市值与 ROE 字段的一组信号帧（默认都过门槛）。
+    """加跌幅、市值、ROE 与净资产字段的一组信号帧（默认都过门槛）。
 
-    默认值：跌幅 0.5（> 42%）、市值 500 亿（> 100 亿）、ROE 25（> 10）。
+    默认值：跌幅 0.5（> 42%）、市值 500 亿（> 100 亿）、ROE 25（> 10）、净资产 50 亿（> 0）。
     """
     frames = valuation_frames(index, columns, **overrides)
     frames[DRAWDOWN_FIELD] = pd.DataFrame(
@@ -63,6 +63,9 @@ def growth_frames(index, columns, **overrides):
     )
     frames[ROE] = pd.DataFrame(
         overrides.get("roe", 25.0), index=index, columns=columns, dtype=float
+    )
+    frames[EQUITY] = pd.DataFrame(
+        overrides.get("equity", 5e9), index=index, columns=columns, dtype=float
     )
     return frames
 
@@ -126,6 +129,133 @@ def test_a_missing_roe_excludes_the_symbol():
         peg=[[0.3, 0.3]] * 2,
         drawdown_1y=[[0.9, 0.9]] * 2,
         roe=[[25.0, float("nan")]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["known"]
+
+
+# --- 票据 #62：净资产为正 -----------------------------------------------------
+
+
+def test_the_growth_screen_excludes_a_negative_equity_company_despite_its_huge_roe():
+    """净资产为负 → 排除，哪怕它的 ROE 高得离谱。
+
+    ROE 的分子分母**同时为负**时商为正，故资不抵债的公司可以带着巨大的正 ROE 通过 ROE
+    门槛。全市场回测里收益率最低的 100 只中实测有 ``sh600340``（ROE 99.1）、
+    ``sz000826``（109.6）、``sz300266``（745.4）——都是这类。
+
+    构造让 ``insolvent`` 的 ROE 远高于 ``healthy``：若过滤被删掉，它会抢走唯一的名额，
+    测试随即变红。
+
+    .. note::
+
+        这个 fixture 里 ``insolvent`` 的 **PE 是正的**（1.0），而在真实数据里这不可能——
+        净资产为负且 ROE > 10 蕴含净利为负，PE 因而必为负。故本用例只验证「过滤被正确接上」
+        这一件机械事实；它**在真实数据上能拦住什么**由
+        :func:`test_the_equity_filter_only_bites_when_negative_pe_is_allowed` 回答。
+    """
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["healthy", "insolvent"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9]] * 2,
+        roe=[[25.0, 745.4]] * 2,  # 负净资产那家的 ROE 更高，必须仍被排除
+        equity=[[5e9, -1e9]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=1).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["healthy"]
+
+
+def test_the_equity_filter_only_bites_when_negative_pe_is_allowed():
+    """**「净资产 > 0」被「动态PE > 0」蕴含，故在默认参数下不改变候选集。**
+
+    证明：净资产 < 0 且 ROE > 10 ⟹ 净利TTM < 0（ROE 的分子分母同时为负时商为正）
+    ⟹ PE = 市值 ÷ 净利TTM < 0 ⟹ 已被 ``profitable`` 排除。
+
+    这条断言把「冗余」写进测试而不是留在注释里：
+
+    - 默认参数下，加不加净资产过滤，结果**一样**（都是空集）——拦它的是 PE；
+    - 把 ``pe_above`` 调到负数（显式放行小幅亏损）后，它才会通过其余条件，
+      此时**只有净资产过滤**能拦住它。
+
+    谁将来改 ``pe_above`` 的默认值、或删掉 ``profitable``，这条会告诉他净资产过滤从此
+    **不再冗余**。
+    """
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["insolvent"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[-0.5]] * 2,  # 亏到 PE 为负——负净资产 + 正 ROE 的必然结果
+        pe_percentile=[[0.01]] * 2,
+        peg=[[0.3]] * 2,
+        drawdown_1y=[[0.9]] * 2,
+        roe=[[745.4]] * 2,
+        equity=[[-1e9]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    panel = Panel(frames)
+    without = float("-inf")  # 关掉净资产过滤（任何有限净资产都通过）
+
+    assert (
+        undervalued_growth_screen(top_n=5).apply(panel).candidates(index[0]) == []
+    ), "默认下 PE > 0 已经拦掉它"
+    assert (
+        undervalued_growth_screen(top_n=5, min_equity=without).apply(panel).candidates(index[0])
+        == []
+    ), "所以默认参数下净资产过滤是冗余的：加不加结果都一样"
+
+    assert undervalued_growth_screen(top_n=5, pe_above=-1.0, min_equity=without).apply(
+        panel
+    ).candidates(index[0]) == ["insolvent"], "放行负 PE 后它会通过其余全部条件"
+    assert (
+        undervalued_growth_screen(top_n=5, pe_above=-1.0).apply(panel).candidates(index[0]) == []
+    ), "此时只有净资产过滤能拦住它"
+
+
+def test_the_growth_screen_requires_an_equity_strictly_above_zero():
+    """净资产必须**严格大于** 0：恰好归零不算，1 元才算——与其余门槛同一口径。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["negative", "zero", "positive"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9, 0.9]] * 2,
+        equity=[[-1.0, 0.0, 1.0]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["positive"]
+
+
+def test_a_missing_equity_excludes_the_symbol():
+    """净资产缺失（无可用财报）→ 排除，不凑数。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["known", "unknown"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9]] * 2,
+        equity=[[5e9, float("nan")]] * 2,
     )
     from mbt.data.panel import Panel
 
