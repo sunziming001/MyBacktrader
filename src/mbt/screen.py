@@ -59,6 +59,24 @@ MIN_MARKET_CAP = 1e10
 #: 口径见 :data:`mbt.data.valuation.ROE`。
 MIN_ROE = 10.0
 
+#: 净资产（归母股东权益）门槛，单位**元**。``0.0`` 表示「净资产必须为正」。
+#:
+#: .. note::
+#:
+#:     **在默认的 ``pe_above = 0.0`` 下，这条过滤恒为冗余**——它被「动态PE > 0」蕴含：
+#:
+#:         净资产 < 0 且 ROE > 10 ⟹ 净利TTM < 0 ⟹ PE < 0 ⟹ 已被排除
+#:
+#:     （ROE 的分子分母同时为负时商才为正，见 :data:`mbt.data.valuation.EQUITY`。）
+#:     全市场核验：反例 **0 格**（8,361,752 个有效格里「净资产 ≤ 0」有 29,914 个，其中
+#:     98% 的 ROE > 10，却没有一个 PE > 0）；加过滤前后候选集都是 **8,602 格**，无差异。
+#:
+#:     它真正的用处在 ``pe_above < 0``：那时亏损公司被放行，净资产为负的那些会带着巨大的
+#:     正 ROE 挤进排序（排序因子正是 ROE），这条下界就变成必需的。把它写进条件，是为了让
+#:     「净资产为正」是一个**被声明的前提**，而不是 PE 符号的偶然推论。
+#:     冗余关系有测试钉住：``test_the_equity_filter_only_bites_when_negative_pe_is_allowed``。
+MIN_EQUITY = 0.0
+
 
 def drawdown_fields(markets, *, lookback: int = DRAWDOWN_LOOKBACK) -> dict[str, pd.DataFrame]:
     """由**完整**行情算出「近一年跌幅」信号，供 :func:`undervalued_growth_screen` 取用。
@@ -258,21 +276,37 @@ def undervalued_growth_screen(
     drawdown_above: float = DRAWDOWN_THRESHOLD,
     min_market_cap: float = MIN_MARKET_CAP,
     min_roe: float = MIN_ROE,
+    min_equity: float = MIN_EQUITY,
     top_n: int = 5,
 ) -> Screen:
-    """**低估成长**策略的买入条件（票据 #51、#52、#58）。
+    """**低估成长**策略的买入条件（票据 #51、#52、#58、#62）。
 
     这是「同一条件不必写两遍」的落点（ADR-0001）：回测用它当入场闸门（引擎的 ``screen``），
     选股用它出候选清单（``mbt screen``），两边是**同一个对象**。
 
-    六个过滤条件：
+    七个过滤条件：
 
     - ``动态PE 百分位 < percentile_below`` —— 相对自身历史足够便宜；
     - ``动态PE > pe_above`` —— 剔除亏损（负 PE 无估值含义）；
     - ``peg_above < PEG < peg_below`` —— 增长要为正、且价格相对增长仍算便宜；
     - ``一年内跌幅 > drawdown_above`` —— 从近一年的**最高价**回落足够深；
     - ``总市值 > min_market_cap`` —— 剔除小盘股（默认 100 亿元）；
-    - ``ROE > min_roe`` —— 盈利质量门槛（默认 10%，**百分数**）。
+    - ``ROE > min_roe`` —— 盈利质量门槛（默认 10%，**百分数**）；
+    - ``净资产 > min_equity`` —— **净资产为正**（默认 0 元，严格大于）。
+
+    .. note::
+
+        **最后一条在默认参数下是冗余的**，它被「动态PE > 0」蕴含：
+
+            净资产 < 0 且 ROE > 10 ⟹ 净利TTM < 0 ⟹ PE < 0 ⟹ 已被 ``profitable`` 排除
+
+        （ROE 的分子分母同时为负时商为正，故净资产为负的公司会带着巨大的正 ROE 通过 ROE
+        门槛——但那种情形下它的净利必为负，PE 因而为负。）全市场核验：反例格数为 0，
+        加过滤前后候选集无差异。
+
+        它真正的用处在 ``pe_above < 0``：那时亏损公司被放行，这条下界就变成必需的。
+        写进条件是让「净资产为正」成为**被声明的前提**，而不是 PE 符号的偶然推论。
+        详见 :data:`MIN_EQUITY`。
 
     排序因子是 **ROE**：**盈利质量越高越靠前**（``Screen`` 的契约是「越大越靠前」，而 ROE
     天然满足）。
@@ -284,10 +318,17 @@ def undervalued_growth_screen(
         （净值 −50.9%）。现在改成「先按便宜 + 深跌 + 排除小盘筛出候选，再按**盈利质量**优先」：
         「在折价里挑质量最好的」，而不是「在折价里挑跌得最惨的」。
 
-    这些条件由估值信号（前三 + 市值 + ROE）与 :func:`drawdown_fields`（跌幅）提供，调用方要
-    把两组信号都并进行情面板，见各函数的说明。
+    这些条件由估值信号（前三条 + 市值 + ROE + 净资产）与 :func:`drawdown_fields`（跌幅）提供，
+    调用方要把两组信号都并进行情面板，见各函数的说明。
     """
-    from mbt.data.valuation import MARKET_CAP, PE, PE_PERCENTILE, PEG, ROE
+    from mbt.data.valuation import (
+        EQUITY,
+        MARKET_CAP,
+        PE,
+        PE_PERCENTILE,
+        PEG,
+        ROE,
+    )
 
     def cheap(panel):
         return panel[PE_PERCENTILE] < percentile_below
@@ -307,6 +348,9 @@ def undervalued_growth_screen(
     def good_quality(panel):
         return panel[ROE] > min_roe
 
+    def solvent(panel):
+        return panel[EQUITY] > min_equity
+
     def quality(panel):
         return panel[ROE]
 
@@ -318,6 +362,7 @@ def undervalued_growth_screen(
             deeply_fallen,
             big_enough,
             good_quality,
+            solvent,
         ),
         factor=quality,
         top_n=top_n,

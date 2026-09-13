@@ -1,4 +1,4 @@
-"""估值信号：动态PE、PE 百分位、PEG（票据 #37、#48）。
+"""估值信号：动态PE、PE 百分位、PEG、市值、ROE、净资产（票据 #37、#48、#62）。
 
 把「收盘价」与「按期财务」合成 **date × 标的** 形状的估值序列，供选股规则与策略共用
 （ADR-0001：同一条件不必写两遍）。本模块与 :mod:`mbt.data.fundamental` 同属数据层——财务
@@ -99,8 +99,38 @@ MARKET_CAP = "market_cap"
 #:     现成字段仍可作**交叉验证**：年末时它与本口径接近（茅台 2025-12-31：33.65 vs 34.87）。
 ROE = "roe"
 
+#: 归母股东权益字段名（净资产），单位是**元**。
+#:
+#: 暴露它是为了给选股规则一条**显式**的下界过滤（``equity > 0``，票据 #62）。
+#:
+#: .. note::
+#:
+#:     **它是防御性的，不是当前在起作用的那道闸门。** 在 ``pe_above >= 0`` 的前提下，
+#:     「净资产 > 0」被「动态PE > 0」**蕴含**，故不改变候选集：
+#:
+#:         equity < 0 且 ROE > 10
+#:         ⟹ ROE = 净利TTM ÷ 权益 > 0 ⟹ 净利TTM < 0
+#:         ⟹ PE = 市值 ÷ 净利TTM < 0 ⟹ 已被「PE > 0」排除
+#:
+#:     （第一步之所以成立，是因为 ROE 的分子分母**同时为负**时商为正——这正是净资产为负的
+#:     公司会带着巨大正 ROE 的原因。）
+#:
+#:     真实数据核验（全市场 4,792 只、区间内 4,697 只、2018-01-02 → 2026-09-11）：
+#:
+#:     - 有完整数据的格 **8,361,752**，其中「净资产 ≤ 0」**29,914** 格（0.36%）；
+#:     - 这 29,914 格里 **29,393** 格（**98%**）的 ROE > 10——负净资产几乎必然伴随巨大
+#:       正 ROE，正是上面那条推论；
+#:     - 但满足「净资产 ≤ 0 且 ROE > 10 且 PE > 0」的反例：**0 格**；
+#:     - 加过滤前后，候选集都是 **8,602 格**，逐格无差异。
+#:
+#:     它会在 ``pe_above < 0``（显式放行亏损公司）时**才**真正起作用——那时亏损公司不再被
+#:     PE 拦下，净资产为负的会带着巨大正 ROE 挤进排序（排序因子正是 ROE）。
+#:     保留它是为了让「净资产为正」成为一个**声明出来的前提**，而不是 PE 符号的偶然推论。
+#:     这条冗余关系有测试钉住：``test_the_equity_filter_only_bites_when_negative_pe_is_allowed``。
+EQUITY = "equity"
+
 #: 本模块产出的字段，按构造顺序。给调用方**显式声明**用（与 ``SCREEN_FIELDS`` 同一精神）。
-VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG, MARKET_CAP, ROE)
+VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG, MARKET_CAP, ROE, EQUITY)
 
 #: 百分位的默认窗口（交易日）——约 4 年。
 DEFAULT_WINDOW = 1000
@@ -192,12 +222,16 @@ def return_on_equity(profit_ttm: pd.DataFrame, equity: pd.DataFrame) -> pd.DataF
 
 @dataclass(frozen=True)
 class Valuation:
-    """三个估值序列（都是 **date × 标的** 的标的宽表，与价格同日对齐）。
+    """估值序列（都是 **date × 标的** 的标的宽表，与价格同日对齐）。
 
     属性:
         pe: 动态PE。
         pe_percentile: PE 百分位，``[0, 1]``。
         peg: PEG。
+        market_cap: 总市值（元）。
+        roe: ROE，**百分数**。
+        equity: 归母股东权益（净资产，元）。用来做 ``equity > 0`` 的下界过滤，
+            见 :data:`EQUITY`。
     """
 
     pe: pd.DataFrame
@@ -205,6 +239,7 @@ class Valuation:
     peg: pd.DataFrame
     market_cap: pd.DataFrame
     roe: pd.DataFrame
+    equity: pd.DataFrame
 
     def as_fields(self) -> dict[str, pd.DataFrame]:
         """字段名 → 标的宽表，供装进 :class:`~mbt.data.panel.Panel` 或交给策略。"""
@@ -214,6 +249,7 @@ class Valuation:
             PEG: self.peg,
             MARKET_CAP: self.market_cap,
             ROE: self.roe,
+            EQUITY: self.equity,
         }
 
 
@@ -223,7 +259,7 @@ def build_valuation(
     *,
     window: int = DEFAULT_WINDOW,
 ) -> Valuation:
-    """由收盘价与按期财务算出三个估值序列。
+    """由收盘价与按期财务算出估值序列。
 
     参数:
         close: **date × 标的** 的收盘价标的宽表。索引须升序，列即标的。
@@ -232,7 +268,7 @@ def build_valuation(
         window: 百分位窗口，默认 :data:`DEFAULT_WINDOW`。
 
     返回:
-        :class:`Valuation`。三个序列与 ``close`` 的索引、列完全一致。
+        :class:`Valuation`。各序列与 ``close`` 的索引、列完全一致。
 
     复杂度是每个标的「一遍公告 + 一遍交易日」：公告是几十条，交易日是几千条，故实际代价由
     交易日决定（全市场 5000 标的 × 6400 日 ≈ 3200 万格，numpy 支撑下可接受）。
@@ -258,6 +294,7 @@ def build_valuation(
         peg=price_earnings_growth(pe, growth),
         market_cap=close * shares,
         roe=return_on_equity(ttm, equity),
+        equity=equity,
     )
 
 
