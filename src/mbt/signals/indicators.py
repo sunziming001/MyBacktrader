@@ -4,12 +4,14 @@
 各写一份。窗口一律取「当根及其之前 n-1 根」且 ``min_periods=n``：既不含未来信息，也不把
 不足窗口的短缺当成数值——缺失就让它缺失（ADR-0005 的缺口纪律）。
 
-本模块多数函数取**单字段**的标的宽表；``atr`` 是第一个需要**跨字段**的，故它取
+本模块多数函数取**单字段**的标的宽表；``atr`` 与 ``kdj`` 需要**跨字段**，故它们取
 :class:`~mbt.data.panel.Panel`。跨字段的信号**返回标的宽表**（ADR-0009）：消费方向与其余的
 指标完全一样（列 = 时序、行 = 截面），只是输入多了两张表。
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -23,9 +25,152 @@ def sma(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     return check_symbol_frame(prices).rolling(n, min_periods=n).mean()
 
 
+def _recursive_smooth_series(values: pd.Series, alpha: float) -> pd.Series:
+    """对**单列**做分段递推平滑：``Y₁ = X₁``，其后 ``Y = α·X + (1 − α)·Y_prev``。
+
+    缺失把序列切成若干段，每段以该段**第一个可用值**播种；缺失处一律是缺失。
+
+    这里逐段调用 ``ewm`` 而不是整列调用一次，理由与 :func:`_wilder_smooth` 相同，且已实测：
+    整列 ``ewm(adjust=False)`` 遇到缺失会**沿用前值**——``[1, 2, NaN, 4, 5]`` 在 ``span=2``
+    下的输出是 ``[1, 1.667, 1.667, 3.667, 4.556]``，第 3 位不是缺失而是上一根的值。那等于把
+    停牌日伪造成一个**有**指标值的交易日（ADR-0005）。
+    """
+    valid = values.notna()
+    if not valid.any():
+        return values
+
+    run_id = (~valid).cumsum()
+    out = pd.Series(np.nan, index=values.index, dtype=float)
+    for _, run in values[valid].groupby(run_id[valid]):
+        out.loc[run.index] = run.ewm(alpha=alpha, adjust=False).mean()
+    return out
+
+
+def ema(prices: pd.DataFrame, n: int) -> pd.DataFrame:
+    """n 日指数移动平均，**通达信口径**：``EMA_t = (2·C_t + (n−1)·EMA_{t−1}) ÷ (n+1)``。
+
+    与 :func:`sma` 的口径差别是**刻意的，不要对齐**：
+
+    - ``sma`` 是尾随窗口均值，窗口不满处为**缺失**（``min_periods=n``）；
+    - ``ema`` 是递推平滑，**没有「窗口填满」这一刻**。通达信与行情软件都以**首根**播种
+      （``EMA₁ = C₁``）并一路递推；要对齐图上的线就必须照此口径。若也按 ``min_periods=n``
+      处理，前 n−1 根会缺失，且首个非缺失值也与图上不同。
+
+    代价要写明：它在前若干根的取值受**序列起点**影响——那不是数据的性质，是本函数的口径。
+    故凡与长窗口均线（如 114 日均线）同时出现的信号，其可用起点由**那个长窗口**决定，
+    本函数不额外设门槛。
+
+    缺失处一律是缺失：没有收盘价就没有 EMA。缺口把序列切成若干段，每段以该段**第一个可用值**
+    播种——与 :func:`atr` 是同一条缺口纪律，而**不是**「沿用前值续算」：把跨越停牌的递推连起来
+    等于假装停牌期间也有收盘价（ADR-0005）。行情软件上没有缺口行，故只在**无缺口**的序列上
+    两种口径一致——也就是说「字面复刻图上的线」这件事，在有空缺的标的身上并不成立。
+    """
+    return check_symbol_frame(prices).apply(_recursive_smooth_series, alpha=2.0 / (n + 1))
+
+
 def rolling_max(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     """n 日最高价，含当根；窗口不足处为缺失值。"""
     return check_symbol_frame(prices).rolling(n, min_periods=n).max()
+
+
+def rolling_min(prices: pd.DataFrame, n: int) -> pd.DataFrame:
+    """n 日最低价，含当根；窗口不足处为缺失值。
+
+    与 :func:`rolling_max` 对称。喂 ``low`` 字段即得「近 n 根的**前低**」——止损位要用的量
+    （见 ``CONTEXT.md`` 的**前低**）；喂收盘价得的是收盘价的低点，两者不是一回事。
+    """
+    return check_symbol_frame(prices).rolling(n, min_periods=n).min()
+
+
+def white_line(prices: pd.DataFrame, n: int) -> pd.DataFrame:
+    """**白线**：``EMA(EMA(C, n), n)``——双重指数平滑，行情软件图上的一条快线。
+
+    名字取自图上线的颜色，不是算法性质；同名术语见 ``CONTEXT.md``。``n`` 由调用方给定
+    （常见取 10）而不设默认值：默认值会让「用了哪个口径」从调用处消失。
+
+    外层 EMA 吃到内层在缺口处留下的缺失，故缺口会把两层的递推都切开——与 :func:`ema`
+    是同一条缺口纪律。
+    """
+    return ema(ema(prices, n), n)
+
+
+def yellow_line(prices: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataFrame:
+    """**黄线**：若干条 ``MA(C, w)`` 的**等权均值**，行情软件图上的一条慢线。
+
+    名字取自图上线的颜色，不是算法性质；同名术语见 ``CONTEXT.md``。``windows`` 由调用方
+    给定（常见取 ``(14, 28, 57, 114)``）而不设默认值，理由同 :func:`white_line`。
+
+    均值用**简单平均**而非加权：图上那四条线是等权的。任一条 MA 在当根缺失（窗口不满或
+    数据有缺口），结果即缺失——NaN 会自然沿加法传播，不必额外判空。
+    """
+    if not windows:
+        raise ValueError("windows 不能为空：至少需要一条均线才谈得上均值")
+    return sum(sma(prices, w) for w in windows) / len(windows)
+
+
+class KDJ(NamedTuple):
+    """KDJ 的三条线，各是一条标的宽表。
+
+    三条线**各自**都是合法的指标（列 = 时序、行 = 截面），故这个结构不破坏「指标返回
+    标的宽表」的契约（ADR-0009）——它只是把一次计算里的三个结果一起交回，省得调用方
+    为了拿 ``j`` 而把 ``k``、``d`` 算两遍。
+    """
+
+    k: pd.DataFrame
+    d: pd.DataFrame
+    j: pd.DataFrame
+
+
+def kdj(panel: Panel, n: int, m1: int, m2: int) -> KDJ:
+    """KDJ 指标，**通达信口径**：
+
+    .. code-block:: text
+
+        RSV_t = (C_t − LLV(L, n)) ÷ (HHV(H, n) − LLV(L, n)) × 100
+        K_t   = SMA(RSV, m1, 1)      # 即 α = 1/m1 的递推平滑
+        D_t   = SMA(K,   m2, 1)
+        J_t   = 3·K_t − 2·D_t
+
+    其中 ``SMA(X, N, M) = (M·X + (N−M)·Y_prev) ÷ N`` 是通达信的递推均值，与本模块的
+    :func:`ema` 是同一族（``α = M/N``）——**不是**移动平均。用简单均线算出的 K 与图上不同，
+    这条差别已被测试钉住。
+
+    参数:
+        panel: 须含 ``high`` / ``low`` / ``close`` 三个字段，且三者同日对齐
+            （对齐由 :class:`~mbt.data.panel.Panel` 保证）。
+        n / m1 / m2: 三个窗口，由调用方给出；KDJ 的常见取值为 ``9 / 3 / 3``，但这里不设
+            默认值——默认值会让「用了哪个口径」从调用处消失。
+
+    返回:
+        :class:`KDJ`（``k`` / ``d`` / ``j`` 各为一条标的宽表）。``j`` 不属于 ``[0, 100]``，
+        会跌破 0、也会超过 100，这是定义如此而非瑕疵。
+
+    三类缺失一律**缺失**，不填充：
+
+    - **窗口不满**（``min_periods=n``）：不足 n 根就无从谈最高/最低，故 RSV 缺失。与图上
+      的差别要写明：行情软件的 ``LLV``/``HHV`` 在不足 n 根时按**已有的**几根算，故它从首根
+      就有值；本项目的缺口纪律不给这种乐观答案。这段差异只影响序列开头 n−1 根，且递推会
+      在约 m1×5 根内把差别衰减掉。
+    - **分母为 0**：窗口内最高价等于最低价（一字板、长期停牌复牌）时 RSV 无定义。此处判
+      缺失而**不是**沿用前值——与图上「平盘时 KDJ 保持前值」的观感不同，取的是「不猜」。
+    - **数据缺口**：缺失把序列切成若干段，每段以第一个可用值播种，缺口处保持缺失
+      （与 :func:`_recursive_smooth_series` 同一纪律）。
+    """
+    high = check_symbol_frame(panel["high"])
+    low = check_symbol_frame(panel["low"])
+    close = check_symbol_frame(panel["close"])
+
+    highest = high.rolling(n, min_periods=n).max()
+    lowest = low.rolling(n, min_periods=n).min()
+    span = highest - lowest
+    # 分母为 0 时 RSV 无定义：先算出比值、再把分母非正的位置判为缺失，
+    # 免得 0/0 的 NaN 与「窗口不满」的 NaN 混为一谈。
+    rsv = (close - lowest) / span * 100.0
+    rsv = rsv.where(span > 0)
+
+    k = rsv.apply(_recursive_smooth_series, alpha=1.0 / m1)
+    d = k.apply(_recursive_smooth_series, alpha=1.0 / m2)
+    return KDJ(k=k, d=d, j=3.0 * k - 2.0 * d)
 
 
 def volume_ratio(volumes: pd.DataFrame, n: int) -> pd.DataFrame:

@@ -18,25 +18,110 @@ import pytest
 
 import mbt.signals as signals
 
+
+def swing_columns(frame):
+    """摆动点的四条输出并成一张表，好让判据**一次盖住全部四条**。
+
+    只盖 ``peak_price`` 是不够的：``peak_age`` 是**累加量**，最容易在实现里被写成「用未来
+    的根数」而只有它露馅。
+    """
+    found = signals.swings(frame, retracement=0.10)
+    return pd.concat(
+        {
+            "peak_price": found.peak_price,
+            "peak_age": found.peak_age,
+            "trough_price": found.trough_price,
+            "trough_age": found.trough_age,
+        },
+        axis=1,
+    )
+
+
+def kdj_lines(panel):
+    """KDJ 的三条线并成一张表，好让判据**一次盖住 k / d / j**，而不是只盖住 j。"""
+    lines = signals.kdj(panel, n=3, m1=3, m2=3)
+    return pd.concat({"k": lines.k, "d": lines.d, "j": lines.j}, axis=1)
+
+
+def volume_columns(frame):
+    """量能结构的三个比值并成一张表，好让判据**一次盖住全部三条**。"""
+    anchors = signals.swings(frame, retracement=0.05)
+    structure = signals.volume_structure(frame, anchors, edge_bars=2, base_bars=3)
+    return pd.concat(
+        {
+            "surge_ratio": structure.surge_ratio,
+            "top_ratio": structure.top_ratio,
+            "pullback_ratio": structure.pullback_ratio,
+        },
+        axis=1,
+    )
+
+
 #: 取**标的宽表**的信号（``DataFrame → DataFrame``）。
 SYMBOL_FRAME_SIGNALS = [
     ("sma", lambda frame: signals.sma(frame, n=3)),
+    ("ema", lambda frame: signals.ema(frame, n=3)),
     ("rolling_max", lambda frame: signals.rolling_max(frame, n=3)),
+    ("rolling_min", lambda frame: signals.rolling_min(frame, n=3)),
     ("volume_ratio", lambda frame: signals.volume_ratio(frame, n=3)),
+    ("white_line", lambda frame: signals.white_line(frame, n=3)),
+    ("yellow_line", lambda frame: signals.yellow_line(frame, windows=(2, 3))),
     ("new_high", lambda frame: signals.new_high(frame, n=3)),
     ("above_ma", lambda frame: signals.above_ma(frame, n=3)),
+    ("above_white", lambda frame: signals.above_white(frame, n=3, margin=0.08)),
+    ("above_yellow", lambda frame: signals.above_yellow(frame, windows=(2, 3))),
+    ("below_white", lambda frame: signals.below_white(frame, n=3)),
     ("ma_cross_up", lambda frame: signals.ma_cross_up(frame, n=3)),
     ("rising_streak", lambda frame: signals.rising_streak(frame, n=3)),
     ("volume_surge", lambda frame: signals.volume_surge(frame, k=2.0, n=3)),
+    ("white_above_yellow", lambda frame: signals.white_above_yellow(frame, n=3, windows=(2, 3))),
+    (
+        "below_yellow_streak",
+        lambda frame: signals.below_yellow_streak(frame, n=3, windows=(2, 3), days=2),
+    ),
     ("momentum", lambda frame: signals.momentum(frame, n=3)),
     ("distance_to_high", lambda frame: signals.distance_to_high(frame, n=3)),
+    ("yellow_proximity", lambda frame: signals.yellow_proximity(frame, windows=(2, 3))),
+    ("swings", swing_columns),
+    ("volume_structure", volume_columns),
+    (
+        "volume_contraction",
+        lambda frame: signals.volume_contraction(
+            frame,
+            signals.swings(frame, retracement=0.05),
+            edge_bars=2,
+            base_bars=3,
+            min_surge=1.0,
+            max_pullback=10.0,
+        ),
+    ),
+    (
+        "pullback_after_advance",
+        lambda frame: signals.pullback_after_advance(
+            frame,
+            retracement=0.10,
+            min_advance=0.10,
+            min_drop=0.01,
+            max_drop=0.90,
+            min_peak_age=0,
+            max_peak_age=999,
+        ),
+    ),
 ]
+
 
 #: 取**行情面板**的信号（跨字段，仍返回标的宽表）。
 PANEL_SIGNALS = [
     ("atr", lambda panel: signals.atr(panel, n=3)),
+    ("kdj", kdj_lines),
+    ("j_below", lambda panel: signals.j_below(panel, threshold=50.0, n=3, m1=3, m2=3)),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
 ]
+
+#: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /
+#: 三个量能比值），本身不产生数值序列，故没有可截断重算的「输出」——分别由上面的
+#: ``kdj`` / ``swings`` / ``volume_structure`` 条目一并覆盖。
+NON_SIGNAL_EXPORTS = {"KDJ", "Swings", "VolumeStructure"}
 
 #: 八根 K 线、两个标的，含一处停牌造成的缺失——缺失正是因果性最容易出错的地方。
 SYMBOL_FRAME_VALUES = {
@@ -57,11 +142,16 @@ PANEL_VALUES = {
     "close": SYMBOL_FRAME_VALUES,
 }
 
+#: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /
+#: 三个量能比值），本身不产生数值序列，故没有可截断重算的「输出」——分别由上面的
+#: ``kdj`` / ``swings`` / ``volume_structure`` 条目一并覆盖。
+NON_SIGNAL_EXPORTS = {"KDJ", "Swings", "VolumeStructure"}
+
 
 def test_every_public_signal_is_covered_here():
     """公开了什么就要检查什么——否则新增信号会悄悄绕过契约测试。"""
     covered = {name for name, _ in SYMBOL_FRAME_SIGNALS + PANEL_SIGNALS}
-    assert covered == set(signals.__all__)
+    assert covered == set(signals.__all__) - NON_SIGNAL_EXPORTS
 
 
 @pytest.mark.parametrize("name,run", SYMBOL_FRAME_SIGNALS, ids=[n for n, _ in SYMBOL_FRAME_SIGNALS])

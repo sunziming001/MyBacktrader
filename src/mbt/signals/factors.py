@@ -14,7 +14,7 @@ import pandas as pd
 
 from mbt.data.panel import Panel
 from mbt.signals._symbol_frame import check_symbol_frame
-from mbt.signals.indicators import rolling_max
+from mbt.signals.indicators import rolling_max, yellow_line
 
 
 def drawdown_from_high(panel: Panel, n: int) -> pd.DataFrame:
@@ -62,3 +62,39 @@ def distance_to_high(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     排序时不必为每个因子记住方向，从而不必在每处都猜一次符号。
     """
     return check_symbol_frame(prices) / rolling_max(prices, n) - 1.0
+
+
+def yellow_proximity(prices: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataFrame:
+    """**黄线贴近度**：``黄线 ÷ |收盘 − 黄线|``——**越大离黄线越近**。
+
+    它天然满足本层「越大越靠前」的约定，故可直接当排序因子交给
+    :class:`~mbt.screen.Screen`，不必翻符号：分母趋于 0 时它趋于**无穷**，而「贴着黄线」
+    正是这个因子要排在最前的状态。
+
+    与 :func:`distance_to_high` 的关系要说明：那个因子度量「离高点多远」，这个度量「离
+    **均线**多近」。买点本来就要求在回调中贴近黄线（``CONTEXT.md`` 的**黄线**），故排序用
+    后者比「跌得最深」更贴合这套规则——跌得深只说明跌得多，不代表回到了支撑上。
+
+    .. warning::
+
+        **它度量的是「相对贴近度」，不是绝对距离。** 分子分母同量纲，故结果对价格整体缩放
+        不变——等价于 ``1 ÷ (|收盘 − 黄线| ÷ 黄线)``，即相对距离的倒数。故两只股票即使与各自
+        黄线的**绝对**距离相同，黄线更高的那只因子更大。这是公式本身的性质，不是实现细节；
+        要按绝对距离排序应当另写一个因子（本项目不提供，因为价格量纲上的绝对距离在横截面上
+        没有可比性）。
+
+        **它取绝对值，故不区分站上还是跌破黄线。** 这也是刻意的：因子是**横截面**上的排序
+        依据，而「在黄线哪一侧」是**过滤信号**该管的事（``white_above_yellow``）。把方向塞
+        进因子会让同一个条件在两层各说一遍。
+
+    两处退化要写明：
+
+    - 收盘**恰好**等于黄线时分母为 0，结果为**正无穷**——数学上正确（它是最近的），且与
+      :func:`~mbt.signals.indicators.volume_ratio` 在前 n 根均为零成交时返回无穷同一先例。
+      消费方按大小排序即可，无需特判。
+    - 黄线为 0（或负）时分子退化，结果不再有「贴近度」的含义。价格不会为 0，故这在真实
+      行情上不出现；序列开头窗口不足时黄线是**缺失**，结果随之缺失，而 ``Screen`` 会把缺失
+      的标的排除在取前 N 之外（与其余因子一致）。
+    """
+    line = yellow_line(prices, windows)
+    return line / (check_symbol_frame(prices) - line).abs()

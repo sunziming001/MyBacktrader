@@ -9,7 +9,18 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from mbt.signals import atr, rolling_max, sma, volume_ratio
+from mbt.signals import (
+    KDJ,
+    atr,
+    ema,
+    kdj,
+    rolling_max,
+    rolling_min,
+    sma,
+    volume_ratio,
+    white_line,
+    yellow_line,
+)
 
 
 def test_sma_averages_the_trailing_window(symbol_frame):
@@ -296,3 +307,270 @@ def test_atr_of_a_series_shorter_than_the_window_is_all_missing_not_an_error(pan
     )
 
     assert got["sh600000"].isna().all()
+
+
+# --- EMA 与提示 1、2 的两条线 ---------------------------------------------------
+
+
+def test_ema_seeds_at_the_first_bar_like_the_charting_software_does(symbol_frame):
+    """EMA **以首根播种**（EMA_1 = C_1），而不是像 sma 那样把前 n-1 根留空。
+
+    手算（n=2，alpha = 2/3）：1 -> 5/3 -> 23/9 -> 95/27 -> 365/81。
+    """
+    prices = symbol_frame({"sh600000": [1.0, 2.0, 3.0, 4.0, 5.0]})
+
+    got = ema(prices, n=2)["sh600000"]
+
+    assert got.iloc[0] == pytest.approx(1.0)
+    assert got.iloc[1] == pytest.approx(5.0 / 3.0)
+    assert got.iloc[2] == pytest.approx(23.0 / 9.0)
+    assert got.iloc[3] == pytest.approx(95.0 / 27.0)
+    assert got.iloc[4] == pytest.approx(365.0 / 81.0)
+
+
+def test_ema_is_not_the_simple_average_of_the_window(symbol_frame):
+    """递推平滑与尾随均值不是一回事——这条能真正区分两种口径。
+
+    同一组样本上 sma(2) 为 [缺失, 1.5, 2.5, 3.5, 4.5]，与本函数的首值不同、其后也不等。
+    """
+    prices = symbol_frame({"sh600000": [1.0, 2.0, 3.0, 4.0, 5.0]})
+
+    got = ema(prices, n=2)["sh600000"]
+    averaged = sma(prices, n=2)["sh600000"]
+
+    assert pd.isna(averaged.iloc[0]) and not pd.isna(got.iloc[0])
+    assert got.iloc[3] != pytest.approx(averaged.iloc[3])
+
+
+def test_ema_keeps_a_gap_missing_and_re_seeds_after_it(symbol_frame):
+    """缺口当根必须是**缺失**，其后**重新播种**。
+
+    整列 ewm 会把缺口位置填成上一根的值（已实测：span=2 下 [1,2,NaN,4,5] 得到
+    [1, 1.667, 1.667, 3.667, 4.556]，第 3 位不是缺失）——那是把停牌日伪造成有指标值的
+    交易日。故这里同时钉两条：缺口处缺失，且缺口之后以 4.0 重新播种（沿用前值会得到别的数）。
+    """
+    nan = float("nan")
+    prices = symbol_frame({"sh600000": [1.0, 2.0, nan, 4.0, 5.0]})
+
+    got = ema(prices, n=2)["sh600000"]
+
+    assert pd.isna(got.iloc[2]), "缺口处沿用了前值——那是填充，不是缺失"
+    assert got.iloc[3] == pytest.approx(4.0)
+    assert got.iloc[4] == pytest.approx(14.0 / 3.0)
+
+
+def test_ema_of_an_all_missing_series_stays_missing(symbol_frame):
+    """全为缺失值的序列不产生数值，也不被填充（ADR-0005 的缺口纪律）。"""
+    nan = float("nan")
+    prices = symbol_frame({"sh600000": [nan, nan, nan]})
+
+    assert ema(prices, n=2)["sh600000"].isna().all()
+
+
+def test_white_line_collapses_to_the_close_at_window_one(symbol_frame):
+    """n=1 时 alpha=1，两层都不改变输入，故白线等于收盘价本身。
+
+    这条同时钉住「它是**两层** EMA」：单层 EMA 在 n=1 下也是收盘价，故再加一条 n>1 的滞后断言。
+    """
+    prices = symbol_frame({"sh600000": [1.0, 2.0, 3.0, 4.0]})
+
+    assert white_line(prices, n=1)["sh600000"].tolist() == pytest.approx([1.0, 2.0, 3.0, 4.0])
+
+    got = white_line(prices, n=2)["sh600000"]
+    assert got.iloc[0] == pytest.approx(1.0)
+    assert got.iloc[3] < 4.0
+    # 两次平滑比一次更滞后，故白线低于单层 EMA。
+    assert got.iloc[3] < ema(prices, n=2)["sh600000"].iloc[3]
+
+
+def test_yellow_line_is_the_equal_weighted_average_of_its_mas(symbol_frame):
+    """[1,2,3,4] 上 windows=(2,3)：MA2=[缺失,1.5,2.5,3.5]、MA3=[缺失,缺失,2,3]，
+    故均值为 [缺失,缺失,2.25,3.25]。等权与加权在这里得出的数不同，故这条能区分两者。
+    """
+    prices = symbol_frame({"sh600000": [1.0, 2.0, 3.0, 4.0]})
+
+    got = yellow_line(prices, windows=(2, 3))["sh600000"]
+
+    assert pd.isna(got.iloc[0])
+    assert pd.isna(got.iloc[1])
+    assert got.iloc[2] == pytest.approx(2.25)
+    assert got.iloc[3] == pytest.approx(3.25)
+
+
+def test_yellow_line_stays_missing_until_its_longest_window_is_full(symbol_frame):
+    """任一条均线缺失则结果缺失，故黄线的可用起点由**最长**那个窗口决定。"""
+    prices = symbol_frame({"sh600000": [1.0, 2.0, 3.0, 4.0]})
+
+    got = yellow_line(prices, windows=(2, 4))["sh600000"]
+
+    assert pd.isna(got.iloc[0]) and pd.isna(got.iloc[1]) and pd.isna(got.iloc[2])
+    assert got.iloc[3] == pytest.approx((3.5 + 2.5) / 2.0)
+
+
+def test_yellow_line_rejects_an_empty_window_list(symbol_frame):
+    """没有均线就谈不上均值；静默返回 0 会让下游把「没算」当成「算出来是 0」。"""
+    with pytest.raises(ValueError, match="不能为空"):
+        yellow_line(symbol_frame({"sh600000": [1.0, 2.0]}), windows=())
+
+
+# --- KDJ（提示 3 的 J 值） -----------------------------------------------------
+
+
+def kdj_panel(panel):
+    """手算样本（n=3）：每一根的窗口内高低差都可直接手算。
+
+    RSV：r2=(11-9)/(12-9)=2/3、r3=(10-9)/(12-9)=1/3、r4=(12-10)/(12-10)=1。
+    """
+    return panel(
+        {
+            "high": {"sh600000": [10.0, 11.0, 12.0, 11.0, 12.0]},
+            "low": {"sh600000": [9.0, 9.0, 10.0, 10.0, 11.0]},
+            "close": {"sh600000": [10.0, 10.0, 11.0, 10.0, 12.0]},
+        }
+    )
+
+
+def test_kdj_matches_the_hand_computed_values(panel):
+    """手算锁定通达信口径（n=m1=m2=3）：K=(X+2K_prev)/3，D=(K+2D_prev)/3，J=3K-2D。
+
+    r2 播种 K=D=2/3*100；其后 K3=(1+2*2)/3=5/9*100、K4=(1+2*5/9)/3=70.370...；
+    D3=(5/9+2*2/3)/3=17/27*100、D4=(19/27+2*17/27)/3=65.432...；J3=40.740...、J4=80.246...。
+    """
+    lines = kdj(kdj_panel(panel), n=3, m1=3, m2=3)
+
+    k = lines.k["sh600000"]
+    d = lines.d["sh600000"]
+    j = lines.j["sh600000"]
+
+    assert pd.isna(k.iloc[0]) and pd.isna(k.iloc[1])
+    assert k.iloc[2] == pytest.approx(200.0 / 3.0)
+    assert k.iloc[3] == pytest.approx(500.0 / 9.0)
+    assert k.iloc[4] == pytest.approx(1900.0 / 27.0)
+
+    assert d.iloc[2] == pytest.approx(200.0 / 3.0)
+    assert d.iloc[3] == pytest.approx(1700.0 / 27.0)
+    assert d.iloc[4] == pytest.approx(5300.0 / 81.0)
+
+    assert j.iloc[2] == pytest.approx(200.0 / 3.0)
+    assert j.iloc[3] == pytest.approx(1100.0 / 27.0)
+    assert j.iloc[4] == pytest.approx(6500.0 / 81.0)
+
+
+def test_kdj_uses_the_recursive_tdx_mean_not_a_moving_average(panel):
+    """K 是递推均值，**不是** RSV 的移动平均——两者在这组样本上必须可区分。
+
+    简单 3 根均线版会给出 mean(2/3, 1/3, 1)*100 = 66.67，而通达信口径是 70.370…
+    """
+    lines = kdj(kdj_panel(panel), n=3, m1=3, m2=3)
+
+    assert lines.k["sh600000"].iloc[4] != pytest.approx(200.0 / 3.0)
+
+
+def test_kdj_is_missing_while_the_window_is_not_full(panel):
+    """窗口不满 n 根就无从谈最高/最低，故 RSV 与三条线一律缺失。
+
+    与图上的差别要写明：行情软件的 LLV/HHV 在不足 n 根时按已有的几根算，故它从首根就有值；
+    本项目的缺口纪律不给这种乐观答案（ADR-0005）。
+    """
+    lines = kdj(kdj_panel(panel), n=3, m1=3, m2=3)
+
+    for series in (lines.k, lines.d, lines.j):
+        assert pd.isna(series["sh600000"].iloc[0])
+        assert pd.isna(series["sh600000"].iloc[1])
+
+
+def test_kdj_is_missing_when_the_window_has_no_range(panel):
+    """窗口内最高价等于最低价（一字板、长期停牌复牌）时 RSV 分母为 0，三条线一律缺失。
+
+    此处刻意**不**沿用前值：沿用会把一个没有波幅的窗口说成有 KDJ 值。
+    """
+    flat = panel(
+        {
+            "high": {"sh600000": [5.0, 5.0, 5.0, 5.0]},
+            "low": {"sh600000": [5.0, 5.0, 5.0, 5.0]},
+            "close": {"sh600000": [5.0, 5.0, 5.0, 5.0]},
+        }
+    )
+
+    lines = kdj(flat, n=3, m1=3, m2=3)
+
+    assert lines.k["sh600000"].isna().all()
+    assert lines.d["sh600000"].isna().all()
+    assert lines.j["sh600000"].isna().all()
+
+
+def test_kdj_re_seeds_after_a_gap_instead_of_carrying_the_previous_value(panel):
+    """缺口把序列切成两段，第二段以该段第一个可用值播种。
+
+    样本（n=3）：第 4 根缺失。缺口后到第 7 根才凑满一个窗口，RSV=100，故 K 在那一根为
+    **100**（重新播种）；若把跨缺口的递推连起来，会得到 2/3*66.67+1/3*100 ≈ 77.78。
+    """
+    nan = float("nan")
+    gapped = panel(
+        {
+            "high": {"sh600000": [10.0, 11.0, 12.0, nan, 12.0, 13.0, 14.0]},
+            "low": {"sh600000": [9.0, 9.0, 10.0, nan, 11.0, 12.0, 13.0]},
+            "close": {"sh600000": [10.0, 10.0, 11.0, nan, 12.0, 12.5, 14.0]},
+        }
+    )
+
+    k = kdj(gapped, n=3, m1=3, m2=3).k["sh600000"]
+
+    assert k.iloc[2] == pytest.approx(200.0 / 3.0)
+    assert k.iloc[3:6].isna().all()
+    assert k.iloc[6] == pytest.approx(100.0)
+
+
+def test_kdj_returns_a_symbol_frame_per_line_with_the_usual_shape_and_dtype(panel):
+    """三条线**各自**都是合法的标的宽表（ADR-0009）：列、索引、dtype 与输入一致。"""
+    lines = kdj(kdj_panel(panel), n=3, m1=3, m2=3)
+
+    assert isinstance(lines, KDJ)
+    for series in (lines.k, lines.d, lines.j):
+        assert list(series.columns) == ["sh600000"]
+        assert series.index.equals(lines.k.index)
+        assert all(dtype.kind == "f" for dtype in series.dtypes)
+
+
+def test_kdj_rejects_a_non_monotonic_index_like_the_other_indicators_do():
+    """契约由所有公开函数共同遵守，跨字段的也不例外。"""
+    from mbt.data import Panel
+
+    idx = pd.to_datetime(["2024-01-03", "2024-01-02", "2024-01-04"])
+    prices = pd.DataFrame({"sh600000": [10.0, 11.0, 12.0]}, index=idx)
+
+    with pytest.raises(ValueError, match="升序"):
+        kdj(Panel({"high": prices, "low": prices, "close": prices}), n=2, m1=3, m2=3)
+
+
+def test_rolling_min_covers_the_trailing_n_bars_including_the_current_one(symbol_frame):
+    """N 日最低价：窗口不足处为缺失；窗口内取最小，含当根。喂 ``low`` 字段即是「前低」。"""
+    prices = symbol_frame({"sh600000": [5.0, 3.0, 4.0, 1.0]})
+
+    got = rolling_min(prices, n=2)["sh600000"]
+
+    assert pd.isna(got.iloc[0])
+    assert got.iloc[1] == pytest.approx(3.0)
+    assert got.iloc[2] == pytest.approx(3.0)
+    assert got.iloc[3] == pytest.approx(1.0)
+
+
+def test_rolling_min_over_an_all_missing_window_stays_missing(symbol_frame):
+    """全为缺失值的窗口不产生数值，也不被填充（ADR-0005 的缺口纪律）。"""
+    nan = float("nan")
+    prices = symbol_frame({"sh600000": [nan, nan, nan]})
+
+    assert rolling_min(prices, n=2)["sh600000"].isna().all()
+
+
+def test_rolling_min_is_not_the_min_of_the_closes(symbol_frame):
+    """「前低」用的是 ``low``，不是收盘价的最小值——两者在带下影线的 K 线上不同。
+
+    这一条把口径钉死：止损位若按收盘价的最低价算，在有长下影的样本上会**偏高**，
+    于是止损被触发得更早。
+    """
+    lows = symbol_frame({"sh600000": [10.0, 7.0, 9.0, 8.0]})
+    closes = symbol_frame({"sh600000": [10.5, 9.5, 9.6, 8.5]})
+
+    assert rolling_min(lows, n=3)["sh600000"].iloc[3] == pytest.approx(7.0)
+    assert rolling_min(closes, n=3)["sh600000"].iloc[3] == pytest.approx(8.5)
