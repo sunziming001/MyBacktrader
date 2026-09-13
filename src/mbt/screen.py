@@ -33,10 +33,56 @@ from dataclasses import dataclass
 import pandas as pd
 
 from mbt.data.panel import Panel
+from mbt.signals import drawdown_from_high
 
 #: 组面板时提供给选股规则的字段。刻意**不含** ``amount``：它与信号无关，没有理由被带进
 #: 计算（ADR-0009 的「字段显式声明」）。这是一份**固定声明**的集合，不是从数据里推断的。
 SCREEN_FIELDS = ("open", "high", "low", "close", "volume")
+
+#: 「低估成长」策略用的跌幅信号字段名。
+#:
+#: 由 :func:`drawdown_fields` 产出，与 :func:`undervalued_growth_screen` 同在本模块——两者的
+#: 耦合是**局部**的，故名字写在一处即可，不必当参数传来传去。
+DRAWDOWN_FIELD = "drawdown_1y"
+
+#: 「一年」按**交易日**计，取 252（与 :data:`mbt.metrics.TRADING_DAYS_PER_YEAR` 的年化口径
+#: 一致）。刻意不用 365 个日历日：行情只在交易日有值，用日历日会让窗口长度随假期漂移。
+DRAWDOWN_LOOKBACK = 252
+
+#: 跌幅门槛，来自需求方的设定（「跌幅应该大于 42%」）。
+DRAWDOWN_THRESHOLD = 0.42
+
+#: 总市值门槛（元），来自需求方的设定（「市值应该大于 100 亿」）。100 亿 = 1e10 元。
+MIN_MARKET_CAP = 1e10
+
+
+def drawdown_fields(markets, *, lookback: int = DRAWDOWN_LOOKBACK) -> dict[str, pd.DataFrame]:
+    """由**完整**行情算出「近一年跌幅」信号，供 :func:`undervalued_growth_screen` 取用。
+
+    返回 ``{字段名: 标的宽表}``，可直接与估值信号合并后交给 ``Screen``（见
+    :func:`mbt.data.panel.with_signals`）。
+
+    .. warning::
+
+        **必须传完整行情，不能传已被 ``--start`` 截断的行情。** 跌幅要回看 ``lookback`` 个
+        交易日；若拿截断后的行情去算，回测开头那一段的窗口不足 → 全为缺失 → 过滤条件
+        （缺失取假）会把**开头整年的候选全部排除**，而且**不报错**。这与估值百分位的坑是
+        同一个（见 :func:`mbt.data.valuation.valuation_for`），故同样走「先算后截」：
+
+        1. 用**完整**行情算跌幅；
+        2. 用 :func:`mbt.data.panel.clip_fields` 截到回测区间。
+
+    参数:
+        markets: 一组 :class:`~mbt.data.market.MarketData`（**完整历史**）。
+        lookback: 回看的交易日数，默认 :data:`DRAWDOWN_LOOKBACK`。
+    """
+    from mbt.data.panel import assemble_panel
+
+    if not markets:
+        raise ValueError("算跌幅至少要有一个标的")
+    panel = assemble_panel(list(markets), ("high", "close"))
+    return {DRAWDOWN_FIELD: drawdown_from_high(panel, lookback)}
+
 
 #: 过滤器与排序因子的共同签名：**行情面板进、标的宽表出**。
 #:
@@ -199,6 +245,69 @@ def momentum_screen(window: int = 20, top_n: int = 10) -> Screen:
     return Screen(factor=lambda p: momentum(p["close"], window), top_n=top_n)
 
 
+def undervalued_growth_screen(
+    *,
+    percentile_below: float = 0.08,
+    pe_above: float = 0.0,
+    peg_below: float = 0.75,
+    peg_above: float = 0.0,
+    drawdown_above: float = DRAWDOWN_THRESHOLD,
+    min_market_cap: float = MIN_MARKET_CAP,
+    top_n: int = 5,
+) -> Screen:
+    """**低估成长**策略的买入条件（票据 #51、#52）。
+
+    这是「同一条件不必写两遍」的落点（ADR-0001）：回测用它当入场闸门（引擎的 ``screen``），
+    选股用它出候选清单（``mbt screen``），两边是**同一个对象**。
+
+    五个过滤条件：
+
+    - ``动态PE 百分位 < percentile_below`` —— 相对自身历史足够便宜；
+    - ``动态PE > pe_above`` —— 剔除亏损（负 PE 无估值含义）；
+    - ``peg_above < PEG < peg_below`` —— 增长要为正、且价格相对增长仍算便宜；
+    - ``一年内跌幅 > drawdown_above`` —— 从近一年的**最高价**回落足够深；
+    - ``总市值 > min_market_cap`` —— 剔除小盘股（默认 100 亿元）。
+
+    排序因子是**跌幅本身**：**跌得越深越靠前**。信号层的契约是「因子越大越靠前」，而跌幅
+    天然满足（越大跌得越深），故这里不必翻符号。
+
+    这些条件分别由估值信号（前三 + 市值）与 :func:`drawdown_fields`（跌幅）提供，调用方要
+    把两组信号都并进行情面板，见各函数的说明。
+
+    .. note::
+
+        **市值门槛是后加的（票据 #52）。** 把标的从 300 只抽样换成全市场后，「按跌幅最深排序
+        取前 5」选出来的**大量是小市值股票**，而它们最可能是价值陷阱或退市候选。实测那次
+        全市场回测的净值是 **−50.9%**（年化 −8.1%、回撤 77.9%），而同一策略在 300 只抽样上
+        是 +438%——候选池的大小把结论整个翻转了。市值门槛是针对这件事的直接手段。
+    """
+    from mbt.data.valuation import MARKET_CAP, PE, PE_PERCENTILE, PEG
+
+    def cheap(panel):
+        return panel[PE_PERCENTILE] < percentile_below
+
+    def profitable(panel):
+        return panel[PE] > pe_above
+
+    def growth_worth_paying(panel):
+        return (panel[PEG] > peg_above) & (panel[PEG] < peg_below)
+
+    def deeply_fallen(panel):
+        return panel[DRAWDOWN_FIELD] > drawdown_above
+
+    def big_enough(panel):
+        return panel[MARKET_CAP] > min_market_cap
+
+    def fall_depth(panel):
+        return panel[DRAWDOWN_FIELD]
+
+    return Screen(
+        filters=(cheap, profitable, growth_worth_paying, deeply_fallen, big_enough),
+        factor=fall_depth,
+        top_n=top_n,
+    )
+
+
 def valuation_screen(
     *,
     percentile_below: float = 0.08,
@@ -207,25 +316,11 @@ def valuation_screen(
     peg_above: float = 0.0,
     top_n: int = 5,
 ) -> Screen:
-    """内置的**估值筛选**买入条件：PE 百分位够低、PE 为正、PEG 在区间内，取最低估的前 N。
+    """**旧版**估值筛选（无跌幅条件、按百分位排序）。保留给对照实验用。
 
-    这是「同一条件不必写两遍」的落点（ADR-0001）：回测用它当入场闸门（引擎的 ``screen``），
-    选股用它出候选清单（``mbt screen``），两边是**同一个对象**。
-
-    三个过滤条件与需求一一对应：
-
-    - ``动态PE 百分位 < 8%`` —— 相对自身历史足够便宜；
-    - ``动态PE > 0`` —— 剔除亏损（负 PE 无估值含义）；
-    - ``0 < PEG < 0.75`` —— 增长要为正、且价格相对增长仍算便宜。
-
-    排序因子是 ``1 − 百分位``：**百分位越低越靠前**。信号层的契约是「因子越大越靠前」，故这里
-    把「低估程度」定义成 ``1 − 百分位``，而不是加一个反转开关——那个开关会让「因子一律同向」
-    的约定形同虚设（见 :class:`Screen` 的说明）。
-
-    .. note::
-
-        它只是一个**可用的起点**：三个阈值与 ``top_n`` 都直接来自需求方的设定，没有经过论证。
-        真正的口径应当由你自己在回测里检验后再改。
+    它与 :func:`undervalued_growth_screen` 的区别只有两处：少了跌幅过滤、排序因子是
+    ``1 − 百分位`` 而非跌幅。留着它是为了让「加跌幅条件、换排序因子」这件事**可被对照**——
+    否则改动前后的差异就无从归因。
     """
     from mbt.data.valuation import PE, PE_PERCENTILE, PEG
 

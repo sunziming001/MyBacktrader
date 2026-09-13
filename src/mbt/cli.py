@@ -113,9 +113,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument(
         "--screen",
-        choices=("none", "momentum", "valuation"),
+        choices=("none", "momentum", "undervalued_growth", "valuation"),
         default="none",
-        help="入场闸门：指名库里的一条选股规则（valuation 需 --cw-root）",
+        help="入场闸门：指名库里的一条选股规则（undervalued_growth 需 --cw-root；"
+        "valuation 是它的旧版，留给对照）",
     )
     backtest.add_argument(
         "--screen-top-n",
@@ -161,9 +162,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     screen.add_argument(
         "--screen",
-        choices=("momentum", "valuation"),
+        choices=("momentum", "undervalued_growth", "valuation"),
         default="momentum",
-        help="用哪条选股规则（valuation 需 --cw-root）。默认 momentum",
+        help="用哪条选股规则（undervalued_growth 需 --cw-root；valuation 是它的旧版）"
+        "。默认 momentum",
     )
     screen.add_argument(
         "--screen-top-n",
@@ -394,15 +396,19 @@ def _screen_and_signals(args, loaded, full_markets, stdout):
     if name == "momentum":
         return momentum_screen(window=20, top_n=top_n), None
 
-    if name != "valuation":
+    if name not in ("undervalued_growth", "valuation"):
         raise ValueError(f"未知的 --screen {name!r}")
 
+    # `valuation` 是旧名（无跌幅条件、按百分位排序），留给对照实验。
+    legacy = name == "valuation"
+
     if not args.cw_root:
-        raise ValueError("--screen valuation 需要 --cw-root：估值的每股收益来自财务数据")
+        raise ValueError(f"--screen {name} 需要 --cw-root：估值的每股收益来自财务数据")
 
     from mbt.data.fundamental import CwDataSource
-    from mbt.data.valuation import clip_fields, valuation_for
-    from mbt.screen import valuation_screen
+    from mbt.data.panel import clip_fields
+    from mbt.data.valuation import valuation_for
+    from mbt.screen import drawdown_fields, undervalued_growth_screen, valuation_screen
 
     # 传的是**原始**行情：PE 要用当时的成交价，而后复权价以首根为基准放大（见 valuation_for）。
     valuation = valuation_for(full_markets, CwDataSource(args.cw_root))
@@ -411,14 +417,26 @@ def _screen_and_signals(args, loaded, full_markets, stdout):
         f"估值：{covered}/{len(full_markets)} 个标的算出了动态PE（其余无可用财报）",
         file=stdout,
     )
+
+    signals = dict(valuation.as_fields())
+    if not legacy:
+        # 跌幅要回看 252 个交易日，故同样**先算后截**（见 drawdown_fields）。
+        signals.update(drawdown_fields(full_markets))
+        covered_fall = int(signals["drawdown_1y"].notna().any().sum())
+        print(
+            f"跌幅：{covered_fall}/{len(full_markets)} 个标的有满一年的回看窗口",
+            file=stdout,
+        )
+
     signals = clip_fields(
-        valuation.as_fields(),
+        signals,
         loaded.markets,
         # 选股命令没有 --start/--end（评估日由 --as-of 承担），故用 getattr 兜底。
         start=getattr(args, "start", None),
         end=getattr(args, "end", None),
     )
-    return valuation_screen(top_n=top_n), signals
+    factory = valuation_screen if legacy else undervalued_growth_screen
+    return factory(top_n=top_n), signals
 
 
 def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:

@@ -21,6 +21,7 @@ import pytest
 from mbt.data.errors import MarketDataError
 from mbt.data.fundamental import FinancialRecord
 from mbt.data.valuation import (
+    MARKET_CAP,
     PE,
     PE_PERCENTILE,
     PEG,
@@ -257,7 +258,29 @@ def test_as_fields_exposes_the_documented_names():
     valuation = build_valuation(frame([10.0] * 3), FakeFinancials())
 
     assert tuple(valuation.as_fields()) == VALUATION_FIELDS
-    assert (PE, PE_PERCENTILE, PEG) == VALUATION_FIELDS
+    assert (PE, PE_PERCENTILE, PEG, MARKET_CAP) == VALUATION_FIELDS
+
+
+def test_market_cap_is_shares_times_price():
+    """市值 = 总股本 × 收盘价，**用原始价**（与 PE 同一理由：后复权价会把它放大）。
+
+    手算：10 亿股 × 20 元 = **200 亿元**。
+    """
+    financials = FakeFinancials(
+        sh600000=[record(dt.date(2023, 12, 31), dt.date(2024, 1, 1), shares=1_000_000_000.0)]
+    )
+
+    valuation = build_valuation(frame([20.0] * 3), financials)
+
+    assert valuation.market_cap.iloc[0, 0] == pytest.approx(20.0 * 1_000_000_000.0)
+
+
+def test_a_symbol_without_shares_data_gets_a_missing_market_cap():
+    """取不到总股本 → 市值缺失（不给 0，那会让它在「市值 > 100 亿」里被静默排除，
+    而「缺失」与「不足」是**两件事**，前者该报出来）。"""
+    valuation = build_valuation(frame([20.0] * 3), FakeFinancials())
+
+    assert valuation.market_cap.isna().all().all()
 
 
 def test_a_non_datetime_index_is_rejected():

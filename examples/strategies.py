@@ -81,13 +81,20 @@ def signal_value(signals, field, today, name) -> float:
     return float(frame.at[today, name])
 
 
-class ValuationReversal(bt.Strategy, EngineClock):
-    """估值便宜时买入，估值恢复或转亏时卖出。
+class UndervaluedGrowth(bt.Strategy, EngineClock):
+    """**低估成长**：估值便宜 + 深度回撤时买入，估值恢复、增长放缓或转亏时卖出。
 
-    **买入条件不在这里**：它是 :func:`mbt.screen.valuation_screen`（PE 百分位 < 8%、
-    动态PE > 0、0 < PEG < 0.75，按百分位最低取前 N），由引擎经 ``broker.selection_mask``
-    交进来。这样 ``mbt screen`` 与 ``mbt backtest`` 用的是**同一个对象**，条件不必写两遍
-    （ADR-0001）。
+    **买入条件不在这里**：它是 :func:`mbt.screen.undervalued_growth_screen`，由引擎经
+    ``broker.selection_mask`` 交进来。四个条件：
+
+    1. 动态PE 百分位 < 8%（相对自身历史足够便宜）；
+    2. 动态PE > 0（剔除亏损）；
+    3. 0 < PEG < 0.75（增长为正、且价格相对增长仍算便宜）；
+    4. **一年内跌幅 > 42%**（自近一年的最高价回落足够深）。
+
+    排序因子是**跌幅本身**，故候选取跌得最深的那几只。
+
+    这样 ``mbt screen`` 与 ``mbt backtest`` 用的是**同一个对象**，条件不必写两遍（ADR-0001）。
 
     本类只管**卖出**——那三条都依赖「已经持有」与当日估值，是**路径依赖**的，而筛选规则按
     定义不管持仓（见 :class:`~mbt.screen.Screen`）。
@@ -107,6 +114,13 @@ class ValuationReversal(bt.Strategy, EngineClock):
     实测 ``sz002692`` 在 2025-09-02，通达信口径给出 PE 百分位 **91.82%**、PEG **−36.57**
     （不该买），而项目早先自创的「年化 EPS + 滞后同比」口径给出 **2.55%** 与 **+0.42**——
     **会把它买进来**。这类假阳性正是本策略拒绝自创口径的原因。
+
+    .. warning::
+
+        **「排除 ST」在本项目里是一条空条件**：本地数据没有股票名称，出厂规则表刻意不登记
+        任何 ``st_period``，故 ST 股不会被排除。实测 ``sz002731``（2025-05-07 建仓）就是 ST，
+        而且引擎还按 **10%** 的限幅在给它撮合（真实是 5%）——那意味着它的一字板会被当成可成交。
+        详见 ADR-0002 与 :mod:`mbt.rules`。
 
     .. warning::
 
@@ -158,10 +172,11 @@ class ValuationReversal(bt.Strategy, EngineClock):
 
         .. note::
 
-            上面那张逐年表与「剔除 2019」的数字取自**改动前**的增长率口径。改成
-            ``growth_lag_years=1`` 后重跑：年化由 ``+4.18%`` 降到 ``+2.11%``，2019 由
-            ``+85.79%`` 降到 ``+41.64%``，剔除 2019 后由 ``−16.52%`` 变为 ``−11.71%``。
-            **仍为负**，故本节的判断不变，只是没那么极端。
+            上面那张逐年表与「剔除 2019」的数字取自**早先的自创口径**（年化 EPS + 滞后同比）。
+            改成通达信口径后（见 :mod:`mbt.data.valuation`）重跑 2018 起：年化 **+12.68%**、
+            2019 **+110.36%**、剔除 2019 后 **+29.14%**（**转正**）、2022 起跑 **+62.67%**。
+            「靠某一年」的结构**没变**（2019 仍占各年正收益之和的一半），但比早先那版站得住
+            一些。
     """
 
     params = (("percentile_exit", 0.70), ("peg_exit", 1.1))

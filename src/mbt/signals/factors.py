@@ -12,8 +12,35 @@ from __future__ import annotations
 
 import pandas as pd
 
+from mbt.data.panel import Panel
 from mbt.signals._symbol_frame import check_symbol_frame
 from mbt.signals.indicators import rolling_max
+
+
+def drawdown_from_high(panel: Panel, n: int) -> pd.DataFrame:
+    """从 n 日**最高价**回落的幅度：``1 − 当根收盘 / n 日最高价``，恒 ``≥ 0``。**越大跌得越深**。
+
+    一行内同时要用 ``high`` 与 ``close``，故收 :class:`~mbt.data.panel.Panel`（与 ``atr``
+    同理）；返回的仍是**标的宽表**，消费方向不变。
+
+    .. warning::
+
+        **它与 :func:`distance_to_high` 不是同一个量，别混用**：
+
+        ====================  ======================  ==================
+        函数                   基准                    方向
+        ====================  ======================  ==================
+        ``distance_to_high``   **收盘价**的 n 日最高值    ``≤ 0``，「越接近 0 越强」
+        ``drawdown_from_high`` **最高价**的 n 日最高值    ``≥ 0``，「越大跌得越深」
+        ====================  ======================  ==================
+
+        两者互为反向，且基准不同——``high`` 的最高值与 ``close`` 的最高值不是一回事。这看起来
+        像重复，但「哪根 K 线创新高」与「从最高点跌了多少」在选股里是两个不同的条件，而本项目
+        的约定是**方向写进函数名与文档**，不靠调用方翻符号。
+
+    窗口取 ``[当日 − n + 1, 当日]``（含当日），不足 n 根处为**缺失**（不给乐观答案）。
+    """
+    return 1.0 - panel["close"] / rolling_max(panel["high"], n)
 
 
 def momentum(prices: pd.DataFrame, n: int) -> pd.DataFrame:

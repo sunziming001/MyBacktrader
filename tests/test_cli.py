@@ -892,7 +892,7 @@ def test_placing_no_order_at_all_is_reported_differently_from_all_rejected(tmp_p
     """
     root, gbbq = make_dataroot(tmp_path, periods=30)  # 不足门槛 60 → 股票池为空
     args = make_args(
-        strategy="examples.strategies:ValuationReversal",
+        strategy="examples.strategies:UndervaluedGrowth",
         tdx_root=str(root),
         gbbq=str(gbbq),
         output_dir=str(tmp_path / "runs"),
