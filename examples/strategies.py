@@ -34,6 +34,8 @@ from __future__ import annotations
 import backtrader as bt
 import pandas as pd
 
+from mbt.screen import Screen
+
 
 class EngineClock:
     """取**引擎主时钟**：各标的当前日期里的**最大者**。这就是「今天」。
@@ -216,6 +218,343 @@ class UndervaluedGrowth(bt.Strategy, EngineClock):
         percentile = signal_value(signals, "pe_percentile", today, name)
         peg = signal_value(signals, "peg", today, name)
         return bool(pe <= 0 or percentile > self.p.percentile_exit or peg > self.p.peg_exit)
+
+
+class B1(bt.Strategy, EngineClock):
+    """**回调买点 + 三条卖出规则**：白线/黄线之上、J 值偏低、回调缩量时买入。
+
+    **买入条件不在这里**：它是 :func:`b1_signals` 那几个过滤器组的
+    :class:`~mbt.screen.Screen`，由引擎经 ``broker.selection_mask`` 交进来。本类只管
+    **持有与卖出**——三条卖出规则全都依赖「已经持有」与「建仓时的价格」，是**路径依赖**的，
+    而选股规则按定义不管持仓。
+
+    三条卖出规则（任一满足即动作）:
+
+    ==========  ==========================================  ================
+    规则        判据                                        动作
+    ==========  ==========================================  ================
+    止损        ``stop_streak``：连续 ``stop_days`` 根收盘    清仓
+                低于黄线，**或**收盘跌破建仓时锚定的前低
+    分批止盈    ``trim``：收盘 ≥ 白线 × (1 + ``trim_margin``)  卖出一半
+    趋势离场    ``below_white``：曾收在白线上（armed），      清仓
+                其后收盘跌破白线
+    ==========  ==========================================  ================
+
+    **两条状态一律在「首次见到这个持仓」的那一根建立**，而不是在下单那一根：
+
+    - ``armed``（是否曾收在白线上）与 ``trimmed``（是否已减过仓）在建仓后从 **False**
+      起算——建仓那一根本身**不**武装趋势离场。理由是多一个选择就要多一处解释：把建仓日
+      也算进去，会让「买在白线下方、次日反抽到白线上方、第三日又跌破」这种最常见的形态
+      在第三天就被清掉，而买点本来就允许收盘贴近白线（实测九个样本里七成的买入价在白线
+      **下方**）。故趋势离场至少要等一次明确的站上。
+    - 前低止损位在建仓后**只取一次**。若每根都重算，「自峰值以来的最低价」会随价格下跌
+      一起下移，判据永远不成立——那不是止损，是跟随。这也是它必须留在策略层的原因：
+      信号层没有「持仓」这个概念。
+
+    参数:
+        white_n: 白线的双重 EMA 窗口。默认 10。
+        yellow_windows: 黄线各条均线的窗口。默认 ``(14, 28, 57, 114)``。
+        stop_days: 「连续跌破黄线」的根数。默认 2。
+        stop_buffer: 前低止损的缓冲比例（跌破前低 × (1 − 它) 才触发）。默认 0.01。
+        trim_margin: 分批止盈相对白线的比例门槛。默认 0.08。
+
+    **前低取「峰值之后」的那一段**（调整期的前低），不是「峰值之前」的波段起点。两者
+    位置差得很远：实测九个样本上，取波段起点给出的止损距中位 **−36.9%**（最松 −70.5%），
+    那样的止损形同虚设；取调整期前低是 **−2.7%**（−1.1% ~ −20.0%）。同一批样本上两者在
+    60 根内都未被触发，故这条止损**无法**用这批样本验证——它们全是买在局部底部的成功案例。
+
+    .. warning::
+
+        实测九个样本上，趋势离场会**明显早于**趋势走完就出场（平均持有 23 根，而原口径的
+        「连续跌破黄线」是 40~127 根）。最刺眼的一例是 ``sz002074``：持有 7 根、+1.5% 出场，
+        而持有到第 60 根是 +52.3%——它买在白线**下方 4.9%**，反抽站上白线之后第一次回落就
+        被清掉。单次一个收盘价低于白线就清仓，对「在白线附近震荡」的形态非常敏感。
+
+        这**不**说明这套卖出规则不好——这九个样本全是上涨的，任何「早点卖」的规则都必然
+        少赚。要判断它有没有价值，只能看**失败样本**（跌幅不深、长期横盘的那些），而那批
+        样本目前一个都没有。
+    """
+
+    params = (
+        ("white_n", 10),
+        ("yellow_windows", (14, 28, 57, 114)),
+        ("stop_days", 2),
+        ("stop_buffer", 0.01),
+        ("trim_margin", 0.08),
+    )
+
+    def __init__(self):
+        # 持仓期的路径依赖状态：**按标的**各持一份，且只在有持仓时有效。
+        self._armed: set[str] = set()
+        self._trimmed: set[str] = set()
+        self._stop_price: dict[str, float] = {}
+
+    def next(self):
+        today = self.today()
+        signals = self.broker.signals
+
+        for data in self.datas:
+            name = data._name
+            position = self.getposition(data)
+
+            if not position.size:
+                # 空仓即清状态：下一次建仓必须从「未武装、未减仓、前低重取」开始，
+                # 否则上一笔的武装状态会漏到下一笔上，趋势离场会凭空提前触发。
+                self._armed.discard(name)
+                self._trimmed.discard(name)
+                self._stop_price.pop(name, None)
+                self._enter_if_selected(data, name, today)
+                continue
+
+            if name not in self._stop_price:
+                # 首次见到这个持仓——上一根下的单成交了，此刻才是「建仓时」。
+                self._armed.discard(name)
+                self._trimmed.discard(name)
+                self._stop_price[name] = self._anchored_prior_low(data, signals, today, name)
+
+            self._manage_exit(data, name, position, signals, today)
+
+    # --- 买入 -----------------------------------------------------------------
+
+    def _enter_if_selected(self, data, name, today) -> None:
+        """买入条件来自选股规则算好的候选集，本类不再重复一遍（ADR-0001）。"""
+        if not self.broker.tradability_mask.at[today, name]:
+            return  # 停牌或尚未上市：这根 K 线是陈旧价/未来价
+        selection = self.broker.selection_mask
+        if selection is None or not selection.at[today, name]:
+            return
+        # 不传 size → 交给引擎的等权 sizer（`EqualWeightSizer`）。
+        self.buy(data=data)
+
+    # --- 卖出 -----------------------------------------------------------------
+
+    def _manage_exit(self, data, name, position, signals, today) -> None:
+        close = data.close[0]
+
+        # 1) 止损优先：同一根上若既触发止损又触发减仓，先清仓与「减半再清」等价，
+        #    而先判止损不会留下半仓。
+        stop_level = self._stop_price.get(name)
+        stop_hit = signal_value(signals, "stop_streak", today, name) > 0.5
+        if stop_hit or (stop_level == stop_level and close < stop_level):
+            self.close(data=data)
+            return
+
+        # 2) 趋势离场：曾收在白线上，其后跌破白线。
+        above = signal_value(signals, "above_white", today, name)
+        below = signal_value(signals, "below_white", today, name)
+        if above > 0.5:
+            self._armed.add(name)
+        if name in self._armed and below > 0.5:
+            self.close(data=data)
+            return
+
+        # 3) 分批止盈：只做一次；买点允许收盘贴近白线，故它常常在趋势离场之前就触发。
+        if name not in self._trimmed and signal_value(signals, "trim", today, name) > 0.5:
+            half = int(position.size // 2)
+            if half > 0:
+                # **未按「一手 = 100 股」整手取整**（README 已记的乐观偏差）；卖出一半后
+                # 余下的股数同样可能不是整手。
+                self._trimmed.add(name)
+                self.close(data=data, size=half)
+
+    def _anchored_prior_low(self, data, signals, today, name) -> float:
+        """建仓时锚定「调整期的前低」= 峰值之后到建仓日之间的最低价。
+
+        峰位由 ``peak_age`` 给出（自峰值起经过的根数），故这一段是**含当根**的 ``age + 1``
+        根。``peak_age`` 缺失（拐点未确认）时不设这条止损——缺失取「不设」而不是取 0，
+        与信号层「缺失即不合格」同一精神：不猜。
+        """
+        age = signal_value(signals, "peak_age", today, name)
+        if age != age:  # NaN
+            return float("nan")
+        bars = int(age) + 1
+        if bars < 1 or bars > len(data):
+            return float("nan")
+        lowest = min(data.low[-k] for k in range(bars))
+        return float(lowest) * (1.0 - self.p.stop_buffer)
+
+
+def b1_signals(
+    markets,
+    *,
+    align_to=None,
+    white_n=10,
+    yellow_windows=(14, 28, 57, 114),
+    stop_days=2,
+    trim_margin=0.08,
+    retracement=0.08,
+) -> dict[str, pd.DataFrame]:
+    """算出卖点与止损要读的信号（**标的宽表**），供 ``run_portfolio_backtest(signals=...)``。
+
+    在**完整历史**上算，再截到回测区间——这正是「先算后截」的口径
+    （:func:`mbt.data.panel.clip_fields` 的说明）。若先截再算，摆动点与黄线都会因为起点
+    不同而给出不同的值，于是同一段行情在两个区间里结论不同。
+
+    参数:
+        markets: 一组已质检行情。**必须是完整历史**（``load_market_data`` 的返回值），
+            不是切过窗口的那些——否则「先算后截」就反了。
+        align_to: 一组行情；给了就把结果的**标的集合与交易日范围**对齐到它。
+            **回测时必须给**，且必须传**切过窗口的**那一组行情：引擎要求信号与行情面板
+            逐日同列对齐，而完整历史的信号比切过的行情长、也可能多出被跳过的标的，
+            不对齐就会以「index / columns 不一致」报错。
+
+            刻意接受一个「行情组」而不是 ``(start, end)`` 两个值：那两个值若与实际切片
+            不一致，结果仍是错的，而**行情的边界就在行情里**——从它推出来不会漂移。
+
+    返回的五个字段都是**浮点**（布尔信号转成 0.0/1.0）：它们的消费方是策略侧
+    :func:`signal_value`，读的是标量，而面板字段保持数值型可以省掉一处类型分支。
+
+    ==================  ====================================================
+    字段                含义
+    ==================  ====================================================
+    ``above_white``     收盘严格高于白线（0/1）
+    ``below_white``     收盘严格低于白线（0/1）
+    ``trim``            收盘 ≥ 白线 × (1 + ``trim_margin``)（0/1）
+    ``stop_streak``     连续 ``stop_days`` 根收盘低于黄线（0/1）
+    ``peak_age``        自最近一段已完成上涨的峰值起经过的根数（缺失=拐点未确认）
+    ==================  ====================================================
+    """
+    from mbt.data.panel import clip_fields
+    from mbt.signals import above_white, below_white, below_yellow_streak, swings
+
+    closes = {market.symbol: market.prices["close"] for market in markets}
+    close_frame = pd.DataFrame(closes)
+
+    def as_float(frame):
+        return frame.astype(float)
+
+    anchors = swings(close_frame, retracement=retracement)
+    fields = {
+        "above_white": as_float(above_white(close_frame, white_n, 0.0)),
+        "below_white": as_float(below_white(close_frame, white_n)),
+        "trim": as_float(above_white(close_frame, white_n, trim_margin)),
+        "stop_streak": as_float(
+            below_yellow_streak(close_frame, white_n, tuple(yellow_windows), stop_days)
+        ),
+        "peak_age": anchors.peak_age.astype(float),
+    }
+    if align_to is None:
+        return fields
+
+    bounds = [market.prices.index for market in align_to]
+    lower = min(index.min() for index in bounds)
+    upper = max(index.max() for index in bounds)
+    return clip_fields(fields, align_to, start=lower, end=upper)
+
+
+def b1_screen(
+    *,
+    white_n=10,
+    yellow_windows=(14, 28, 57, 114),
+    kdj_n=9,
+    kdj_m1=3,
+    kdj_m2=3,
+    j_max=20.0,
+    retracement=0.08,
+    min_advance=0.10,
+    min_drop=0.08,
+    max_drop=0.35,
+    min_peak_age=5,
+    max_peak_age=50,
+    volume_edge_bars=3,
+    volume_base_bars=10,
+    min_surge=2.0,
+    max_pullback=0.5,
+    top_n=None,
+) -> Screen:
+    """**B1 策略**的选股规则：趋势 + 位置 + J 值 + 量能（四条过滤），**黄线贴近度**排序。
+
+    它是 ``Screen``，故同一条件既能用于 ``mbt screen`` 选股，也能作为回测的入场闸门——
+    不必写两遍（ADR-0001）。
+
+    ==================  ================================================
+    过滤器              判据
+    ==================  ================================================
+    趋势                白线在黄线上（提示 2）
+    价格在慢线上        收盘 > 黄线（B1 追加）
+    位置                「一波上涨之后的下跌阶段」（提示 3）
+    J 值                KDJ 的 J 偏低（提示 3）
+    量能                上涨放量 + 回调缩量（提示 4）
+    ==================  ================================================
+
+    「价格在慢线上」这一条与「趋势」不是同义反复：前者比较**价格**与黄线，后者比较
+    **白线**与黄线。价格可以从上方双双跌破，那时白线仍在黄线上（慢线还没跟上）——实测
+    ``sh688321`` 在 2025-06-20 就是这样。追加它是为了解决一件具体的事：止损要求「连续 2 根
+    收盘低于黄线」，若入场时价格已在黄线**下方**，那条止损几乎立刻触发（全市场回测里
+    78% 的出场都是它，持有期中位仅 1 天）。
+
+    排序因子是 :func:`~mbt.signals.factors.yellow_proximity`（``黄线 ÷ |收盘 − 黄线|``），
+    **越大离黄线越近**，故买点取「回调到支撑上」的那几只，而不是「跌得最深」的那几只。
+    因子本身不带方向（取了绝对值），「在黄线哪一侧」由过滤条件管。
+
+    参数:
+        top_n: 只取前 N 名。``None``（默认）表示**不截断**——那正是「本金不限」的语义：
+            每个合格标的都买一份。给了它就只买离黄线最近的那 N 只。
+
+    各阈值的取法见 ``CONTEXT.md`` 与 ``.scratch`` 下的实测记录；默认值是九个样本上的
+    **可执行起点**，不是调优过的参数。特别地：
+
+    - ``retracement``：实测只有 **0.08** 让九个样本全部呈现「涨过一段 + 正在回调」
+      （0.04~0.06 与 0.10 都是 7/9，0.15 是 5/9）。
+    - ``j_max``：九个样本的信号日 J 落在 −13.4 ~ 19.8（中位 −4.8），故 20 覆盖 9/9。
+    - ``min_surge=2.0`` / ``max_pullback=0.5``：量能两条，9 个样本上命中 8/9
+      （只有 ``sz301076`` 不通过，因为摆动点给它切出的是一段 4 根、14% 的短促上冲）。
+
+    .. warning::
+
+        「位置」条件**几乎不筛人**：全历史实测，它在 35%~52% 的交易日成立。真正的选择性
+        来自 J 值与量能，故不要指望它单独构成一个稀疏的候选集。
+    """
+    from mbt.signals import (
+        above_yellow,
+        j_below,
+        pullback_after_advance,
+        swings,
+        volume_contraction,
+        white_above_yellow,
+        yellow_proximity,
+    )
+
+    windows = tuple(yellow_windows)
+
+    def trend(panel):
+        return white_above_yellow(panel["close"], white_n, windows)
+
+    def not_below_the_line(panel):
+        return above_yellow(panel["close"], windows)
+
+    def position(panel):
+        return pullback_after_advance(
+            panel["close"],
+            retracement=retracement,
+            min_advance=min_advance,
+            min_drop=min_drop,
+            max_drop=max_drop,
+            min_peak_age=min_peak_age,
+            max_peak_age=max_peak_age,
+        )
+
+    def low_j(panel):
+        return j_below(panel, j_max, kdj_n, kdj_m1, kdj_m2)
+
+    def volume(panel):
+        return volume_contraction(
+            panel["volume"],
+            swings(panel["close"], retracement=retracement),
+            edge_bars=volume_edge_bars,
+            base_bars=volume_base_bars,
+            min_surge=min_surge,
+            max_pullback=max_pullback,
+        )
+
+    def proximity(panel):
+        return yellow_proximity(panel["close"], windows)
+
+    return Screen(
+        filters=(trend, not_below_the_line, position, low_j, volume),
+        factor=proximity,
+        top_n=top_n,
+    )
 
 
 class BuyAndHold(bt.Strategy, EngineClock):

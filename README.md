@@ -37,9 +37,19 @@
 - **信号层已实现**（票据 [#5](https://github.com/sunziming001/MyBacktrader/issues/5)）：项目的架构中枢。
   指标、过滤信号、排序因子一律算成日期 × 标的的**标的宽表**，回测按列取时序、选股按行取截面
   ——同一个函数，两个消费方向（ADR-0001）。全部是纯函数：无 I/O、无状态、不读全局配置。
-  - 指标：`sma`、`rolling_max`、`volume_ratio`（成交量比）、`atr`（Wilder 口径，见下）
-  - 过滤信号：`new_high`、`volume_surge`、`ma_cross_up`、`rising_streak`、`above_ma`
-  - 排序因子：`momentum`、`distance_to_high`
+  - 指标：`sma`、`ema`（通达信口径：首根播种、无 `min_periods`）、`rolling_max`、
+    `rolling_min`（前低）、`volume_ratio`（成交量比）、`atr`（Wilder 口径，见下）、
+    `kdj`（通达信递推均值口径，返回 `K/D/J` 三线）、`white_line` / `yellow_line`
+    （行情软件图上那对快慢线，见 `CONTEXT.md`）、`swings`（**已确认**的摆动点：
+    最近一段已完成上涨的起涨点与峰值，顺序扫描，只报确认过的拐点）、
+    `volume_structure`（按摆动点切段后的量能结构：放量倍数 / 顶部比值 / 缩量倍数）
+  - 过滤信号：`new_high`、`volume_surge`、`ma_cross_up`、`rising_streak`、`above_ma`、
+    `white_above_yellow`、`above_yellow`（收盘在黄线上方——与前者不同：前者比两条线，
+    后者比价格与线）、`below_yellow_streak`、`above_white` / `below_white`（卖出规则用的
+    白线两侧）、`j_below`、`pullback_after_advance`（「一波上涨之后的下跌阶段」）、
+    `volume_contraction`（上涨放量 + 回调缩量）
+  - 排序因子：`momentum`、`distance_to_high`、`yellow_proximity`（黄线贴近度，
+    **越大离黄线越近**——B1 策略用的就是它）
   - **行情面板已实现**（票据 [#14](https://github.com/sunziming001/MyBacktrader/issues/14)）：
     `Panel` + `assemble_panel`。ATR 一行内要用 `high` / `low` / `close` 且必须同日对齐，而标的
     宽表一格只能放一个数，面板补上这一层。它是**按需组装**的显式结构，不落盘、不常驻；字段
