@@ -84,8 +84,23 @@ PEG = "peg"
 #: 100 亿」），不参与收益计算。
 MARKET_CAP = "market_cap"
 
+#: 净资产收益率字段名，**单位是百分数**（``10.0`` 表示 10%）。
+#:
+#: ``= 归母净利润TTM ÷ 归母股东权益 × 100``。
+#:
+#: .. warning::
+#:
+#:     **不要用 ``gpcw`` 那个现成的「净资产收益率」字段（索引 5）。** 它是**累计**值——
+#:     一季报给的是「年初到 3 月底」的 ROE。实测茅台 2026-03-31 那个字段是 **10.06**，而
+#:     同期按 TTM 算是 **31.63**；平安银行更是 **2.67** vs **7.91**。若拿它做「ROE > 10%」
+#:     的过滤，**一季度报告期里几乎所有股票都会被排除**——与 PE 那个「年化 ×4」的陷阱同源，
+#:     只是方向相反（那个偏大、这个偏小）。
+#:
+#:     现成字段仍可作**交叉验证**：年末时它与本口径接近（茅台 2025-12-31：33.65 vs 34.87）。
+ROE = "roe"
+
 #: 本模块产出的字段，按构造顺序。给调用方**显式声明**用（与 ``SCREEN_FIELDS`` 同一精神）。
-VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG, MARKET_CAP)
+VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG, MARKET_CAP, ROE)
 
 #: 百分位的默认窗口（交易日）——约 4 年。
 DEFAULT_WINDOW = 1000
@@ -160,6 +175,21 @@ def price_earnings_growth(pe: pd.DataFrame, growth_pct: pd.DataFrame) -> pd.Data
     return (pe / growth_pct).where(usable)
 
 
+def return_on_equity(profit_ttm: pd.DataFrame, equity: pd.DataFrame) -> pd.DataFrame:
+    """``ROE = 归母净利润TTM ÷ 归母股东权益 × 100``（**百分数**）。
+
+    用 TTM 净利而非累计净利，是为了避开季节性——见 :data:`ROE` 的 warning。权益取**最新
+    时点**值（不是期间平均）：那是可得的、且与「市值 ÷ 净资产」这类同期口径一致；代价是
+    权益在期内大幅变动（增发、回购）时会略有偏差。
+
+    权益为 0 处判缺失（除零无意义）；**负权益照常算出负 ROE**——「ROE > 0」是过滤条件的事，
+    不是计算的事（与 PE 的处理一致）。
+    """
+    _require_same_shape(profit_ttm, equity, "归母净利润TTM", "归母股东权益")
+    safe = equity.where(equity != 0)
+    return profit_ttm / safe * 100.0
+
+
 @dataclass(frozen=True)
 class Valuation:
     """三个估值序列（都是 **date × 标的** 的标的宽表，与价格同日对齐）。
@@ -174,6 +204,7 @@ class Valuation:
     pe_percentile: pd.DataFrame
     peg: pd.DataFrame
     market_cap: pd.DataFrame
+    roe: pd.DataFrame
 
     def as_fields(self) -> dict[str, pd.DataFrame]:
         """字段名 → 标的宽表，供装进 :class:`~mbt.data.panel.Panel` 或交给策略。"""
@@ -182,6 +213,7 @@ class Valuation:
             PE_PERCENTILE: self.pe_percentile,
             PEG: self.peg,
             MARKET_CAP: self.market_cap,
+            ROE: self.roe,
         }
 
 
@@ -217,6 +249,7 @@ def build_valuation(
     shares = _point_in_time_frame(close, financials, "total_shares")
     ttm = _point_in_time_frame(close, financials, "profit_ttm")
     growth = _point_in_time_frame(close, financials, "growth_ytd")
+    equity = _point_in_time_frame(close, financials, "equity")
 
     pe = price_earnings_ratio(close, shares, ttm)
     return Valuation(
@@ -224,6 +257,7 @@ def build_valuation(
         pe_percentile=pe_percentile(pe, window),
         peg=price_earnings_growth(pe, growth),
         market_cap=close * shares,
+        roe=return_on_equity(ttm, equity),
     )
 
 

@@ -25,6 +25,7 @@ from mbt.data.valuation import (
     PE,
     PE_PERCENTILE,
     PEG,
+    ROE,
     VALUATION_FIELDS,
     build_valuation,
     pe_percentile,
@@ -44,7 +45,7 @@ class FakeFinancials:
 
 
 def record(period, announced, *, shares=1_000_000_000.0, ttm=50_000_000.0, growth=30.0, **extra):
-    """造一条 ``FinancialRecord``；三个估值字段按名义值给出，其余补 0。"""
+    """造一条 ``FinancialRecord``；估值字段按名义值给出，其余补 0。"""
     values = {
         "eps_ytd": 0.0,
         "net_profit_ytd": 0.0,
@@ -53,7 +54,15 @@ def record(period, announced, *, shares=1_000_000_000.0, ttm=50_000_000.0, growt
         "revenue_quarter": 0.0,
         "net_profit_quarter": 0.0,
     }
-    values.update({"total_shares": shares, "profit_ttm": ttm, "growth_ytd": growth})
+    values.update(
+        {
+            "total_shares": shares,
+            "profit_ttm": ttm,
+            "growth_ytd": growth,
+            # 默认权益使得 ROE = 50_000_000 ÷ 1_000_000_000 = 5%
+            "equity": 1_000_000_000.0,
+        }
+    )
     values.update(extra)
     return FinancialRecord(
         symbol="sh600000",
@@ -258,7 +267,67 @@ def test_as_fields_exposes_the_documented_names():
     valuation = build_valuation(frame([10.0] * 3), FakeFinancials())
 
     assert tuple(valuation.as_fields()) == VALUATION_FIELDS
-    assert (PE, PE_PERCENTILE, PEG, MARKET_CAP) == VALUATION_FIELDS
+    assert (PE, PE_PERCENTILE, PEG, MARKET_CAP, ROE) == VALUATION_FIELDS
+
+
+def test_roe_is_ttm_profit_over_equity_in_percent():
+    """``ROE = 归母净利润TTM ÷ 归母股东权益 × 100``，**单位是百分数**。
+
+    手算：TTM 5000 万 ÷ 权益 5 亿 = 10%。
+    """
+    financials = FakeFinancials(
+        sh600000=[
+            record(
+                dt.date(2023, 12, 31),
+                dt.date(2024, 1, 1),
+                ttm=50_000_000.0,
+                equity=500_000_000.0,
+            )
+        ]
+    )
+
+    valuation = build_valuation(frame([20.0] * 3), financials)
+
+    assert valuation.roe.iloc[0, 0] == pytest.approx(10.0)
+
+
+def test_the_direct_roe_field_is_not_used_because_it_is_cumulative():
+    """**不用 `gpcw` 那个现成的「净资产收益率」字段**——它是累计值，会把一季报的 ROE 报小。
+
+    这里用同一期数据把差异摆出来：现成字段（累计）给 2.5，而 TTM 口径给 10.0。若拿前者做
+    「ROE > 10%」的过滤，一季度报告期里几乎所有股票都会被排除——与 PE 那个「年化 ×4」的
+    陷阱同源，只是方向相反。
+    """
+    financials = FakeFinancials(
+        sh600000=[
+            record(
+                dt.date(2023, 3, 31),
+                dt.date(2023, 4, 30),
+                ttm=50_000_000.0,
+                equity=500_000_000.0,
+                roe_cum=2.5,  # 一季报的累计 ROE——**本模块刻意不用它**
+            )
+        ]
+    )
+
+    valuation = build_valuation(frame([20.0] * 3, start="2023-05-02"), financials)
+
+    assert valuation.roe.iloc[0, 0] == pytest.approx(10.0), "TTM 口径"
+
+
+def test_a_zero_equity_yields_a_missing_roe():
+    """权益为 0 → 缺失（除零无意义）；负权益照常算出负 ROE。"""
+    zero = build_valuation(
+        frame([20.0] * 3),
+        FakeFinancials(sh600000=[record(dt.date(2023, 12, 31), dt.date(2024, 1, 1), equity=0.0)]),
+    )
+    negative = build_valuation(
+        frame([20.0] * 3),
+        FakeFinancials(sh600000=[record(dt.date(2023, 12, 31), dt.date(2024, 1, 1), equity=-5e8)]),
+    )
+
+    assert pd.isna(zero.roe.iloc[0, 0])
+    assert negative.roe.iloc[0, 0] < 0
 
 
 def test_market_cap_is_shares_times_price():
