@@ -55,6 +55,10 @@ DRAWDOWN_THRESHOLD = 0.42
 #: 总市值门槛（元），来自需求方的设定（「市值应该大于 100 亿」）。100 亿 = 1e10 元。
 MIN_MARKET_CAP = 1e10
 
+#: ROE 门槛，**百分数**（``10.0`` 表示 10%），来自需求方的设定。
+#: 口径见 :data:`mbt.data.valuation.ROE`。
+MIN_ROE = 10.0
+
 
 def drawdown_fields(markets, *, lookback: int = DRAWDOWN_LOOKBACK) -> dict[str, pd.DataFrame]:
     """由**完整**行情算出「近一年跌幅」信号，供 :func:`undervalued_growth_screen` 取用。
@@ -253,35 +257,37 @@ def undervalued_growth_screen(
     peg_above: float = 0.0,
     drawdown_above: float = DRAWDOWN_THRESHOLD,
     min_market_cap: float = MIN_MARKET_CAP,
+    min_roe: float = MIN_ROE,
     top_n: int = 5,
 ) -> Screen:
-    """**低估成长**策略的买入条件（票据 #51、#52）。
+    """**低估成长**策略的买入条件（票据 #51、#52、#58）。
 
     这是「同一条件不必写两遍」的落点（ADR-0001）：回测用它当入场闸门（引擎的 ``screen``），
     选股用它出候选清单（``mbt screen``），两边是**同一个对象**。
 
-    五个过滤条件：
+    六个过滤条件：
 
     - ``动态PE 百分位 < percentile_below`` —— 相对自身历史足够便宜；
     - ``动态PE > pe_above`` —— 剔除亏损（负 PE 无估值含义）；
     - ``peg_above < PEG < peg_below`` —— 增长要为正、且价格相对增长仍算便宜；
     - ``一年内跌幅 > drawdown_above`` —— 从近一年的**最高价**回落足够深；
-    - ``总市值 > min_market_cap`` —— 剔除小盘股（默认 100 亿元）。
+    - ``总市值 > min_market_cap`` —— 剔除小盘股（默认 100 亿元）；
+    - ``ROE > min_roe`` —— 盈利质量门槛（默认 10%，**百分数**）。
 
-    排序因子是**跌幅本身**：**跌得越深越靠前**。信号层的契约是「因子越大越靠前」，而跌幅
-    天然满足（越大跌得越深），故这里不必翻符号。
-
-    这些条件分别由估值信号（前三 + 市值）与 :func:`drawdown_fields`（跌幅）提供，调用方要
-    把两组信号都并进行情面板，见各函数的说明。
+    排序因子是 **ROE**：**盈利质量越高越靠前**（``Screen`` 的契约是「越大越靠前」，而 ROE
+    天然满足）。
 
     .. note::
 
-        **市值门槛是后加的（票据 #52）。** 把标的从 300 只抽样换成全市场后，「按跌幅最深排序
-        取前 5」选出来的**大量是小市值股票**，而它们最可能是价值陷阱或退市候选。实测那次
-        全市场回测的净值是 **−50.9%**（年化 −8.1%、回撤 77.9%），而同一策略在 300 只抽样上
-        是 +438%——候选池的大小把结论整个翻转了。市值门槛是针对这件事的直接手段。
+        **排序因子从「跌幅」换成 ROE 是一个立场变化（票据 #58）。** 原来按跌幅排序选的是
+        「跌得最狠的那几只」——实测把标的池扩到全市场后，那等于在选小市值/退市边缘的股票
+        （净值 −50.9%）。现在改成「先按便宜 + 深跌 + 排除小盘筛出候选，再按**盈利质量**优先」：
+        「在折价里挑质量最好的」，而不是「在折价里挑跌得最惨的」。
+
+    这些条件由估值信号（前三 + 市值 + ROE）与 :func:`drawdown_fields`（跌幅）提供，调用方要
+    把两组信号都并进行情面板，见各函数的说明。
     """
-    from mbt.data.valuation import MARKET_CAP, PE, PE_PERCENTILE, PEG
+    from mbt.data.valuation import MARKET_CAP, PE, PE_PERCENTILE, PEG, ROE
 
     def cheap(panel):
         return panel[PE_PERCENTILE] < percentile_below
@@ -298,12 +304,22 @@ def undervalued_growth_screen(
     def big_enough(panel):
         return panel[MARKET_CAP] > min_market_cap
 
-    def fall_depth(panel):
-        return panel[DRAWDOWN_FIELD]
+    def good_quality(panel):
+        return panel[ROE] > min_roe
+
+    def quality(panel):
+        return panel[ROE]
 
     return Screen(
-        filters=(cheap, profitable, growth_worth_paying, deeply_fallen, big_enough),
-        factor=fall_depth,
+        filters=(
+            cheap,
+            profitable,
+            growth_worth_paying,
+            deeply_fallen,
+            big_enough,
+            good_quality,
+        ),
+        factor=quality,
         top_n=top_n,
     )
 

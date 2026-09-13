@@ -15,7 +15,7 @@ import pytest
 from mbt.backtest import run_portfolio_backtest
 from mbt.data.errors import MarketDataError
 from mbt.data.panel import clip_fields
-from mbt.data.valuation import MARKET_CAP
+from mbt.data.valuation import MARKET_CAP, ROE
 from mbt.screen import (
     DRAWDOWN_FIELD,
     Screen,
@@ -50,7 +50,10 @@ def columns_of(markets):
 
 
 def growth_frames(index, columns, **overrides):
-    """加跌幅与市值字段的一组信号帧（默认跌幅 0.5 过 42%、市值 500 亿过 100 亿）。"""
+    """加跌幅、市值与 ROE 字段的一组信号帧（默认都过门槛）。
+
+    默认值：跌幅 0.5（> 42%）、市值 500 亿（> 100 亿）、ROE 25（> 10）。
+    """
     frames = valuation_frames(index, columns, **overrides)
     frames[DRAWDOWN_FIELD] = pd.DataFrame(
         overrides.get("drawdown_1y", 0.5), index=index, columns=columns, dtype=float
@@ -58,17 +61,20 @@ def growth_frames(index, columns, **overrides):
     frames[MARKET_CAP] = pd.DataFrame(
         overrides.get("market_cap", 5e10), index=index, columns=columns, dtype=float
     )
+    frames[ROE] = pd.DataFrame(
+        overrides.get("roe", 25.0), index=index, columns=columns, dtype=float
+    )
     return frames
 
 
-def test_the_growth_screen_ranks_by_drawdown_not_by_percentile():
-    """**排序因子是跌幅，不是百分位**——跌得越深越靠前。
+def test_the_growth_screen_ranks_by_roe_not_by_drawdown():
+    """**排序因子是 ROE**（票据 #58）——质量越高越靠前，而不是跌得越深越靠前。
 
-    构造：三只**都过四个条件**，但「百分位最低的是 a，跌幅最深的是 c」。旧版按百分位会选 a，
-    新版必须选 **c**——这一条把「换排序因子」这件事钉住。
+    构造：三只**都过六个条件**，但「跌幅最深的是 c，ROE 最高的是 a」。按跌幅排序会选 c，
+    按 ROE 必须选 **a**——这一条把「换排序因子」这件事钉住。
 
-    注意三只的百分位都要 < 8%，否则它们会被过滤掉、测的就不是排序因子了（第一版就写错过：
-    把 c 的百分位写成 0.20，它先被过滤，于是选出的 b 与排序因子无关）。
+    三只的百分位都要 < 8%，否则它们会被过滤掉、测的就不是排序因子了（第一版写错过：把
+    c 的百分位写成 0.20，它先被过滤，于是选出的与排序因子无关）。
     """
     index = pd.bdate_range("2024-01-02", periods=3)
     columns = ["a", "b", "c"]
@@ -79,12 +85,53 @@ def test_the_growth_screen_ranks_by_drawdown_not_by_percentile():
         pe_percentile=[[0.001, 0.050, 0.070]] * 3,  # 三只都过 8%
         peg=[[0.3, 0.6, 0.3]] * 3,
         drawdown_1y=[[0.45, 0.60, 0.90]] * 3,  # c 跌得最深
+        roe=[[30.0, 20.0, 11.0]] * 3,  # a 质量最高
     )
     from mbt.data.panel import Panel
 
     got = undervalued_growth_screen(top_n=1).apply(Panel(frames))
 
-    assert got.candidates(index[0]) == ["c"], "跌幅最深者优先（而非百分位最低者）"
+    assert got.candidates(index[0]) == ["a"], "ROE 最高者优先（而非跌幅最深者）"
+
+
+def test_the_growth_screen_requires_roe_above_the_threshold():
+    """ROE 必须**严格大于** 10：恰好 10 不算，10.1 才算。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["low", "edge", "high"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9, 0.9]] * 2,
+        roe=[[9.9, 10.0, 10.1]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["high"]
+
+
+def test_a_missing_roe_excludes_the_symbol():
+    """ROE 缺失（取不到权益）→ 排除，不凑数。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["known", "unknown"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9]] * 2,
+        roe=[[25.0, float("nan")]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["known"]
 
 
 def test_the_growth_screen_requires_a_drawdown_deeper_than_the_threshold():

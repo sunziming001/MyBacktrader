@@ -94,6 +94,7 @@ FIELDS = {
     "total_shares": 237,  # 总股本（股，时点）——FINVALUE(238)
     "profit_ttm": 275,  # 归母净利润 TTM（元）——FINVALUE(276)
     "growth_ytd": 183,  # 归母净利润累计同比（%）——FINVALUE(184)
+    "equity": 270,  # 归属母公司股东权益（元，时点）——FINVALUE(271)
     "announcement_date": 313,  # 财报公告日期（YYMMDD / YYYYMMDD 整数，存在 float32 里）
 }
 
