@@ -13,7 +13,7 @@ import datetime as dt
 import pandas as pd
 import pytest
 
-from mbt.data.st import DEFAULT_WINDOW, infer_st_periods
+from mbt.data.st import DEFAULT_WINDOW, MIN_SPAN_DAYS, infer_st_periods
 from mbt.rules import RuleTable, limit_price
 
 MAIN_BOARD_RULES = """
@@ -64,14 +64,46 @@ def walk(prices, steps, *, cap=0.05, start="2024-01-02"):
 
 
 def test_a_window_that_never_exceeds_5_percent_and_hits_the_limit_is_st(rules):
-    """**判据的两条同时成立**才有结论：波动被封在 5% 内，且确实打过 5% 的板。"""
-    # 20 次精确打到 +5% 限价，窗口内最大幅度恰好是 5%
-    values = walk(10.0, [0.05] * (DEFAULT_WINDOW + 4))
+    """**判据的两条同时成立**才有结论：波动被封在 5% 内，且确实打过 5% 的板。
 
-    periods = infer_st_periods(series(values), "sh600000", rules)
+    构造要**足够长**：证据跨度须超过 :data:`MIN_SPAN_DAYS`，否则会被当成巧合丢掉（那是
+    刻意行为，另有一条测试专门钉住它）。
+    """
+    steps = [0.05] * (DEFAULT_WINDOW + MIN_SPAN_DAYS + 20)
+
+    periods = infer_st_periods(series(walk(10.0, steps)), "sh600000", rules)
 
     assert periods, "应当判出 ST 期间"
-    assert periods[0].evidence_days >= 2
+    assert periods[0].evidence_days >= MIN_SPAN_DAYS
+
+
+@pytest.mark.parametrize(
+    ("tail_steps", "expected", "why"),
+    [
+        (0, True, "短证据**紧贴数据末端** → 视为「仍在 ST」（sz002731 就是这种）"),
+        (200, False, "短证据**远在末端之前** → 视为巧合（sh600106 / sh600100 是这种）"),
+    ],
+)
+def test_a_short_burst_is_accepted_only_when_it_reaches_the_data_end(
+    rules, tail_steps, expected, why
+):
+    """**短证据只在「仍在 ST」时才采信**——这是判据的「或」那一半，理由见测试说明。
+
+    实测两类标本：
+    - ``sz002731``：证据只跨 **15** 个交易日，但它**是** ST——末日距数据末端仅 **40** 个交易日；
+    - ``sh600106`` / ``sh600100``：证据跨度 7 / 21，而末日距末端 **264 / 382** 个交易日
+      ——它们早已结束，属于「恰好落进窗口」的巧合。
+
+    故判据是「跨度够长（长期 ST）**或**距末端够近（近期发作且仍在）」。
+    """
+    steps = [0.05] * (DEFAULT_WINDOW + 4)
+    if tail_steps:
+        # 8% 的日波动 > 5.4%，把窗口判据打破，同时仍在 10% 的带内
+        steps += [0.08] * tail_steps
+
+    periods = infer_st_periods(series(walk(10.0, steps)), "sh600000", rules)
+
+    assert bool(periods) is expected, why
 
 
 def test_a_quiet_stock_that_never_hits_the_limit_is_not_st(rules):
@@ -121,11 +153,10 @@ def test_too_short_a_history_yields_nothing(rules):
 
 def test_a_period_that_ends_well_before_the_data_end_is_closed(rules):
     """ST 结束后（其后有足够长的无证据期）→ 期间有 ``end``，不是延续到末端。"""
-    # 先走 40+ 次 5% 板（触发），再走足够长的正常波动期（> 一个窗口）把它隔开
-    steps = [0.05] * (DEFAULT_WINDOW + 4) + [0.03] * (DEFAULT_WINDOW * 3)
-    values = walk(10.0, steps)
+    # 先走足够长的一段 5% 板（触发且跨度够），再走足够长的正常波动期把它隔开
+    steps = [0.05] * (DEFAULT_WINDOW + MIN_SPAN_DAYS + 20) + [0.03] * (DEFAULT_WINDOW * 3)
 
-    periods = infer_st_periods(series(values), "sh600000", rules)
+    periods = infer_st_periods(series(walk(10.0, steps)), "sh600000", rules)
 
     assert periods, "前段应当被判为 ST"
     assert periods[0].end is not None, "它早已结束，不该延续到数据末端"
