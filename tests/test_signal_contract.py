@@ -35,6 +35,7 @@ SYMBOL_FRAME_SIGNALS = [
 #: 取**行情面板**的信号（跨字段，仍返回标的宽表）。
 PANEL_SIGNALS = [
     ("atr", lambda panel: signals.atr(panel, n=3)),
+    ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
 ]
 
 #: 八根 K 线、两个标的，含一处停牌造成的缺失——缺失正是因果性最容易出错的地方。

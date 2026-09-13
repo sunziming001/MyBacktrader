@@ -14,11 +14,18 @@ import pytest
 
 from mbt.backtest import run_portfolio_backtest
 from mbt.data.errors import MarketDataError
-from mbt.data.valuation import clip_fields
-from mbt.screen import Screen, valuation_screen
+from mbt.data.panel import clip_fields
+from mbt.data.valuation import MARKET_CAP
+from mbt.screen import (
+    DRAWDOWN_FIELD,
+    Screen,
+    drawdown_fields,
+    undervalued_growth_screen,
+    valuation_screen,
+)
 from mbt.universe import UniverseRules
 
-STRATEGY = "examples.strategies:ValuationReversal"
+STRATEGY = "examples.strategies:UndervaluedGrowth"
 
 
 def valuation_frames(index, columns, **overrides):
@@ -39,7 +46,163 @@ def columns_of(markets):
     return [market.symbol for market in markets]
 
 
-# --- 选股规则：买入条件 -------------------------------------------------------
+# --- 低估成长的买入条件（票据 #51） -------------------------------------------
+
+
+def growth_frames(index, columns, **overrides):
+    """加跌幅与市值字段的一组信号帧（默认跌幅 0.5 过 42%、市值 500 亿过 100 亿）。"""
+    frames = valuation_frames(index, columns, **overrides)
+    frames[DRAWDOWN_FIELD] = pd.DataFrame(
+        overrides.get("drawdown_1y", 0.5), index=index, columns=columns, dtype=float
+    )
+    frames[MARKET_CAP] = pd.DataFrame(
+        overrides.get("market_cap", 5e10), index=index, columns=columns, dtype=float
+    )
+    return frames
+
+
+def test_the_growth_screen_ranks_by_drawdown_not_by_percentile():
+    """**排序因子是跌幅，不是百分位**——跌得越深越靠前。
+
+    构造：三只**都过四个条件**，但「百分位最低的是 a，跌幅最深的是 c」。旧版按百分位会选 a，
+    新版必须选 **c**——这一条把「换排序因子」这件事钉住。
+
+    注意三只的百分位都要 < 8%，否则它们会被过滤掉、测的就不是排序因子了（第一版就写错过：
+    把 c 的百分位写成 0.20，它先被过滤，于是选出的 b 与排序因子无关）。
+    """
+    index = pd.bdate_range("2024-01-02", periods=3)
+    columns = ["a", "b", "c"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0, 1.0]] * 3,
+        pe_percentile=[[0.001, 0.050, 0.070]] * 3,  # 三只都过 8%
+        peg=[[0.3, 0.6, 0.3]] * 3,
+        drawdown_1y=[[0.45, 0.60, 0.90]] * 3,  # c 跌得最深
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=1).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["c"], "跌幅最深者优先（而非百分位最低者）"
+
+
+def test_the_growth_screen_requires_a_drawdown_deeper_than_the_threshold():
+    """跌幅必须**严格大于**门槛：42% 本身不算，42.1% 才算。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["shallow", "edge", "deep"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3, 0.3]] * 2,
+        drawdown_1y=[[0.41, 0.42, 0.421]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["deep"], "恰好 42% 不算（严格大于）"
+
+
+def test_a_missing_drawdown_excludes_the_symbol():
+    """跌幅缺失（回看窗口不足）→ 排除，而不是当成 0 或合格。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["known", "unknown"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, float("nan")]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["known"]
+
+
+def test_the_growth_screen_keeps_the_three_original_conditions():
+    """原来那三条一个都不能少——亏损、百分位不够低、PEG 越界的都要落选。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["ok", "loss", "expensive", "growing_too_fast", "negative_peg"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, -1.0, 1.0, 1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01, 0.20, 0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3, 0.3, 1.5, -0.2]] * 2,
+        drawdown_1y=[[0.9] * 5] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["ok"]
+
+
+def test_a_missing_market_cap_excludes_the_symbol():
+    """市值缺失 → 排除（缺失取假是过滤信号的既定契约）。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["known", "unknown"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9]] * 2,
+        market_cap=[[5e10, float("nan")]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["known"]
+
+
+def test_the_growth_screen_requires_a_market_cap_above_the_threshold():
+    """市值必须**严格大于** 100 亿：恰好 100 亿不算，100 亿零 1 元才算。"""
+    index = pd.bdate_range("2024-01-02", periods=2)
+    columns = ["small", "edge", "big"]
+    frames = growth_frames(
+        index,
+        columns,
+        pe=[[1.0, 1.0, 1.0]] * 2,
+        pe_percentile=[[0.01, 0.01, 0.01]] * 2,
+        peg=[[0.3, 0.3, 0.3]] * 2,
+        drawdown_1y=[[0.9, 0.9, 0.9]] * 2,
+        market_cap=[[9e9, 1e10, 1e10 + 1]] * 2,
+    )
+    from mbt.data.panel import Panel
+
+    got = undervalued_growth_screen(top_n=5).apply(Panel(frames))
+
+    assert got.candidates(index[0]) == ["big"]
+
+
+def test_drawdown_fields_computes_from_the_full_history(make_market, make_prices):
+    """``drawdown_fields`` 由行情算出跌幅：窗口内最高价 12、末根收盘 6 → 0.5。"""
+    highs = [10.0, 12.0, 11.0, 9.0, 6.0]
+    prices = make_prices(highs)
+    prices["high"] = highs  # make_prices 令 o=h=l=c，这里只要 high 与 close 不同
+
+    fields = drawdown_fields([make_market("sh600000", prices)], lookback=5)
+
+    got = fields[DRAWDOWN_FIELD]["sh600000"]
+    assert pd.isna(got.iloc[3]), "不足 5 根处为缺失"
+    assert got.iloc[-1] == pytest.approx(1.0 - 6.0 / 12.0)
+
+
+def test_drawdown_fields_rejects_an_empty_universe():
+    with pytest.raises(ValueError, match="至少要有一个标的"):
+        drawdown_fields([])
+
+
+# --- 选股规则：买入条件（旧版，留作对照） --------------------------------------
 
 
 def test_the_valuation_screen_keeps_the_cheapest_qualifying_symbol():
@@ -149,7 +312,7 @@ class _Holder:
 
 def _run_with_signals(make_market, make_prices, zero_cost_rules, **overrides):
     """6 根恒定价，信号可覆盖；返回回测结果。"""
-    from examples.strategies import ValuationReversal
+    from examples.strategies import UndervaluedGrowth
 
     markets = [make_market("sh600000", make_prices([10.0] * 8))]
     index = markets[0].prices.index
@@ -157,7 +320,7 @@ def _run_with_signals(make_market, make_prices, zero_cost_rules, **overrides):
 
     return run_portfolio_backtest(
         markets,
-        ValuationReversal,
+        UndervaluedGrowth,
         cash=100_000.0,
         max_positions=1,
         rules=zero_cost_rules,
@@ -217,7 +380,7 @@ def test_missing_signals_never_trigger_an_exit(make_market, make_prices, zero_co
 
 def test_the_strategy_does_not_buy_when_the_gate_says_no(make_market, make_prices, zero_cost_rules):
     """买入闸门关着就不买——买入条件属于选股规则，策略不自己重算一遍（ADR-0001）。"""
-    from examples.strategies import ValuationReversal
+    from examples.strategies import UndervaluedGrowth
 
     markets = [make_market("sh600000", make_prices([10.0] * 8))]
     index = markets[0].prices.index
@@ -225,7 +388,7 @@ def test_the_strategy_does_not_buy_when_the_gate_says_no(make_market, make_price
 
     result = run_portfolio_backtest(
         markets,
-        ValuationReversal,
+        UndervaluedGrowth,
         cash=100_000.0,
         max_positions=1,
         rules=zero_cost_rules,

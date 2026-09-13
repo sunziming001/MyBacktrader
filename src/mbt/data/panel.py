@@ -105,6 +105,43 @@ class Panel:
         )
 
 
+def clip_fields(
+    fields: dict[str, pd.DataFrame],
+    markets,
+    *,
+    start=None,
+    end=None,
+) -> dict[str, pd.DataFrame]:
+    """把算好的信号截到回测区间，并对齐到 ``markets`` 的标的与顺序。
+
+    **为什么必须先算后截**：回看类信号（估值百分位要看 1000 个交易日、跌幅要看 252 个）若拿
+    **已截断**的行情去算，区间开头的窗口就只剩几天——截短了**不会报错**，只会让开头那段日子的
+    值失真、或整段变成缺失而被过滤条件静默排除。故顺序是：用**完整历史**算，再截到回测区间。
+
+    它同时服务两类信号（估值来自财务、跌幅来自行情），故住在**面板**这一层而不是某一类信号的
+    模块里。
+
+    截断口径与 :func:`~mbt.data.loader.slice_markets` 一致（``.loc`` 两端含），并保留
+    ``markets`` 的列顺序——引擎那边的行情面板正是按那个顺序组装的，顺序不同会被
+    :class:`Panel` 判为不一致（这是对的：顺序不同往往意味着两份数据来源对不上，而静默重排
+    会掩盖它）。
+    """
+    lower = pd.Timestamp(start) if start else None
+    upper = pd.Timestamp(end) if end else None
+    symbols = [market.symbol for market in markets]
+
+    clipped = {}
+    for name, frame in fields.items():
+        one = frame.loc[lower:upper] if lower is not None or upper is not None else frame
+        missing = [symbol for symbol in symbols if symbol not in one.columns]
+        if missing:
+            raise MarketDataError(
+                f"信号 {name!r} 缺少标的 {missing[:3]}…——它与行情不是同一次取数的产物"
+            )
+        clipped[name] = one[symbols]
+    return clipped
+
+
 def with_signals(panel: Panel, signals: Mapping[str, pd.DataFrame] | None) -> Panel:
     """把**额外信号**并进面板，供选股规则取用；``None`` 或空则原样返回。
 

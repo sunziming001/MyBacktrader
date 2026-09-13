@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from mbt.signals.factors import distance_to_high, momentum
+from mbt.signals.factors import distance_to_high, drawdown_from_high, momentum
 from mbt.signals.filters import (
     above_ma,
     ma_cross_up,
@@ -29,6 +29,7 @@ __all__ = [
     "above_ma",
     "atr",
     "distance_to_high",
+    "drawdown_from_high",
     "ma_cross_up",
     "momentum",
     "new_high",

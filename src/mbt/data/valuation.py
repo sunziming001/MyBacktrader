@@ -77,9 +77,15 @@ PE = "pe"
 PE_PERCENTILE = "pe_percentile"
 #: PEG 字段名。
 PEG = "peg"
+#: 总市值字段名（元）。
+#:
+#: ``= 总股本 × 收盘价``——**用原始价**，与 PE 同一个理由：市值是当时的真实市值，用后复权价
+#: 会把它随首根放大（实测 ``sh600000`` 放大 13.38 倍）。它只作**过滤条件**用（如「市值 >
+#: 100 亿」），不参与收益计算。
+MARKET_CAP = "market_cap"
 
 #: 本模块产出的字段，按构造顺序。给调用方**显式声明**用（与 ``SCREEN_FIELDS`` 同一精神）。
-VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG)
+VALUATION_FIELDS = (PE, PE_PERCENTILE, PEG, MARKET_CAP)
 
 #: 百分位的默认窗口（交易日）——约 4 年。
 DEFAULT_WINDOW = 1000
@@ -167,10 +173,16 @@ class Valuation:
     pe: pd.DataFrame
     pe_percentile: pd.DataFrame
     peg: pd.DataFrame
+    market_cap: pd.DataFrame
 
     def as_fields(self) -> dict[str, pd.DataFrame]:
         """字段名 → 标的宽表，供装进 :class:`~mbt.data.panel.Panel` 或交给策略。"""
-        return {PE: self.pe, PE_PERCENTILE: self.pe_percentile, PEG: self.peg}
+        return {
+            PE: self.pe,
+            PE_PERCENTILE: self.pe_percentile,
+            PEG: self.peg,
+            MARKET_CAP: self.market_cap,
+        }
 
 
 def build_valuation(
@@ -211,6 +223,7 @@ def build_valuation(
         pe=pe,
         pe_percentile=pe_percentile(pe, window),
         peg=price_earnings_growth(pe, growth),
+        market_cap=close * shares,
     )
 
 
@@ -244,40 +257,6 @@ def _point_in_time(steps: list[tuple[dt.date, float]], index: pd.DatetimeIndex) 
     values = pd.Series([value for _, value in steps], index=stamps, dtype=float)
     values = values[~values.index.duplicated(keep="last")].sort_index()
     return values.reindex(index, method="ffill")
-
-
-def clip_fields(
-    fields: dict[str, pd.DataFrame],
-    markets,
-    *,
-    start=None,
-    end=None,
-) -> dict[str, pd.DataFrame]:
-    """把算好的信号截到回测区间，并对齐到 ``markets`` 的标的与顺序。
-
-    **为什么必须先算后截**：百分位的回看窗口是 1000 个交易日。若拿着**已截断**的行情去算，
-    区间开头的窗口就只剩几天——而它是本策略的核心输入，截短了不会报错，只会让开头那段日子
-    的「分位」失真。故顺序是：用**完整历史**算，再截到回测区间。
-
-    截断口径与 :func:`~mbt.data.loader.slice_markets` 一致（`.loc` 两端含），并保留
-    ``markets`` 的列顺序——引擎那边的行情面板正是按那个顺序组装的，顺序不同会被
-    :class:`~mbt.data.panel.Panel` 判为不一致（这是对的：顺序不同往往意味着两份数据来源
-    对不上，而静默重排会掩盖它）。
-    """
-    symbols = [market.symbol for market in markets]
-    lower = pd.Timestamp(start) if start else None
-    upper = pd.Timestamp(end) if end else None
-
-    clipped = {}
-    for name, frame in fields.items():
-        one = frame.loc[lower:upper] if lower is not None or upper is not None else frame
-        missing = [symbol for symbol in symbols if symbol not in one.columns]
-        if missing:
-            raise MarketDataError(
-                f"信号 {name!r} 缺少标的 {missing[:3]}…——它与行情不是同一次取数的产物"
-            )
-        clipped[name] = one[symbols]
-    return clipped
 
 
 def valuation_for(
