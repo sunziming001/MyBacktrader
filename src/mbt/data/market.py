@@ -38,6 +38,7 @@ from .adjust import AdjustmentEvent, backward_adjusted, forward_adjusted
 from .anomaly import require_no_anomalies
 from .dilution import DilutionVerdict, resolve_dilution
 from .gbbq import GbbqDataSource
+from .st import InferredStPeriod, infer_st_periods
 from .tdx import TdxDataSource
 
 
@@ -56,12 +57,21 @@ class MarketData:
             :mod:`mbt.data.dilution`）。
         verdicts: 逐条事件的判定记录，含低置信标记。默认空元组——直接构造
             ``MarketData`` 的调用方（如测试）不必提供。
+        st_periods: **推断出的** ST 期间（票据 #53）。默认空元组。它由价格数据推出
+            （判据与已知漏检见 :mod:`mbt.data.st`），**不是**权威的 ST 名单——本地数据
+            没有股票名称。它的用途有二：收紧涨跌幅带（引擎据此撮合），以及给股票池一个
+            可用的「排除 ST」依据（此前那条规则是**空条件**）。
     """
 
     symbol: str
     prices: pd.DataFrame
     events: tuple[AdjustmentEvent, ...]
     verdicts: tuple[DilutionVerdict, ...] = ()
+    st_periods: tuple[InferredStPeriod, ...] = ()
+
+    def was_st(self, on: dt.date) -> bool:
+        """该日是否处于**推断出的** ST 期间。判不出来时返回 ``False``（不猜）。"""
+        return any(period.covers(on) for period in self.st_periods)
 
     def backward_adjusted(self, as_of: dt.date | dt.datetime | None = None) -> pd.DataFrame:
         """**后复权**视图：回测用。首根 K 线价格不变，除权日不再有假跳空。
@@ -124,6 +134,15 @@ def load_market_data(
     prices = TdxDataSource(tdx_root).daily(symbol)
     raw_events = tuple(GbbqDataSource(gbbq_path).events(symbol))
 
+    # **推断 ST 期间，并用它收紧限幅。** 本地数据没有股票名称，出厂表按 ADR-0002 刻意不登记
+    # ST——于是引擎会给一只 5% 的股票按 10% 撮合，把 ST 的一字板当成可成交。判据与已知漏检
+    # 见 `mbt.data.st`。推断在**完整历史**上做（ST 判定要看长窗口），而校验在窗口内做。
+    st_periods = infer_st_periods(prices, symbol, table)
+    if st_periods:
+        table = table.with_st_periods(
+            {symbol: [(period.start, period.end) for period in st_periods]}
+        )
+
     # 校验只做在**回测区间**内，理由见上面的 docstring。
     window = _window_of(prices, start, end)
 
@@ -133,7 +152,13 @@ def load_market_data(
 
     require_no_anomalies(window, symbol, table, events)
 
-    return MarketData(symbol=symbol, prices=prices, events=events, verdicts=verdicts)
+    return MarketData(
+        symbol=symbol,
+        prices=prices,
+        events=events,
+        verdicts=verdicts,
+        st_periods=st_periods,
+    )
 
 
 def _window_of(prices: pd.DataFrame, start, end) -> pd.DataFrame:
