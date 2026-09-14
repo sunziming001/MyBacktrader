@@ -5,31 +5,35 @@
 式的** ``anchors``，而不是重新识别一遍拐点——同一次计算里，价格结构与量能结构必须吃同一份
 边界，否则「回调缩量」缩的是哪一段都说不清。
 
-三段与三个比值（``T`` 为起涨点，``P`` 为峰值，``S`` 为观测日）::
+三段与四个比值（``T`` 为起涨点，``P`` 为峰值，``S`` 为观测日）::
 
     起涨前基准 = [T − base_bars, T − 1]      上涨段 = [T, P]      回调段 = [P + 1, S]
 
-    surge_ratio    = max(上涨段)      ÷ mean(起涨前基准)   放量倍数
-    top_ratio      = mean(顶部 edge 根) ÷ mean(上涨段)      顶部相对上涨段
-    pullback_ratio = mean(回调段)      ÷ max(上涨段)        缩量倍数
+    surge_ratio           = max(上涨段)        ÷ mean(起涨前基准)   放量倍数
+    top_ratio             = mean(顶部 edge 根) ÷ mean(上涨段)       顶部相对上涨段
+    pullback_ratio        = mean(回调段)       ÷ max(上涨段)        缩量倍数（相对**单日爆量**）
+    pullback_vs_top_ratio = mean(回调段)       ÷ mean(顶部 edge 根) 缩量倍数（相对**顶部段**）
 
-两个参照的取法不是随手定的，是实测出来的（九个样本，见下方各自说明）：
+参照物的取法分两层，两层的依据不同，别混起来：
 
-- ``surge_ratio`` 的分母取**起涨前基准**而不是上涨段自身——否则「放量」会变成「与自己比」。
-- ``pullback_ratio`` 的分母取上涨段的**最大值**而不是均值。用均值时九个样本给出 0.51~2.30
-  （中位 1.08，即「回调期与上涨期一样活跃」），用最大值时是 0.19~0.41（中位 0.32）。缩量是
-  相对**那根爆量**才看得见的，相对均值看不见。
+1. **分母是「哪一段」**：``surge_ratio`` 取**起涨前基准**而不是上涨段自身——否则「放量」会
+   变成「与自己比」。缩量那一条取**上涨段**（``pullback_ratio``，分母是该段里的单日最大量）。
+   另一条路是取**顶部段**（``pullback_vs_top_ratio``）：它更贴原文那句「在上涨的顶部…**而在
+   下跌阶段**，成交量会明显萎缩」里的「而」字，在九个**用户亲自标注**的样本上 9/9 成立。但它
+   **全市场对照更差**——逐笔 8,601 → 3,145、收益率均值 +0.164% → +0.116%、均值/标准误
+   3.90 → 1.68，而被它排掉的 5,969 笔反而更好（均值 +0.190%、均值/标准误 +3.74）。故
+   **没有采用**它，只作为数据保留（ADR-0011）。
+2. **分母取哪个统计量**：``pullback_ratio`` 取上涨段的**最大值**。这个 ``max`` 是历史遗留：
+   当初拿九个样本把分母从均值换成最大值，使样本看起来像缩量——而那九个样本在均值口径下本来
+   就不显示缩量（中位 1.08）。那次取舍没有任何记录，直到 1,109 笔真实成交回头检验才发现问题
+   （53% 的成交按其字面含义并不缩量，ADR-0010）。
 
 .. warning::
 
-    **上面第二个参照的取舍后来被证明是拟合九个样本，不要照字面理解 `pullback_ratio`。**
-    用 1,109 笔真实成交回头检验：按「回调均量 ÷ 上涨**均**量」读，**53% 的成交根本不缩量**
-    （中位 1.04），它们全靠最大值作分母才过线；上涨段「最大量 ÷ 均量」的中位是 2.95 倍。
-
-    故 ``pullback_ratio`` 答的是「相对那根单日爆量，回调是否萎缩」，**不答**「回调是否比上涨
-    安静」。口径与门槛都**保留**（已被三轮全市场回测端到端验证），但换分母**不是等价改写**
-    ——会砍掉约一半候选，必须重定门槛并重跑对照。来龙去脉见
-    ``docs/adr/0010-pullback-ratio-denominator.md``。
+    ``pullback_ratio``（分母是单日最大量）**不可**读作「回调比上涨安静」：实测 1,109 笔成交里
+    53% 按其字面含义并不缩量，上涨段「最大量 ÷ 均量」的中位是 2.95 倍（ADR-0010）。也**不要**
+    把它与 ``pullback_vs_top_ratio`` 当同义词——两者秩相关只有约 0.48，且后者当判据时更差
+    （ADR-0011）。
 """
 
 from __future__ import annotations
@@ -46,9 +50,17 @@ from mbt.signals.swings import Swings
 class VolumeStructure(NamedTuple):
     """上涨段与回调段的量能结构，各为一条标的宽表。
 
-    三个比值都**不是**过滤判断，只是数值——故它们照常遵循指标契约（列 = 时序、行 = 截面），
+    四个比值都**不是**过滤判断，只是数值——故它们照常遵循指标契约（列 = 时序、行 = 截面），
     方向各不同（``surge_ratio`` 越大越放量，``pullback_ratio`` 越小越萎缩），
     故**不要**直接当排序因子用（因子约定「越大越靠前」）。
+
+    两个「缩量」比值的差别只在**分母**，而它们不是彼此的换标度（实测秩相关约 0.48）：
+
+    - ``pullback_ratio``：分母是上涨段的**单日最大量**。它答的是「相对那根爆量，回调是否萎缩」，
+      容易被单根异常量操纵（ADR-0010）。**判据用的就是它。**
+    - ``pullback_vs_top_ratio``：分母是**顶部段均量**。它答的是「回调是否比它前面那段顶部安静」，
+      即原始提示里那个「而」字指向的比较；九个用户标注样本上 9/9 成立，比「相对上涨段**均**量」
+      的 2/9 好得多。**但全市场对照更差**（ADR-0011），故只作数据保留、不作判据。
 
     段边界未确认处一律缺失。
     """
@@ -56,6 +68,7 @@ class VolumeStructure(NamedTuple):
     surge_ratio: pd.DataFrame
     top_ratio: pd.DataFrame
     pullback_ratio: pd.DataFrame
+    pullback_vs_top_ratio: pd.DataFrame
 
 
 def _window_aggregates(
@@ -209,6 +222,7 @@ def _volume_structure(
     surge = np.full((rows, columns), np.nan)
     top_ratio = np.full((rows, columns), np.nan)
     pullback_ratio = np.full((rows, columns), np.nan)
+    pullback_vs_top_ratio = np.full((rows, columns), np.nan)
 
     for row in range(rows):
         peak_pos = np.where(np.isfinite(peak_age[row]), row - peak_age[row], -1.0)
@@ -265,6 +279,10 @@ def _volume_structure(
             surge[row, index] = np.where(base > 0.0, adv_top / base, np.nan)
             top_ratio[row, index] = np.where(adv_mean > 0.0, edge / adv_mean, np.nan)
             pullback_ratio[row, index] = np.where(adv_top > 0.0, pull / adv_top, np.nan)
+            # 分母用**顶部段均量**（`edge`）而不是单根最大值：它答的是「回调比它前面那段顶部
+            # 安静吗」，即原始提示里那个「而」所指向的比较。`edge` 与 `pull` 上面都已算出，
+            # 故这一步不增加任何扫描成本。
+            pullback_vs_top_ratio[row, index] = np.where(edge > 0.0, pull / edge, np.nan)
 
     def frame(values: np.ndarray) -> pd.DataFrame:
         return pd.DataFrame(values, index=volumes.index, columns=volumes.columns, dtype=float)
@@ -273,6 +291,7 @@ def _volume_structure(
         surge_ratio=frame(surge),
         top_ratio=frame(top_ratio),
         pullback_ratio=frame(pullback_ratio),
+        pullback_vs_top_ratio=frame(pullback_vs_top_ratio),
     )
 
 
@@ -289,16 +308,23 @@ def volume_contraction(
 
     两条判据（都取自 :func:`volume_structure`）::
 
-        surge_ratio    >= min_surge      上涨段确实放过量
-        pullback_ratio <= max_pullback   回调段相对爆量明显萎缩
+        surge_ratio            >= min_surge      上涨段确实放过量
+        pullback_vs_top_ratio  <= max_pullback   回调段相对**顶部段**明显萎缩
+
+    第二条的参照物是**顶部段**，不是上涨段的单日最大量。依据是原始提示那句「在上涨的顶部，
+    成交量没有继续放大，保持平量或缩量。**而在下跌阶段**，成交量会明显萎缩」——「而」字把回调
+    那句接在顶部那句之后，故它的天然参照物是紧邻的顶部。九个标注样本实测：顶部口径 9/9 成立，
+    而「相对上涨段均值」只有 3/9（ADR-0011）。
+
+    若要用旧口径（相对单日爆量），那个比值仍在 ``volume_structure.pullback_ratio`` 里可取，
+    但**不要**把它当同义词——两者实测秩相关约 0.48。
 
     参数:
         volumes / anchors / edge_bars / base_bars: 同 :func:`volume_structure`。
         min_surge: 放量倍数下界（如 ``2.0``）。九个样本实测 1.21~15.07、中位 9.27，
             ``2.0`` 通过 8/9。
-        max_pullback: 缩量倍数上界（如 ``0.5``）。九个样本实测 0.19~0.41、中位 0.32，
-            ``0.5`` 通过 9/9——但这九个样本不足以定这个数，且过半真实成交靠最大值作分母
-            才过线（见 :func:`volume_structure` 的警告）。
+        max_pullback: 缩量倍数上界——**现在量的是「回调均量 ÷ 顶部段均量」**。九个标注样本
+            实测 0.298~0.564（中位 0.450），门槛按候选群体的分布定，见 ADR-0011。
 
     .. warning::
 
@@ -306,6 +332,9 @@ def volume_contraction(
         因为九个样本一致地**反过来**：爆量落在上涨段的**末尾**而非开头——量峰在上涨段内的
         相对位置是 0.72~1.00（中位 0.95，0 = 起涨点、1 = 峰值），9/9 都在后半段。
         顶部均量相对上涨段均量是 1.09~5.37 倍（中位 2.39），即顶部正是最活跃的一段。
+
+        （ADR-0011 用**用户自己标注的九个样本**复核过这一条：顶部均量 ÷ 上涨段均量 ≤ 1 的
+        有 **0/9**、中位 2.39。故这次不是「九个样本说反了」，而是标注本身如此。）
 
         唯一能给出「9/9 通过」的写法是「顶部均量 ≤ 上涨段最大量」，但那**是同义反复**：
         顶部段是上涨段的子集，子集的均值不会超过全集的最大值。拿它当判据等于没判据。

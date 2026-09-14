@@ -63,7 +63,12 @@ def test_volume_structure_is_missing_until_the_peak_is_confirmed(symbol_frame):
 
     got = volume_structure(vol, anchors, edge_bars=2, base_bars=4)
 
-    for series_ in (got.surge_ratio, got.top_ratio, got.pullback_ratio):
+    for series_ in (
+        got.surge_ratio,
+        got.top_ratio,
+        got.pullback_ratio,
+        got.pullback_vs_top_ratio,
+    ):
         assert series_["sh600000"].iloc[15:].notna().all()
         assert series_["sh600000"].iloc[:15].isna().all()
 
@@ -168,18 +173,22 @@ def test_volume_contraction_requires_both_conditions(symbol_frame):
 
 
 def test_volume_contraction_is_strict_at_both_bounds(symbol_frame):
-    """两条都是严格比较：恰好等于阈值不算（与 :func:`new_high`、:func:`volume_surge` 一致）。"""
+    """两条都是严格比较：恰好等于阈值不算（与 :func:`new_high`、:func:`volume_surge` 一致）。
+
+    缩量那条的边界值是 **40/500**——即回归后的口径（回调均量 ÷ 上涨段**单日最大量**）。
+    """
     price, vol = volume_sample(symbol_frame)
     anchors = swings_of(price)
+    ratio = 40.0 / 500.0
 
     def at(min_surge, max_pullback):
         return volume_contraction(
             vol, anchors, edge_bars=2, base_bars=4, min_surge=min_surge, max_pullback=max_pullback
         )["sh600000"].iloc[15]
 
-    assert bool(at(5.0, 0.08)) is True  # 恰好相等
-    assert bool(at(5.0 + 1e-9, 0.08)) is False
-    assert bool(at(5.0, 0.08 - 1e-9)) is False
+    assert bool(at(5.0, ratio)) is True  # 恰好相等
+    assert bool(at(5.0 + 1e-9, ratio)) is False
+    assert bool(at(5.0, ratio - 1e-9)) is False
 
 
 def test_volume_contraction_returns_plain_bools_and_never_missing(symbol_frame):
@@ -203,7 +212,12 @@ def test_volume_structure_keeps_the_symbol_frame_shape_and_float_dtype(symbol_fr
 
     got = volume_structure(vol, anchors, edge_bars=2, base_bars=4)
 
-    for series_ in (got.surge_ratio, got.top_ratio, got.pullback_ratio):
+    for series_ in (
+        got.surge_ratio,
+        got.top_ratio,
+        got.pullback_ratio,
+        got.pullback_vs_top_ratio,
+    ):
         assert list(series_.columns) == ["sh600000"]
         assert series_.index.equals(vol.index)
         assert all(dtype.kind == "f" for dtype in series_.dtypes)
@@ -273,7 +287,7 @@ def test_volume_structure_never_depends_on_bars_after_the_evaluation_day(symbol_
         vol_k = vol.iloc[:k]
         anchors_k = swings_of(price_k, retracement=0.05)
         got = volume_structure(vol_k, anchors_k, edge_bars=3, base_bars=5)
-        for name in ("surge_ratio", "top_ratio", "pullback_ratio"):
+        for name in ("surge_ratio", "top_ratio", "pullback_ratio", "pullback_vs_top_ratio"):
             expected = getattr(full, name).iloc[:k]
             pd.testing.assert_frame_equal(getattr(got, name), expected, check_exact=True)
         checked += int(full.surge_ratio.iloc[:k].notna().to_numpy().sum())
@@ -301,7 +315,7 @@ def test_volume_structure_is_invariant_to_scaling_the_volume_series(symbol_frame
     plain = volume_structure(vol, anchors, edge_bars=3, base_bars=5)
     scaled = volume_structure(vol * 7.5, anchors, edge_bars=3, base_bars=5)
 
-    for name in ("surge_ratio", "top_ratio", "pullback_ratio"):
+    for name in ("surge_ratio", "top_ratio", "pullback_ratio", "pullback_vs_top_ratio"):
         pd.testing.assert_frame_equal(getattr(scaled, name), getattr(plain, name), rtol=1e-12)
     assert plain.surge_ratio.notna().to_numpy().sum() > 20, "样本太稀薄，这条性质没被真正检验"
 
@@ -345,7 +359,7 @@ def test_output_of_a_symbol_does_not_depend_on_which_other_symbols_are_present(s
             edge_bars=3,
             base_bars=5,
         )
-        for name in ("surge_ratio", "top_ratio", "pullback_ratio"):
+        for name in ("surge_ratio", "top_ratio", "pullback_ratio", "pullback_vs_top_ratio"):
             pd.testing.assert_frame_equal(
                 getattr(alone, name), getattr(many, name)[[symbol]], check_exact=True
             )
@@ -407,3 +421,60 @@ def test_the_work_grows_with_the_number_of_symbols_not_with_its_square(symbol_fr
         f"标的数翻倍（4→8），窗口计算量却涨了 {growth:.1f} 倍："
         f"线性应当在 2 倍上下，接近 4 倍说明二次开销又回来了"
     )
+
+
+# --- 回调缩量：参照物取「顶部段」而不是「上涨段最大值」 ----------------------------
+
+
+def test_pullback_vs_top_ratio_divides_by_the_top_segment_not_the_advance_max(symbol_frame):
+    """新比值的分母是**顶部段均量**，与 ``pullback_ratio``（分母是上涨段最大值）不是同一个量。
+
+    夹具同前：基准 [6,9] = 100、上涨段 [10,14] 最大 500 / 均值 180、顶部两根 [13,14] 均值 300、
+    回调 [15] = 40。故
+
+    - ``pullback_ratio``        = 40 / **500** = 0.08（分母是上涨段**最大**量）
+    - ``pullback_vs_top_ratio`` = 40 / **300** = 0.1333…（分母是**顶部段均量**）
+
+    两者刻意放在一条测试里断言：它们是**两个不同的量**（不是彼此的换标度），若实现把新字段
+    也算成 40/500，这条会红；若把旧字段一起改掉，前半句会红。
+    """
+    price, vol = volume_sample(symbol_frame)
+    anchors = swings_of(price)
+
+    got = volume_structure(vol, anchors, edge_bars=2, base_bars=4)
+
+    row = 15
+    assert got.pullback_ratio["sh600000"].iloc[row] == pytest.approx(0.08)
+    assert got.pullback_vs_top_ratio["sh600000"].iloc[row] == pytest.approx(40.0 / 300.0)
+
+
+def test_volume_contraction_judges_the_spike_referenced_ratio(symbol_frame):
+    """``volume_contraction`` 的缩量那条看的是 **``pullback_ratio``**（÷ 上涨段单日最大量）。
+
+    夹具上两个比值分居一个门槛的两侧，故这条能判别实现用的是哪一个：
+
+    - ``pullback_ratio``（÷ 500）        = 0.08  <= 0.10 → 放行
+    - ``pullback_vs_top_ratio``（÷ 300） = 0.133 >  0.10 → 不放行
+
+    取 ``max_pullback=0.10`` 断言为 ``True``，即「仍在看单日爆量那个分母」。
+
+    **为什么不是顶部口径**：顶部口径实现过、也跑过全市场对照，结果是**更差**——逐笔从 8,601
+    降到 3,145、收益率均值 +0.164% → +0.116%、均值/标准误 3.90 → 1.68，而被它排掉的那 5,969 笔
+    反而是更好的交易（均值 +0.190%、均值/标准误 +3.74）。即「相对顶部安静」与收益**反向**。
+    故判据改回，``pullback_vs_top_ratio`` 只作为**数据**保留（见 ADR-0011）。
+    """
+    price, vol = volume_sample(symbol_frame)
+    anchors = swings_of(price)
+
+    def fires(max_pullback):
+        return volume_contraction(
+            vol,
+            anchors,
+            edge_bars=2,
+            base_bars=4,
+            min_surge=2.0,
+            max_pullback=max_pullback,
+        )["sh600000"].iloc[15]
+
+    assert bool(fires(0.10)) is True, "0.08 <= 0.10，看的是爆量口径"
+    assert bool(fires(0.07)) is False, "0.08 > 0.07，收紧就该挡住——证明上一条不是恒真"

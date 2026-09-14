@@ -359,3 +359,53 @@ def test_the_contained_run_filter_is_wired_and_can_bite(b1_setup):
     # 原始夹具上反过来：回调段没有内含，故门槛收到 1 也咬不到——这正是「只看调整期」的
     # 直接体现（不是「历史上出现过就排除」）。
     assert list(selected_bars(b1_screen(contained_days=1), b1_setup)) == list(PASSING_BARS)
+
+
+def test_the_volume_filter_judges_the_pullback_against_the_spike_not_the_top(b1_setup):
+    """量能那条的**参照物**是「上涨段单日最大量」，不是「顶部段」。
+
+    为什么需要这条：夹具原来的上涨段末尾是**平的 6000**，故「顶部段均量」与「上涨段最大量」
+    相等，两个口径给出同一个数——换参照物时全套测试没红。这里把量改成**爆量在中段、顶部反而
+    安静**，两口径才分家：
+
+    - 上涨段 90 根：前 45 根 1000 → 8000，后 45 根 8000 → 1800（故顶部 3 根系均约 1941）
+    - 回调段 11 根：1200
+
+    ====================  ==================  ==========  ==============
+    口径                  算式                结果        门槛 0.5
+    ====================  ==================  ==========  ==============
+    相对上涨段**最大**量   1200 / 8000         0.150       **放行**
+    相对**顶部段均量**     1200 / 1940.9       0.618       不放行
+    ====================  ==================  ==========  ==============
+
+    故默认参数下**仍应入选**（判据看的是前者）。这条断言是**双向**的：收紧门槛到 0.10 之后
+    必须变空，否则它就退化成一条恒真的断言。
+
+    **顶部口径为什么不在用**：它实现过、也跑过全市场对照，结果为**更差**——逐笔 8,601 → 3,145、
+    收益率均值 +0.164% → +0.116%、均值/标准误 3.90 → 1.68，而被它排掉的 5,969 笔反而更好
+    （均值 +0.190%、均值/标准误 +3.74）。见 ADR-0011。
+    """
+    import numpy as np
+
+    from examples.strategies import b1_screen
+    from mbt.data import Panel
+
+    close, _ = climb_fall_bounce()
+    bars = len(close)
+    volume = np.full(bars, 1000.0)
+    # 上涨段 = [40, 129]（夹具里 up 的 90 根），爆量在中段、到顶部已回落
+    volume[40:130] = np.concatenate(
+        [np.linspace(1000.0, 8000.0, 45), np.linspace(8000.0, 1800.0, 45)]
+    )
+    volume[130:] = 1200.0  # 回调与反弹
+
+    fields = dict(b1_setup.fields)
+    fields["volume"] = pd.DataFrame({"sh600000": volume}, index=b1_setup["close"].index)
+    flat = Panel(fields)
+
+    assert (
+        selected_bars(b1_screen(), flat) != []
+    ), "相对上涨最大量是 0.15 <= 0.5，该入选——若为空说明判据改看顶部段了"
+    assert (
+        selected_bars(b1_screen(max_pullback=0.10), flat) == []
+    ), "把门槛收到 0.10 应当挡住 0.15——否则这条过滤器没在起作用"
