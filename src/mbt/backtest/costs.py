@@ -147,16 +147,34 @@ class _LivePositions(collections.defaultdict):
 class AStockBroker(bt.brokers.BackBroker):
     """撮合侧的 A 股硬约束，以及把成交日与标的注入费用对象。
 
-    四条约束共用 ``_try_exec`` 这一个接入点，但**处置方式刻意不同**：
+    若干约束共用 ``_try_exec`` 这一个接入点，但**处置方式与判据时点刻意不同**：
 
     - **涨跌停不可成交、当日无成交**：本日**不具备成交条件**，故保留挂单，
       引擎会自动把它挪到下一根 K 线再试（即用户选定的「挂单保留至下一可交易日」）。
+      按**成交那一根**判——它问的是「此刻能不能成交」，是执行现实。
     - **T+1**：本单在当日**不合法**，故 ``reject()`` 终结，不拖到次日。
-    - **股票池外买入**：资格问题不会因等待而消失，故 ``reject()`` 终结并留痕。
-      **卖出不受限**——持仓可能因调仓或数据变化掉出池子，禁卖会把持仓卡死。
-    - **未被选股规则选中**：同上，买入被拒、卖出不受限。
+    - **股票池外买入**：``reject()`` 终结并留痕。**卖出不受限**——持仓可能因调仓或数据变化
+      掉出池子，禁卖会把持仓卡死。按**下单那一根**判，见下。
+    - **未被选股规则选中**：同上，买入被拒、卖出不受限。按**下单那一根**判，见下。
+    - **已达最大持仓只数**：按**成交那一根**判——它问的是「此刻组合还有没有名额」，
+      是执行现实（同一根上两笔买单只有先到的那笔能占名额）。
     - **长期无 K 线**：标的停牌超过 ``order_expiry_ticks`` 个交易日即 ``reject()``。
       「保留至下一可交易日」在单标的下是「下一天」，停牌数月时就变成「另一笔交易」。
+
+    ## 「股票池 / 选股」按**下单那根**判，不按成交那根
+
+    订单在 T 根收盘下定、在 **T+1 根开盘**成交（``coc=False``，实测成交价即次根开盘价）。
+    于是「它该不该被买」这个问题有两个可能的判据时点，本项目选 **T**：
+
+    - 下单是策略在 T 根做出的**决定**，判据自然属于那一刻；
+    - 在 T+1 复查会造出一条**没人声明过的额外过滤**——实测（326 标的、2,701 根）B1 的入选
+      格里有 **86.3% 只连续入选一天**，若按 T+1 复查，这些订单**必然**被拒（拒单理由写作
+      「未被选股规则选中」），入场条件就悄悄变成了「入选 **且** 次日仍入选」。
+
+    这不是放松约束：策略在 T 根下单的前提本就是「T 根被选中」（它读的是
+    ``broker.selection_mask``），故按 T 判与按 T+1 判在**守规矩的策略**上只在「次日恰好
+    不入选」这一类格子上分岔——而那正是不该被拦的一类。池外/未选中的标的若被别的策略
+    硬买，仍会在下单那根被拒。
 
     区分依据是引擎的挂单循环：``_try_exec`` 返回后，订单若仍 ``alive()`` 就会被
     重新放回 pending 队列；被拒则不再存活。因此「不成交」只需什么都不做。
@@ -293,11 +311,12 @@ class AStockBroker(bt.brokers.BackBroker):
             # T+1：当日买入的股份当日不可卖。交易所就是拒单，故不得留到次日。
             return self._reject(order, "T+1：当日买入的股份当日不可卖")
 
-        if order.isbuy() and self._mask_says(self.p.universe, order) is False:
-            # 股票池外买入：资格问题不会因等待而消失，故拒单而不是保留挂单。
+        # 「池外不可买」「未被选中不可买」按**下单那一根**判，不按成交这一根——下单是策略
+        # 在那一根做出的决定，而成交只是它的执行。理由见类文档的专节。
+        if order.isbuy() and self._mask_says(self.p.universe, order, at_creation=True) is False:
             return self._reject(order, "不在股票池内")
 
-        if order.isbuy() and self._mask_says(self.p.selection, order) is False:
+        if order.isbuy() and self._mask_says(self.p.selection, order, at_creation=True) is False:
             # 当日未被选股规则选中。与出池分开报，因为两者的处置不同：出池要清仓，
             # 没被选中只是今天不买。
             return self._reject(order, "未被选股规则选中")
@@ -384,10 +403,15 @@ class AStockBroker(bt.brokers.BackBroker):
             return None
         return bt.num2date(best).date()
 
-    def _mask_says(self, frame, order):
-        """查标的宽表掩码。返回 ``None`` 表示「无掩码，无从判断」。"""
+    def _mask_says(self, frame, order, *, at_creation: bool = False):
+        """查标的宽表掩码。返回 ``None`` 表示「无掩码，无从判断」。
+
+        ``at_creation=True`` 时用**下单那一根**的日期，而不是成交这一根——两者的区别与理由
+        见类文档的专节。实现上取 ``order.created.dt``（backtrader 在创建订单时记下的浮点
+        日期序号），它**不需要**任何额外状态：订单自己带着它。
+        """
         symbol = getattr(order.data, "_mbt_symbol", None)
-        on = self._today()
+        on = self._creation_date(order) if at_creation else self._today()
         if frame is None or symbol is None or on is None:
             return None
         if symbol not in frame.columns:
@@ -396,6 +420,18 @@ class AStockBroker(bt.brokers.BackBroker):
         if stamp not in frame.index:
             return False
         return bool(frame.at[stamp, symbol])
+
+    def _creation_date(self, order):
+        """订单创建那一根的日期；取不到则退回主时钟。
+
+        ``created.dt`` 是浮点日期序号（0 表示未设）。取不到就退回 ``_today()``——那会让判据
+        退化成「按成交那根判」，即旧行为，而旧行为是**更严**的一侧，故这个降级是安全的：
+        它只会更少成交，不会凭空多成交。
+        """
+        created = getattr(getattr(order, "created", None), "dt", None)
+        if not created:
+            return self._today()
+        return bt.num2date(created).date()
 
     def _execute(self, order, ago=None, price=None, cash=None, position=None, dtcoc=None):
         result = super()._execute(

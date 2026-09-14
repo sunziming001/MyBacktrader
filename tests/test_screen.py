@@ -590,3 +590,147 @@ def test_without_a_screen_nothing_is_gated_by_selection(make_market, zero_cost_r
     )
 
     assert len(result.trades) == 2
+
+
+# --- 掩码按**下单那根**判，不按成交那根（B1 那次改动的落点） --------------------
+
+
+def selective_bars(open_, close, start="2024-01-02"):
+    """由给定开/收盘造字段宽表：high/low 各留一点振幅，避免被当成一字板。"""
+    index = pd.bdate_range(start, periods=len(close))
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": [max(o, c) * 1.001 for o, c in zip(open_, close, strict=True)],
+            "low": [min(o, c) * 0.999 for o, c in zip(open_, close, strict=True)],
+            "close": close,
+            "volume": [1000] * len(close),
+        },
+        index=index,
+    )
+
+
+class BuyWhenSelected(bt.Strategy):
+    """只在**被选股规则选中**的那一根下买单——B1 的 `_enter_if_selected` 同一形状。"""
+
+    def next(self):
+        today = self.data.datetime.date(0)
+        mask = self.broker.selection_mask
+        if mask is not None and bool(mask.at[pd.Timestamp(today), self.data._name]):
+            self.buy()
+
+
+def test_a_buy_fills_at_the_next_open_even_if_the_selection_is_gone_by_then(
+    make_market, zero_cost_rules
+):
+    """**本期改动的落点**：选股只在 T 根成立，T+1 已不成立，订单**照样成交**。
+
+    改之前：撮合在**成交那一根**（T+1）复查选股掩码，于是这笔单一律被拒，理由写作
+    「未被选股规则选中」。实测（326 标的、2,701 根）B1 的入选格里有 **86.3% 只连续成立一天**，
+    故那道复查实际上把入场条件悄悄改成了「入选 **且** 次日仍入选」。
+
+    构造：收盘 [10.6, 10.0, 10.0]，选股规则是「收盘 > 10.5」，故掩码 = [True, False, False]。
+    策略在第 0 根下单；第 1 根掩码已为 False。断言**成交了**，且成交价 = 第 1 根的**开盘价**
+    （11.0，刻意与收盘 10.0 不同，以证明用的是下一根开盘而不是当根收盘）。
+    """
+    from mbt.backtest import run_portfolio_backtest
+    from mbt.universe import UniverseRules
+
+    prices = selective_bars(open_=[10.6, 11.0, 11.0], close=[10.6, 10.0, 10.0])
+    market = make_market("sh600000", prices)
+    screen = Screen(filters=(lambda p: p["close"] > 10.5,))
+
+    result = run_portfolio_backtest(
+        [market],
+        BuyWhenSelected,
+        cash=1_000_000.0,
+        max_positions=1,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+        screen=screen,
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    buys = result.trades[result.trades["size"] > 0]
+    assert len(buys) == 1, "掩码在 T 根成立，订单应当成交"
+    assert buys.iloc[0]["price"] == pytest.approx(11.0), "成交价必须是下一根的开盘价"
+    assert len(result.rejected) == 0, "不该有任何拒单"
+
+
+def test_a_buy_is_still_refused_when_the_selection_never_held_at_creation(
+    make_market, zero_cost_rules
+):
+    """对照：下单那根**就没被选中**时照样拒单——这道守卫没有被削弱。
+
+    构造：收盘 [10.0, 10.6, 10.6]，选股规则是「收盘 > 10.5」。策略在第 0 根下单，而第 0 根
+    收盘 10.0 **未**被选中；第 1 根才被选中。旧口径（按成交那根判）会**成交**，新口径
+    （按下单那根判）会**拒单**——故这条同时证明判据时点真的换了，不是「两处都放过」。
+    """
+    from mbt.backtest import run_portfolio_backtest
+    from mbt.universe import UniverseRules
+
+    prices = selective_bars(open_=[10.0, 10.6, 10.6], close=[10.0, 10.6, 10.6])
+    market = make_market("sh600000", prices)
+    screen = Screen(filters=(lambda p: p["close"] > 10.5,))
+
+    class BuyOnFirstBar(bt.Strategy):
+        def next(self):
+            if len(self) == 1:
+                self.buy()
+
+    result = run_portfolio_backtest(
+        [market],
+        BuyOnFirstBar,
+        cash=1_000_000.0,
+        max_positions=1,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+        screen=screen,
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    assert len(result.trades) == 0, "下单那根没被选中，不该成交"
+    assert len(result.rejected) == 1
+    assert result.rejected.iloc[0]["reason"] == "未被选股规则选中"
+
+
+def test_the_pool_mask_is_also_judged_on_the_creation_bar(make_market, zero_cost_rules):
+    """股票池那条走同一口径：池子**在下单那根**成立即可，成交那根不复查。
+
+    池子通常按「上市满 N 个交易日」算，本来就会连续成立多日；但与选股掩码走两个口径是
+    说不通的——两者都是「这根下不下单」的判据，故一并按创建日判。
+    """
+    from mbt.backtest import run_portfolio_backtest
+    from mbt.universe import UniverseRules
+
+    prices = selective_bars(open_=[10.0, 11.0, 11.0], close=[10.0, 10.0, 10.0])
+    market = make_market("sh600000", prices)
+
+    # 池子：只在前两根内成立（min_bars=1 时第 0 根就够，之后仍成立），故改用 extra_mask
+    # 把第 1 根起踢出池子——这正好是「下单那根在池、成交那根不在」的情形。
+    inside = pd.DataFrame(
+        {"sh600000": [True, False, False]},
+        index=prices.index,
+    )
+    rules = UniverseRules(min_trading_days=0, extra_mask=inside)
+
+    class BuyOnFirstBar(bt.Strategy):
+        def next(self):
+            if len(self) == 1:
+                self.buy()
+
+    result = run_portfolio_backtest(
+        [market],
+        BuyOnFirstBar,
+        cash=1_000_000.0,
+        max_positions=1,
+        rules=zero_cost_rules,
+        universe_rules=rules,
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    assert len(result.trades) == 1, "下单那根在池内，应当成交"
+    assert result.trades.iloc[0]["price"] == pytest.approx(11.0)
