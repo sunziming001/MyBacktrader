@@ -142,6 +142,7 @@ class Screen:
         *,
         as_of: dt.date | dt.datetime | str | None = None,
         universe_mask: pd.DataFrame | None = None,
+        progress=None,
     ) -> ScreenResult:
         """算出整张候选集。
 
@@ -157,6 +158,13 @@ class Screen:
 
                 给了 ``as_of`` 时掩码会被**同样截断**到该日——否则两者的形状必然对不上
                 （面板截了、掩码没截），而这会以「形状不一致」报错的形式暴露出来。
+            progress: 进度上报的接收端（:class:`~mbt.progress.ProgressReporter`）。``None``
+                （默认）时不输出。给出时**逐个过滤器**上报一次——每个过滤器都要独立扫一遍
+                整张面板，全市场尺度下单个过滤器就是分钟量级，而在此之前它没有任何输出
+                （见 :mod:`mbt.progress`）。
+
+                名字取部件的 ``__name__``：过滤器常写成局部函数（如 ``worth_the_risk``），
+                有名字；写成 ``lambda`` 的会得到 ``<lambda>``，一样能读。
 
         返回:
             :class:`ScreenResult`。
@@ -184,6 +192,11 @@ class Screen:
 
         selected = pd.DataFrame(True, index=index, columns=columns)
         for i, one_filter in enumerate(self.filters):
+            if progress is not None:
+                progress.stage(
+                    f"过滤器 {i + 1}/{len(self.filters)}：{_part_name(one_filter)}",
+                    note="每个过滤器各扫一遍整张面板",
+                )
             out = _validate(one_filter(working), index, columns, f"第 {i + 1} 个过滤器")
             if out.dtypes.map(lambda dtype: dtype.kind != "b").any():
                 raise ValueError(
@@ -194,6 +207,8 @@ class Screen:
 
         scores = pd.DataFrame()
         if self.factor is not None:
+            if progress is not None:
+                progress.stage(f"排序因子：{_part_name(self.factor)}")
             scores = _validate(self.factor(working), index, columns, "排序因子")
             if scores.dtypes.map(lambda dtype: dtype.kind != "f").any():
                 raise ValueError(
@@ -422,6 +437,16 @@ def _truncate(panel: Panel, as_of) -> Panel:
 def _shape_of(panel: Panel) -> tuple[pd.Index, pd.Index]:
     frame = next(iter(panel.fields.values()))
     return frame.index, frame.columns
+
+
+def _part_name(part) -> str:
+    """部件在进度里的名字：优先用它自己的 ``__name__``。
+
+    过滤器与因子在本项目里常写成**有名字的局部函数**（``def trend(panel)``），因为规则要能被
+    人读懂；``lambda`` 也有名字（``"<lambda>"``）。只有**可调用对象**（实现了 ``__call__`` 的
+    类实例）才没有 ``__name__``，那时退回类型名——宁可报个含糊的名字，也不去猜。
+    """
+    return getattr(part, "__name__", None) or type(part).__name__
 
 
 def _validate(out, index, columns, label: str) -> pd.DataFrame:

@@ -32,6 +32,7 @@ mbt backtest --strategy mypkg.strategies:MyStrategy ...             # 你自己�
 from __future__ import annotations
 
 import backtrader as bt
+import numpy as np
 import pandas as pd
 
 from mbt.screen import Screen
@@ -40,13 +41,21 @@ from mbt.screen import Screen
 class EngineClock:
     """取**引擎主时钟**：各标的当前日期里的**最大者**。这就是「今天」。
 
-    做法就是把 ``self.datas`` 扫一遍取最大值，理由是：有 K 线的标的其日期正是时钟，停牌的
-    或尚未开始的落后，故最大值恰是时钟本身。
-
     **不要用 ``self.data0.datetime.date(0)``。** 若第一个标的的历史比回测区间短（次新股、
     北交所早期、或 ``--limit`` 随手选中的任意一只），它的日期会**一直停在末根**，于是掩码
     查到的是**另一天**——不报错，只是结果错。引擎内部记账时踩过同一个坑（见
     ``mbt.backtest.engine._EngineClock``，本类与它同源）。
+
+    **但这个值不必自己扫**：backtrader 每 tick 已经把它写进了**策略自己的** ``datetime`` 线
+    ——runonce 走 ``Strategy._oncepost(dt)``（``dt`` 是 cerebro 取的「各标的下一根日期的最小
+    者」，而它已把所有 ``advance_peek() <= dt`` 的标的推进过，推完之后那个最小者恰好就是各
+    标的当前日期的最大者），runnext 走 ``Strategy._clk_update``（直接写
+    ``max(d.datetime[0] for d in self.datas if len(d))``）。两条路径都在调用 ``next()`` 之前
+    把值写好，故读 ``self.datetime.date(0)`` 与扫一遍 ``self.datas`` 是同一个结果。
+
+    差别只在代价上：扫一遍是每 tick × 每标的，全市场是 4752 × 2701 = 1280 万次
+    ``len()`` + ``date()``。**注意是 ``self.datetime``（策略自己的时钟线），不是
+    ``self.data0.datetime``**——后者正是上面那个坑。
 
     .. note::
 
@@ -56,14 +65,7 @@ class EngineClock:
     """
 
     def today(self) -> pd.Timestamp:
-        latest = None
-        for data in self.datas:
-            if len(data) == 0:
-                continue  # 该标的尚未开始（首根晚于当前 tick）
-            current = data.datetime.date(0)
-            if latest is None or current > latest:
-                latest = current
-        return pd.Timestamp(latest)
+        return pd.Timestamp(self.datetime.date(0))
 
 
 def signal_value(signals, field, today, name) -> float:
@@ -288,13 +290,17 @@ class B1(bt.Strategy, EngineClock):
         self._armed: set[str] = set()
         self._trimmed: set[str] = set()
         self._stop_price: dict[str, float] = {}
+        # 下面几份是「本根该遍历谁」的索引，第一次 ``next()`` 时才建（那时 ``self.datas`` 才齐）。
+        self._data_by_name: dict[str, object] = {}
+        self._order_of_name: dict[str, int] = {}
+        self._selected_by_day: dict[object, tuple[str, ...]] = {}
+        self._indexed = False
 
     def next(self):
         today = self.today()
         signals = self.broker.signals
 
-        for data in self.datas:
-            name = data._name
+        for data, name in self._candidates(today):
             position = self.getposition(data)
 
             if not position.size:
@@ -313,6 +319,89 @@ class B1(bt.Strategy, EngineClock):
                 self._stop_price[name] = self._anchored_prior_low(data, signals, today, name)
 
             self._manage_exit(data, name, position, signals, today)
+
+    # --- 遍历范围 -------------------------------------------------------------
+
+    def _candidates(self, today):
+        """本根**可能有动作**的标的——把每根的遍历量从「全部标的」降到「少数几个」。
+
+        只有两个来源，各自对应循环体里唯一的两类动作：
+
+        - **有持仓** → 止损 / 趋势离场 / 分批止盈（:meth:`_manage_exit`）；
+        - **当日候选** → 唯一可能**新建仓**的来源。
+
+        其余标的为什么可以跳过：循环体对它们所做的全是空操作——三个 ``discard``/``pop``
+        对不在集合里的键无效，``_enter_if_selected`` 查到「未被选中」立刻返回。全市场下这
+        不是小账：4752 只 × 2701 根 = 1280 万次遍历，而每根真正有可能动作的标的只有个位数。
+        实测（232 只标的）这一段占「逐根」阶段的六成。
+
+        两处看着像遗漏、实测却**不必要**的候选来源，写在这里免得以后被「补」回去：
+
+        - **刚清仓的标的**（``_stop_price`` 里还留着上一笔的锚定值）。它确实要被清理，但
+          不必单独列一类：要在它身上再建仓只能靠 ``_enter_if_selected``，而那要求它当天在
+          候选里——于是必然先走一遍空仓分支，清理就发生在那里。若它一直不再入选，那份陈旧
+          状态也永远读不到（读它需要持仓，而持仓又回到前一句）。故「陈旧状态被读到」在路径
+          上不可达。
+        - **有挂单的标的**。挂单必然出自「空仓分支」里下的单，而那个分支已经清掉了状态；
+          之后它唯一还能做的就是**再买一次**，那同样要求当天被选中。而成交不会漏：成交后
+          持仓落在 ``broker.positions`` 上，每根都被上面第一个来源扫到。
+
+        （两条都试过单独列一类，实测产出一模一样——多出来的遍历只换来一份读不到的状态。）
+
+        产出按 ``self.datas`` 的原顺序：顺序本身不影响结果（每个标的各自独立，现金只在
+        **成交**时变动，而下单不占用现金），但固定顺序让同一份输入永远给出同一份产物。
+        """
+        if not self._indexed:
+            self._build_indices()
+
+        seen: dict[str, object] = {}
+
+        for data, position in self.broker.positions.items():
+            if position.size:
+                seen[data._name] = data
+
+        for name in self._selected_by_day.get(today, ()):
+            data = self._data_by_name.get(name)
+            if data is not None:
+                seen[name] = data
+
+        return [(seen[name], name) for name in sorted(seen, key=self._order_of_name.__getitem__)]
+
+    def _build_indices(self) -> None:
+        """建好「标的 → data」「标的 → 原顺序」「交易日 → 当日候选」三张表。
+
+        选股表按行扫一遍是**一次性**开销（2701 行），而每根现查一次 ``.at`` 才是要避免的
+        那种按标的数放大的开销。
+        """
+        self._data_by_name = {data._name: data for data in self.datas}
+        self._order_of_name = {data._name: i for i, data in enumerate(self.datas)}
+        self._selected_by_day = self._index_selected_days()
+        self._indexed = True
+
+    def _index_selected_days(self) -> dict[object, tuple[str, ...]]:
+        """把选股掩码转成「交易日 → 当日选中的标的」。
+
+        先要求选股表**覆盖**可交易表的每一天：查不到当天时 ``.get`` 会退化成「当日无人入选」，
+        而那会**静默地一根都不建仓**——与「当天确实没有候选」长得一模一样。故这里把不一致
+        当场变成异常。
+        """
+        selection = self.broker.selection_mask
+        if selection is None:
+            return {}
+
+        tradability = self.broker.tradability_mask
+        missing = tradability.index.difference(selection.index)
+        if len(missing):
+            raise ValueError(
+                f"选股表缺少 {len(missing)} 个交易日（首缺 {missing[0]}）："
+                "那几天会静默地一根都不建仓。选股表与可交易表必须按同一个交易日并集建。"
+            )
+
+        names = selection.columns.to_numpy()
+        flags = selection.to_numpy(dtype=bool)
+        return {
+            day: tuple(names[np.flatnonzero(flags[row])]) for row, day in enumerate(selection.index)
+        }
 
     # --- 买入 -----------------------------------------------------------------
 
@@ -460,9 +549,12 @@ def b1_screen(
     volume_base_bars=10,
     min_surge=2.0,
     max_pullback=0.5,
+    stop_buffer=0.01,
+    min_reward_risk=4.0,
     top_n=None,
 ) -> Screen:
-    """**B1 策略**的选股规则：趋势 + 位置 + J 值 + 量能（四条过滤），**黄线贴近度**排序。
+    """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + **盈亏比**，
+    **交易盈亏比**排序。
 
     它是 ``Screen``，故同一条件既能用于 ``mbt screen`` 选股，也能作为回测的入场闸门——
     不必写两遍（ADR-0001）。
@@ -475,6 +567,7 @@ def b1_screen(
     位置                「一波上涨之后的下跌阶段」（提示 3）
     J 值                KDJ 的 J 偏低（提示 3）
     量能                上涨放量 + 回调缩量（提示 4）
+    盈亏比              交易盈亏比 > ``min_reward_risk``（B1 追加）
     ==================  ================================================
 
     「价格在慢线上」这一条与「趋势」不是同义反复：前者比较**价格**与黄线，后者比较
@@ -483,13 +576,52 @@ def b1_screen(
     收盘低于黄线」，若入场时价格已在黄线**下方**，那条止损几乎立刻触发（全市场回测里
     78% 的出场都是它，持有期中位仅 1 天）。
 
-    排序因子是 :func:`~mbt.signals.factors.yellow_proximity`（``黄线 ÷ |收盘 − 黄线|``），
-    **越大离黄线越近**，故买点取「回调到支撑上」的那几只，而不是「跌得最深」的那几只。
-    因子本身不带方向（取了绝对值），「在黄线哪一侧」由过滤条件管。
+    **排序因子是 :func:`~mbt.signals.factors.reward_risk_ratio`（交易盈亏比）**，即
+    ``(前高 − 收盘) ÷ (收盘 − max(黄线, 前低 × (1 − stop_buffer)))``：**赚头对亏头，越大
+    越划算**。它的取法、时点与退化情形都写在那个函数的文档里，此处不重复。
+
+    .. note::
+
+        **排序因子从「黄线贴近度」换成盈亏比是一个立场变化。** 贴近度问的是「跌到支撑上了
+        没有」，只用了**分母**那一侧的信息——它把「离黄线近」当成好，而不管离前高有多远：
+        一只贴着黄线、但前高就在头顶的标的，与一只贴着黄线、前高远在两成之上的标的，因子
+        几乎一样。盈亏比把**赚头**也放进来，于是「贴支撑」与「有空间」必须同时成立才排得前。
+
+        :func:`~mbt.signals.factors.yellow_proximity` **仍然留在信号层**（它是公开因子、
+        有测试与文档），只是不再被这条规则使用。
+
+    .. warning::
+
+        **``stop_buffer`` 必须与策略 ``B1`` 的同名参数取同一个值。** 否则这个比制度量的是一条
+        策略**不会执行**的止损——两边都改动才是改动，只改一边是静默失真。
+
+    .. warning::
+
+        **盈亏比在评估日（调仓那根）算，而策略的前低是在建仓那一根才锚定的**，两者相差一根，
+        且建仓成交价是那一根的开盘价而这里用当根收盘价。故它是一个**决策时的预估**：选股规则
+        按定义不管持仓（ADR-0001），它也做不到别的。详见
+        :func:`~mbt.signals.factors.reward_risk_ratio`。
+
+    .. warning::
+
+        **盈亏比这一条砍掉约四分之一的候选。** 实测（141 只、8,558 个交易日）：其余五条过滤器
+        给出 3,453 个候选格，加上「盈亏比 > 4.0」后剩 2,556 格（−26%）。它自己并不稀疏——
+        主要的筛子仍是 J 值与量能那两条。
+
+    .. warning::
+
+        **含当根的窗口不会因为「已经跌破前低」而作废**，它只是把止损位跟着当根的最低点下移。
+        与「不含当根」的口径落点相近但不等价，差别集中在「当根收在最低价附近」那一类格子上
+        （实测 1,551 格只有含当根才放行）。机制与数字见
+        :func:`~mbt.signals.factors.reward_risk_ratio`。
 
     参数:
+        stop_buffer: 前低的缓冲比例，传给 :func:`~mbt.signals.factors.reward_risk_ratio`。
+            默认 ``0.01``，与策略 ``B1`` 一致。
+        min_reward_risk: 盈亏比门槛。默认 ``4.0``，即「赚头至少是亏头的四倍」。它是需求方
+            给定的值，不是标定出来的。
         top_n: 只取前 N 名。``None``（默认）表示**不截断**——那正是「本金不限」的语义：
-            每个合格标的都买一份。给了它就只买离黄线最近的那 N 只。
+            每个合格标的都买一份。给了它就只买盈亏比最高的那 N 只。
 
     各阈值的取法见 ``CONTEXT.md`` 与 ``.scratch`` 下的实测记录；默认值是九个样本上的
     **可执行起点**，不是调优过的参数。特别地：
@@ -504,15 +636,22 @@ def b1_screen(
 
         「位置」条件**几乎不筛人**：全历史实测，它在 35%~52% 的交易日成立。真正的选择性
         来自 J 值与量能，故不要指望它单独构成一个稀疏的候选集。
+
+    .. note::
+
+        :func:`~mbt.signals.swings.swings` 在这里被算了**四次**（「位置」「量能」「盈亏比
+        过滤器」「盈亏比因子」各一次）。这是刻意的：``Screen`` 的三个部件各自是纯函数、互不
+        知道对方算过什么，共享中间结果就要引进一处缓存状态。代价是每次选股多几遍顺序扫描，
+        见 ``reward_risk_ratio`` 的复杂度注记。
     """
     from mbt.signals import (
         above_yellow,
         j_below,
         pullback_after_advance,
+        reward_risk_ratio,
         swings,
         volume_contraction,
         white_above_yellow,
-        yellow_proximity,
     )
 
     windows = tuple(yellow_windows)
@@ -547,12 +686,20 @@ def b1_screen(
             max_pullback=max_pullback,
         )
 
-    def proximity(panel):
-        return yellow_proximity(panel["close"], windows)
+    def reward_risk(panel):
+        return reward_risk_ratio(
+            panel,
+            swings(panel["close"], retracement=retracement),
+            windows=windows,
+            stop_buffer=stop_buffer,
+        )
+
+    def worth_the_risk(panel):
+        return reward_risk(panel) > min_reward_risk
 
     return Screen(
-        filters=(trend, not_below_the_line, position, low_j, volume),
-        factor=proximity,
+        filters=(trend, not_below_the_line, position, low_j, volume, worth_the_risk),
+        factor=reward_risk,
         top_n=top_n,
     )
 

@@ -15,7 +15,13 @@
 
 from __future__ import annotations
 
-from mbt.signals.factors import distance_to_high, drawdown_from_high, momentum, yellow_proximity
+from mbt.signals.factors import (
+    distance_to_high,
+    drawdown_from_high,
+    momentum,
+    reward_risk_ratio,
+    yellow_proximity,
+)
 from mbt.signals.filters import (
     above_ma,
     above_white,
@@ -64,6 +70,7 @@ __all__ = [
     "momentum",
     "new_high",
     "pullback_after_advance",
+    "reward_risk_ratio",
     "rising_streak",
     "rolling_max",
     "rolling_min",

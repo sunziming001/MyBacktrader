@@ -116,6 +116,15 @@ PANEL_SIGNALS = [
     ("kdj", kdj_lines),
     ("j_below", lambda panel: signals.j_below(panel, threshold=50.0, n=3, m1=3, m2=3)),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
+    (
+        "reward_risk_ratio",
+        lambda panel: signals.reward_risk_ratio(
+            panel,
+            signals.swings(panel["close"], retracement=0.05),
+            windows=(2, 3),
+            stop_buffer=0.01,
+        ),
+    ),
 ]
 
 #: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /

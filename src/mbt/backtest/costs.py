@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import collections
+
 import backtrader as bt
 import pandas as pd
 
@@ -85,6 +87,63 @@ class AStockCommissionInfo(bt.CommissionInfo):
         return fee
 
 
+class _LivePositions(collections.defaultdict):
+    """持仓表：遍历时**只走有持仓的标的**，且顺序固定为**标的顺序**。
+
+    backtrader 每 tick 会把这张表整表走三遍——``BackBroker.next()`` 两遍（信用利息、
+    期货现金调整）、``_get_value()`` 一遍——而**零持仓的条目在三处都是精确的 0**：
+    前两处的循环体被 ``if pos:`` 挡着，第三处是 ``+= 0.0``（浮点加法里加 0 是恒等操作）。
+    故把它们跳过**逐位不变**，只是不再为全市场 4752 只 × 2701 根各付一遍
+    ``getcommissioninfo``（本子类还带日期注入）与 ``data.close[0]``。
+
+    第二条理由与数值无关、却更要紧：``_get_value`` 是 ``for data in datas or
+    self.positions`` —— 它按**插入顺序**求和，而浮点加法不满足结合律，于是求和顺序会**改变
+    末位**。插入顺序取决于「哪些标的先被碰过」——那是遍历顺序的函数：同一份行情上换个遍历
+    顺序就能算出不同的净值曲线。
+
+    这件事**实测发生过**：全市场那一轮的净值曲线与最初基线差 868 行（成交明细逐位相同，
+    差在末位，如 ``101524.17725994284`` / ``...285``）。根因是「谁顺手把键插进去的」：
+    最初 ``B1.next()`` 对**每个**标的都调 ``getposition()``，而它落到 ``positions[data]``，
+    于是第一根就把全部标的按**标的顺序**插好了——顺序是**碰巧**对的；改成只遍历候选之后
+    那些调用没了，插入顺序变成了撮合碰过的顺序，末位随之漂移。故本轮把顺序**显式**钉住
+    （:meth:`AStockBroker.start` 按标的顺序预置全部标的，此后不再有新键），不再依赖策略
+    循环的副作用：重跑后全市场两份产物与**最初基线逐位相同**。
+
+    ``Position.__bool__`` 就是 ``size != 0``，故这里的过滤与 backtrader 自己写的
+    ``if pos:`` 是同一个判据。
+
+    两半各自的实测（232 只标的、同一条窗口、逐根阶段）：
+
+    - 过滤：**7.1s → 4.7s**，且净值曲线与成交明细与不过滤版**逐位相同**——那条「跳过是
+      无操作」的论证在真实行情上的对账。
+    - 预置：去掉它（即旧的普通 ``defaultdict``）是 6.1s，看着更快，代价是净值曲线
+      **183 行差在末位**（最大 2.9e-11）。故 4.7s < 6.1s 这个比较并不公平——预置买的不只是
+      时间，更是**可复现**。而预置的代价是每标的一次字典插入（全市场 4752 次），毫秒量级。
+
+    .. note::
+
+        换表的动作在 :meth:`AStockBroker.init` 里，**不是** ``__init__``：``start()`` 会调
+        ``init()``，而它刚把表建成普通的 ``defaultdict(Position)``，写在 ``__init__`` 里会被
+        盖掉（实测踩过：过滤一点没生效，表还是 ``defaultdict``）。
+    """
+
+    def __iter__(self):
+        for data in super().__iter__():
+            if self[data]:
+                yield data
+
+    def keys(self):
+        return iter(self)
+
+    def items(self):
+        for data in self:
+            yield data, self[data]
+
+    def values(self):
+        for data in self:
+            yield self[data]
+
+
 class AStockBroker(bt.brokers.BackBroker):
     """撮合侧的 A 股硬约束，以及把成交日与标的注入费用对象。
 
@@ -143,8 +202,40 @@ class AStockBroker(bt.brokers.BackBroker):
         self._stale: dict = {}
         #: 本 tick 的主时钟日期，由 :meth:`next` 缓存（见 :meth:`_today`）。
         self._clock = None
+        #: 各标的 ``datetime`` 线的缓存（见 :meth:`_clock_lines`）。
+        self._mbt_clock_lines = None
+        #: 是否已把全部标的按顺序预置进持仓表（见 :class:`_LivePositions`）。
+        self._positions_seeded = False
+
+    def init(self):
+        super().init()
+        # 持仓表必须在**这里**换，不能在 `__init__`：`super().init()` 刚把它建成
+        # 普通的 `defaultdict(Position)`（`start()` 会调 `init()`），在 `__init__` 里赋值会被
+        # 它盖掉——实测就是这样：表还是 `defaultdict`，过滤一点没生效。
+        self.positions = _LivePositions(bt.Position)
+        # 换了表，预置作废（`init()` 也可能被复用同一个 broker 的第二趟 `run()` 调到）。
+        self._positions_seeded = False
+
+    def start(self):
+        super().start()
+        self._seed_positions()
+
+    def _seed_positions(self):
+        """按**标的顺序**预置全部标的，把 ``_get_value`` 的求和顺序钉死。
+
+        不必担心代价：这一步是每标的一次字典插入（全市场 4752 次，毫秒量级），而它换来的是
+        「求和顺序 = 标的顺序」，与「哪些标的先被策略碰过」彻底解耦。
+        """
+        if self._positions_seeded:
+            return
+        for data in getattr(self.cerebro, "datas", ()):
+            self.positions[data]  # defaultdict：取一次即建一个零持仓
+        self._positions_seeded = True
 
     def next(self):
+        # `start()` 若没被调到（引擎的装配方式变了，或有人直接拿 broker 单跑），这里兜一下底。
+        if not self._positions_seeded:
+            self._seed_positions()
         # 主时钟每个 tick 只算一次：它要遍历全部标的，放进 _try_exec 会变成每个订单一次。
         self._clock = self._compute_clock()
         super().next()
@@ -257,15 +348,41 @@ class AStockBroker(bt.brokers.BackBroker):
             self._clock = self._compute_clock()
         return self._clock
 
+    def _clock_lines(self):
+        """各标的 ``datetime`` 线的缓存。
+
+        ``self.cerebro.datas`` 要等引擎把标的都挂上才齐，故第一次用时才建；建完就不再变。
+        """
+        lines = self._mbt_clock_lines
+        if lines is None:
+            lines = [data.datetime for data in getattr(self.cerebro, "datas", ())]
+            self._mbt_clock_lines = lines
+        return lines
+
     def _compute_clock(self):
-        latest = None
-        for data in getattr(self.cerebro, "datas", ()):
-            if len(data) == 0:
-                continue  # 该标的尚未开始（首根 K 线晚于当前 tick）
-            current = data.datetime.date(0)
-            if latest is None or current > latest:
-                latest = current
-        return latest
+        """取主时钟：**只比浮点日期序号**，最后才把那一个赢家转成 ``date``。
+
+        这里是全引擎唯一必须自己算主时钟的地方——它比策略与分析器早一步（撮合在
+        ``_oncepost`` 之前跑完，那时策略的 ``datetime`` 线还停在上一根），故只能扫一遍标的。
+        原实现每次迭代都走 ``len(data)`` + ``data.datetime.date(0)``，而后者要过
+        ``num2date``（``divmod`` + 构造 ``datetime``）——逐 tick 只为一个日期，那是白付的：
+        改成直接读 ``datetime`` 线的数组与索引，先比浮点（单调同序），最后转换一次。
+        实测（232 标的）省 0.3s / 14.8s，全市场是 4752 × 2701 = 1280 万次迭代。
+
+        ``idx < 0`` 等价于原实现的 ``len(data) == 0``：尚未开始的标的（首根 K 线晚于当前
+        tick）没有当前值可读，跳过。
+        """
+        best = None
+        for line in self._clock_lines():
+            idx = line.idx
+            if idx < 0:
+                continue
+            value = line.array[idx]
+            if best is None or value > best:
+                best = value
+        if best is None:
+            return None
+        return bt.num2date(best).date()
 
     def _mask_says(self, frame, order):
         """查标的宽表掩码。返回 ``None`` 表示「无掩码，无从判断」。"""

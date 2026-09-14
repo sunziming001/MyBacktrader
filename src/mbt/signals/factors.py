@@ -10,11 +10,15 @@
 
 from __future__ import annotations
 
+from collections import deque
+
+import numpy as np
 import pandas as pd
 
 from mbt.data.panel import Panel
 from mbt.signals._symbol_frame import check_symbol_frame
 from mbt.signals.indicators import rolling_max, yellow_line
+from mbt.signals.swings import Swings
 
 
 def drawdown_from_high(panel: Panel, n: int) -> pd.DataFrame:
@@ -98,3 +102,158 @@ def yellow_proximity(prices: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataF
     """
     line = yellow_line(prices, windows)
     return line / (check_symbol_frame(prices) - line).abs()
+
+
+def reward_risk_ratio(
+    panel: Panel,
+    anchors: Swings,
+    *,
+    windows: tuple[int, ...],
+    stop_buffer: float,
+) -> pd.DataFrame:
+    """**交易盈亏比**：``(前高 − 收盘) ÷ (收盘 − 止损位)``——**越大越划算**。
+
+    止损位取两条止损里**较高的那一条**，即策略上先被触发的那条::
+
+        止损位 = max(黄线, 前低)
+        前低   = 「峰值 → 当根」（含两端）的最低价 × (1 − stop_buffer)
+
+    它把「这笔交易值不值得做」写成一个能在同一行内横向比较的数：分子是**赚头**（回到前高还
+    剩多少），分母是**亏头**（跌到止损还有多少）。故它天然满足本层「越大越靠前」的契约，既能
+    当排序因子，也能当过滤信号的判据（``> 门槛``）。
+
+    **两个参照的取法都显式写在这里。** ``CONTEXT.md`` 的**前低**一条明令如此——它的取法直接
+    决定参照价位的高低，故不许只写「前低」两个字就算了：
+
+    - **前高**取 :func:`~mbt.signals.swings.swings` 的 ``peak_price``，即最近一段**已完成
+      上涨**的峰值。刻意不用固定窗口的「N 日最高」：那样「回到前高」会退化成「回到某个窗口的
+      最高」，而窗口长度恰是需要标定的那个量；摆动点给出的峰值是**价格自己切出来的**。
+    - **前低**取「峰值 → **当根**」这一段的最低价。窗口**含当根**，与策略
+      ``B1._anchored_prior_low`` 是同一个式子；代价见下面第二条 warning。
+    - **黄线**与其余规则同一条（:func:`~mbt.signals.indicators.yellow_line`）。取两者中**较大**
+      者作止损位，是因为策略的止损正是「连续跌破黄线 **或** 跌破前低 × (1 − stop_buffer)」，
+      两条里先到的那条才决定这笔交易实际亏多少。
+
+    .. warning::
+
+        **它与 :attr:`mbt.metrics.Metrics.payoff_ratio`（盈亏比）不是同一个量，不可互相印证。**
+
+        ====================  ==========================================
+        ``payoff_ratio``      **已实现**交易的「平均盈利 ÷ 平均亏损」
+        ``reward_risk_ratio`` **建仓前**预估的「赚头 ÷ 亏头」
+        ====================  ==========================================
+
+        前者是复盘算出来的结果，后者是下单前的判断。后者高不蕴含前者高。
+
+    .. warning::
+
+        **窗口含当根，故这里的止损位是「到当根为止的最低点」。** 实测（141 只 × 8,558 个交易日）
+        它与「不含当根」的口径**落点相近但不等价**，差别集中在一类格子上：
+
+        - 当根刚创出调整期新低时，前低随之下移到当根最低价，止损位因此**更低**、亏头更大，比值
+          也就**更小**（同一格实测中位 7.1 对 12.4）——这一口径在门槛上更保守。
+        - 但它也是**唯一**会放行「当根收在最低价附近、已经跌穿昨日的前低」那一类的口径：分母
+          恒为正（当根最低价 ≤ 当根收盘价），故从不因为「已经跌破」而作废。放行的 29,667 格
+          里有 2,300 格属于这一类，其中 **1,551 格**换成不含当根就直接给不出正亏头。
+
+        要挡掉后一类就得把窗口改成**不含当根**，代价是同时会拒掉一部分仍在昨日前低之上的回调。
+        两种口径各有代价，故由调用方选，函数里不写死。
+
+    **两处时点漂移要写明**（它住在信号层，而止损锚定在策略层）：
+
+    1. 本函数在**评估日**（选股／调仓的那一根）算，而策略的前低是在**建仓那一根**才锚定的，
+       两者相差一根；建仓的成交价又是那一根的**开盘价**，而这里用的是当根**收盘价**。
+    2. 故它是一个**决策时的预估**，不是这笔交易最终的风险敞口。选股规则按定义不管持仓
+       （ADR-0001），它也只能是预估。
+
+    退化与缺失一律取**缺失**，不给一个具体的数：
+
+    - **分母 ≤ 0**（已经跌破黄线或前低）——没有「亏头」可言，比值失去含义。刻意不给负数
+      （那会在横截面排序里排到最末，看着像「最差的一档」），也不给无穷（看着像「最好的一档」）。
+    - 峰值未确认（``anchors`` 处缺失）、黄线窗口不足、窗口内无有效最低价、当根无价。
+
+    缺口（停牌、尚未上市）**不参与取最小值**——跳过而不是当成 0，也不因为窗内有缺口就把整窗
+    判为缺失（ADR-0005 的「缺口跳过」）。
+
+    参数:
+        panel: 行情面板，须含 ``close`` 与 ``low``。
+        anchors: :func:`~mbt.signals.swings.swings` 的输出，须与 ``panel`` 出自**同一段行情**。
+            显式收进来而不在函数内重算，是为了让「价格结构与盈亏比吃同一份段边界」成为一条
+            被强制的前提——各自重算一次就可能与前一个过滤器切出不同的段，而那种错不报错。
+        windows: 黄线各条均线的窗口。
+        stop_buffer: 前低的缓冲比例（止损位 = 前低 × (1 − 它)），须落在 ``[0, 1)``。它应当与
+            策略 ``B1`` 的同名参数取**同一个值**——两边不一致时，这个比制度量的是一条策略
+            并不会执行的止损。
+
+    抛:
+        ValueError: ``stop_buffer`` 不在 ``[0, 1)`` 内，或 ``panel`` 与 ``anchors`` 的标的或
+            交易日对不上（对不上会把段边界对到别的日子上，而那种错不报错）。
+
+    .. note::
+
+        与 :func:`~mbt.signals.swings.swings` 同量级的代价：取「峰值 → 当根」的最低值要在每个
+        标的上顺序扫一遍（单调队列，摊还 O(根数)）。窗口的左端就是峰值位置，而它由 ``swings``
+        保证**不后退**，这正是能用队列而不必重扫整段的原因。
+    """
+    if not 0.0 <= stop_buffer < 1.0:
+        raise ValueError(f"stop_buffer 必须落在 [0, 1) 内，收到 {stop_buffer!r}")
+
+    close = check_symbol_frame(panel["close"])
+    low = check_symbol_frame(panel["low"])
+    if not low.columns.equals(anchors.peak_age.columns):
+        raise ValueError("panel 与 anchors 的列（标的）必须一致，且顺序相同")
+    if not low.index.equals(anchors.peak_age.index):
+        raise ValueError("panel 与 anchors 的索引（交易日）必须一致")
+
+    lows = low.to_numpy(dtype=float)
+    ages = anchors.peak_age.to_numpy(dtype=float)
+    prior_low = np.full(lows.shape, np.nan)
+    for column in range(lows.shape[1]):
+        prior_low[:, column] = _lowest_since_peak(lows[:, column], ages[:, column])
+
+    line = yellow_line(close, windows).to_numpy(dtype=float)
+    stop = np.maximum(line, prior_low * (1.0 - stop_buffer))
+    prices = close.to_numpy(dtype=float)
+    risk = prices - stop
+    reward = anchors.peak_price.to_numpy(dtype=float) - prices
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.where(risk > 0.0, reward / risk, np.nan)
+    return pd.DataFrame(ratio, index=close.index, columns=close.columns, dtype=float)
+
+
+def _lowest_since_peak(lows: np.ndarray, peak_age: np.ndarray) -> np.ndarray:
+    """逐根取「峰值 → 当根」这一段的最低价（含两端），缺失处为缺失。
+
+    单调队列，摊还 O(根数)：窗口的**右端每根前进一格**，**左端是峰值位置**——它只会在新的
+    峰值被确认时跳向更晚的一根，由 :func:`~mbt.signals.swings.swings` 保证不后退。两端都单调
+    向右，故队首即为窗口最小值，不必重扫整段。
+
+    缺失（停牌、尚未上市）**不参与取最小值**：跳过而不是当成 0，也不因为窗内有缺口就把整窗
+    判为缺失（ADR-0005 的「缺口跳过」）。整窗无有效值时给缺失。
+
+    **峰值尚未确认的那些根，低价照样要留在队列里。** 峰值的位置往往**早于**它被确认的那一根
+    （确认要等回撤到阈值），故首个可用窗口的左端落在过去；若在确认之前就把队列清空，那个窗口
+    就只剩当根一根——前低会退化成「当根最低价」，盈亏比随之虚高。
+    """
+    bars = lows.size
+    out = np.full(bars, np.nan)
+    window: deque[int] = deque()
+
+    for now in range(bars):
+        value = lows[now]
+        if not np.isnan(value):
+            while window and lows[window[-1]] >= value:
+                window.pop()
+            window.append(now)
+
+        age = peak_age[now]
+        if not np.isfinite(age):
+            continue  # 峰值未确认：这一格没有窗口可言（但队列留着，见文档末段）
+
+        left = now - int(age)
+        while window and window[0] < left:
+            window.popleft()
+        if window:
+            out[now] = lows[window[0]]
+
+    return out

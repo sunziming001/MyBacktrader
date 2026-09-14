@@ -50,6 +50,7 @@ from mbt.data import (
     stock_symbols,
 )
 from mbt.data.errors import MarketDataError
+from mbt.progress import DEFAULT_INTERVAL, ConsoleProgress
 from mbt.report import DEFAULT_BENCHMARK_SYMBOL, write_run_artifacts
 from mbt.screen import SCREEN_FIELDS, momentum_screen
 from mbt.universe import ALL_BOARDS, UniverseRules, combine_masks
@@ -107,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     backtest.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
     backtest.add_argument(
+        "--progress",
+        nargs="?",
+        const=DEFAULT_INTERVAL,
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"每 SECONDS 秒报一次进度（默认 {DEFAULT_INTERVAL:g}）；不给则完全不输出进度。"
+        "全市场回测是分钟到小时量级，而各阶段之间此前没有任何输出——"
+        "给上它才分得清「在正常地慢」与「卡住了」（见 mbt.progress）",
+    )
+    backtest.add_argument(
         "--boards",
         default=None,
         help="纳入的板块，逗号分隔（默认四个全收：主板,创业板,科创板,北交所）",
@@ -155,6 +167,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     screen.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（试跑用）")
     screen.add_argument("--symbols-file", default=None, help="只跑文件里列出的标的（每行一个）")
+    screen.add_argument(
+        "--progress",
+        nargs="?",
+        const=DEFAULT_INTERVAL,
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"每 SECONDS 秒报一次进度（默认 {DEFAULT_INTERVAL:g}）；不给则完全不输出进度。"
+        "全市场取数与选股都是分钟量级，见 mbt.progress",
+    )
     screen.add_argument(
         "--boards",
         default=None,
@@ -213,6 +235,8 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         print("错误：选出的标的为空——请检查 --symbols-file 或 --limit", file=stderr)
         return 1
 
+    progress = _progress(args, stdout)
+
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
     loaded = load_universe_data(
         symbols,
@@ -224,6 +248,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 是这个原因，票据 #45）。
         start=args.start,
         end=args.end,
+        progress=progress,
     )
 
     # **截断之前**先把完整行情留一份。估值的百分位要回看 1000 个交易日，故必须用完整历史
@@ -306,7 +331,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
 
     try:
-        screen, signals = _screen_and_signals(args, loaded, full_markets, stdout)
+        screen, signals = _screen_and_signals(args, loaded, full_markets, stdout, progress)
         result = run_portfolio_backtest(
             list(loaded.markets),
             strategy,
@@ -320,6 +345,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             listing_dates=listing_dates,
             screen=screen,
             signals=signals,
+            progress=progress,
             **params,
         )
     except Exception as exc:  # noqa: BLE001
@@ -352,6 +378,14 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     return 0
 
 
+def _progress(args, stdout):
+    """按 ``--progress`` 造一个进度上报端；未给该开关时返回 ``None``（库据此完全不输出）。"""
+    interval = getattr(args, "progress", None)
+    if interval is None:
+        return None
+    return ConsoleProgress(stdout, every=interval)
+
+
 def _boards(args) -> frozenset:
     """``--boards`` 解析成板块集合；未给即出厂设定（四个全收）。
 
@@ -369,7 +403,7 @@ def _boards(args) -> frozenset:
     return frozenset(names)
 
 
-def _screen_and_signals(args, loaded, full_markets, stdout):
+def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
     """按 ``--screen`` **指名**一条库里的规则，并备好它需要的信号。
 
     本函数只做「指名 + 备料」，规则的语义、默认值与测试都在库里（:mod:`mbt.screen`）——AC
@@ -411,6 +445,8 @@ def _screen_and_signals(args, loaded, full_markets, stdout):
     from mbt.screen import drawdown_fields, undervalued_growth_screen, valuation_screen
 
     # 传的是**原始**行情：PE 要用当时的成交价，而后复权价以首根为基准放大（见 valuation_for）。
+    if progress is not None:
+        progress.stage("算估值信号", note=f"{len(full_markets)} 个标的 × 全部财报")
     valuation = valuation_for(full_markets, CwDataSource(args.cw_root))
     covered = int(valuation.pe.notna().any().sum())
     print(
@@ -421,6 +457,8 @@ def _screen_and_signals(args, loaded, full_markets, stdout):
     signals = dict(valuation.as_fields())
     if not legacy:
         # 跌幅要回看 252 个交易日，故同样**先算后截**（见 drawdown_fields）。
+        if progress is not None:
+            progress.stage("算跌幅信号", note="回看 252 个交易日")
         signals.update(drawdown_fields(full_markets))
         covered_fall = int(signals["drawdown_1y"].notna().any().sum())
         print(
@@ -457,6 +495,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         return 1
 
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
+    progress = _progress(args, stdout)
     loaded = load_universe_data(
         symbols,
         tdx_root=args.tdx_root,
@@ -464,6 +503,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         rules=None,
         # 选股只看评估日及之前，故越界校验也只做到那一天（理由见 backtest 那条注释）。
         end=args.as_of,
+        progress=progress,
     )
     _report_loading(loaded, stdout, stderr)
 
@@ -513,19 +553,25 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 是**同一个对象**（ADR-0001）。此前这里写死 `momentum_screen`，于是「同一条件只写一遍」
         # 在选股侧并没有兑现——`backtest --screen valuation` 用估值规则，而 `screen` 仍按动量
         # 选，两边给出的候选完全不是一回事。
-        screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout)
+        screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout, progress)
         if screen is None:
             screen = momentum_screen(window=20, top_n=args.top_n)
 
         from mbt.data.panel import with_signals
 
         result = screen.apply(
-            with_signals(panel, signals), as_of=as_of, universe_mask=combine_masks(*masks)
+            with_signals(panel, signals),
+            as_of=as_of,
+            universe_mask=combine_masks(*masks),
+            progress=progress,
         )
         candidates = result.candidates(as_of)
     except Exception as exc:  # noqa: BLE001
         print(f"错误：选股失败——{type(exc).__name__}: {exc}", file=stderr)
         return 1
+
+    if progress is not None:
+        progress.finish()
 
     try:
         run_dir = _write_screen_artifacts(result, candidates, args, as_of, loaded, panel)

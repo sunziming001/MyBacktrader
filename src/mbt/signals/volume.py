@@ -47,49 +47,82 @@ class VolumeStructure(NamedTuple):
     pullback_ratio: pd.DataFrame
 
 
-def _pick(values: np.ndarray, inverse: np.ndarray, size: int) -> np.ndarray:
-    """从「按摆动对分行、按标的列排」的中间结果里，取回每个标的自己的那一格。
-
-    写成模块级函数而不是循环内的闭包：闭包会捕获循环变量 ``inverse``，ruff 的 B023 正是指
-    这种写法——当前代码在**同一次迭代内**就调用它，故结果是对的，但这种正确依赖调用时机，
-    一旦有人把它挪出循环就会静默取到最后一轮的 ``inverse``。
-    """
-    return values[inverse, np.arange(size)]
-
-
-def _segment_aggregates(
+def _window_aggregates(
     vol: np.ndarray,
-    cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]],
     start: int,
     end: int,
+    columns: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """区间 ``[start, end]``（含两端）逐标的的 (均值, 最大值)。
+    """区间 ``[start, end]``（含两端）**只在 ``columns`` 这些列上**的 (均值, 最大值)。
 
-    按 ``(start, end)`` 去重缓存。缓存值是一个**覆盖全部标的**的向量，故同一对拐点在两个
-    标的上复用时，两者都取到各自列上的聚合值——缓存不会串列。
-
-    去重是必要的：同一对拐点会连续多行不变，故实际计算次数等于**摆动次数**，
-    而不是「K 线根数 × 标的数」——后者在全市场上是亿级。
+    只算要用的那几列，而不是全部标的。这不是「少算一点」的近似：``np.nanmean`` /
+    ``np.nanmax`` 沿 ``axis=0`` 归约，**每一列独立**，故限定列之后每一列的取值与整体算时
+    **逐位相同**。而一次只为一两只标的算某个摆动对才是常态——按全部标的算，就把这两列的
+    代价放大到了标的数的量级（全市场实测：这正是这一步从 5 秒涨到一个多小时的主因之一）。
     """
-    key = (start, end)
-    hit = cache.get(key)
-    if hit is None:
-        window = vol[start : end + 1]
-        # 整段无有效值时**直接给 NaN**，不走 nanmean/nanmax——那两个在空切片上会发
-        # RuntimeWarning。但只判「整段」不够：`np.nanmean(..., axis=0)` 只要**任一列**全缺失
-        # 就会发 "Mean of empty slice" / "All-NaN slice"，而长期停牌的标的列正是这种情况。
-        # 缺失是正常状态不是异常，故这里连警告一起压掉——不能靠 `errstate`（它管的是浮点
-        # 状态，不是 warnings 模块）。
-        valid = np.isfinite(window)
-        if valid.any():
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                hit = (np.nanmean(window, axis=0), np.nanmax(window, axis=0))
-        else:
-            blank = np.full(vol.shape[1], np.nan)
-            hit = (blank.copy(), blank.copy())
-        cache[key] = hit
-    return hit
+    window = vol[start : end + 1][:, columns]
+    # 整段无有效值时**直接给 NaN**，不走 nanmean/nanmax——那两个在空切片上会发
+    # RuntimeWarning。但只判「整段」不够：`np.nanmean(..., axis=0)` 只要**任一列**全缺失
+    # 就会发 "Mean of empty slice" / "All-NaN slice"，而长期停牌的标的列正是这种情况。
+    # 缺失是正常状态不是异常，故这里连警告一起压掉——不能靠 `errstate`（它管的是浮点
+    # 状态，不是 warnings 模块）。
+    if not np.isfinite(window).any():
+        blank = np.full(columns.size, np.nan)
+        return blank, blank.copy()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(window, axis=0), np.nanmax(window, axis=0)
+
+
+def _cached_aggregates(
+    vol: np.ndarray,
+    cache: dict[tuple[int, int], dict[int, tuple[float, float]]],
+    start: int,
+    end: int,
+    columns: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`_window_aggregates` 的**按列缓存**版本，用于跨行会重复的窗口。
+
+    为什么必须缓存：一个窗口的起止只由摆动点决定，而摆动点**连续多行不变**，故同一窗口会被
+    反复问到。不缓存的话，每行每个摆动对都要发 4 次 numpy 调用——实测在 472 只上这让整步从
+    1.6 秒变成 2.6 秒，**调用开销本身就是主项**（每次只算十来行、几列）。
+
+    缓存粒度是**列**而不是整窗：同一窗口在不同行可能只被一部分标的问到（那些标的的摆动恰好
+    走到了这一段），按整窗缓存就得整窗重算。代价是每列的记账走到 Python 字典里，比向量化慢，
+    但比起「重算一整窗」仍是划算的。
+    """
+    slot = cache.get((start, end))
+    if slot is None:
+        slot = {}
+        cache[(start, end)] = slot
+
+    missing = [int(column) for column in columns if int(column) not in slot]
+    if missing:
+        fresh_mean, fresh_top = _window_aggregates(vol, start, end, np.array(missing))
+        for position, column in enumerate(missing):
+            slot[column] = (fresh_mean[position], fresh_top[position])
+
+    size = columns.size
+    return (
+        np.fromiter((slot[int(c)][0] for c in columns), dtype=float, count=size),
+        np.fromiter((slot[int(c)][1] for c in columns), dtype=float, count=size),
+    )
+
+
+def _group_columns(inverse: np.ndarray, slots: int) -> list[np.ndarray]:
+    """把「每个元素属于哪个槽位」翻成「每个槽位有哪些元素」。
+
+    返回的是**槽位内位置**（``0..len(inverse)-1``），不是标的列号——调用方拿它去索引
+    ``index`` 才得到列号。这样分组与「元素代表什么」无关。
+
+    写法上刻意避开 ``index[inverse == slot]``：那要对每个槽位扫一遍全部元素（``O(槽位×元素)``），
+    而槽位数与元素数是同一量级——正是本次要消掉的那种二次开销。改成排一次序再切段，
+    ``O(元素·log 元素)``。
+    """
+    order = np.argsort(inverse, kind="stable")  # 稳定排序：同一槽位内保持原顺序
+    sorted_inverse = inverse[order]
+    bounds = np.searchsorted(sorted_inverse, np.arange(slots + 1))
+    return [order[bounds[slot] : bounds[slot + 1]] for slot in range(slots)]
 
 
 def volume_structure(
@@ -138,7 +171,9 @@ def volume_structure(
     peak_age = anchors.peak_age.to_numpy(dtype=float)
     trough_age = anchors.trough_age.to_numpy(dtype=float)
 
-    cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    #: 窗口 → {标的列: (均值, 最大值)}。只对起止由摆动点决定的窗口有意义，见
+    #: :func:`_cached_aggregates`。
+    cache: dict[tuple[int, int], dict[int, tuple[float, float]]] = {}
     surge = np.full((rows, columns), np.nan)
     top_ratio = np.full((rows, columns), np.nan)
     pullback_ratio = np.full((rows, columns), np.nan)
@@ -160,32 +195,39 @@ def volume_structure(
 
         trough_of = trough_pos[index].astype(int)
         peak_of = peak_pos[index].astype(int)
-        # 只在**这一行**去重：不同标的多半落在不同的摆动上，而同一摆动会被多行复用（缓存）。
+        # 按摆动对分组：同一对拐点落在多个标的上时，那几个标的共用一个窗口，故窗口只算一次。
         pairs, inverse = np.unique(
             np.stack([trough_of, peak_of], axis=1), axis=0, return_inverse=True
         )
 
-        base_mean = np.empty((pairs.shape[0], index.size))
-        advance_mean = np.empty_like(base_mean)
-        advance_top = np.empty_like(base_mean)
-        edge_mean = np.empty_like(base_mean)
-        pullback_mean = np.empty_like(base_mean)
-        for slot, (trough, peak) in enumerate(pairs):
-            m_base, _ = _segment_aggregates(vol, cache, int(trough) - base_bars, int(trough) - 1)
-            m_adv, x_adv = _segment_aggregates(vol, cache, int(trough), int(peak))
-            m_edge, _ = _segment_aggregates(vol, cache, int(peak) - edge_bars + 1, int(peak))
-            m_pull, _ = _segment_aggregates(vol, cache, int(peak) + 1, row)
-            base_mean[slot] = m_base[index]
-            advance_mean[slot] = m_adv[index]
-            advance_top[slot] = x_adv[index]
-            edge_mean[slot] = m_edge[index]
-            pullback_mean[slot] = m_pull[index]
+        # 结果按「标的在 `index` 里的位置」排，故下面每个槽位只写回它自己那几个位置——
+        # 而不是先铺一张 `(槽位数 × 标的数)` 的表再挑回来。那张表要写 `5 × 槽位 × 标的`
+        # 个格子却只读回 `5 × 标的` 个，是本次消掉的另一处二次开销。
+        base = np.empty(index.size)
+        adv_mean = np.empty(index.size)
+        adv_top = np.empty(index.size)
+        edge = np.empty(index.size)
+        pull = np.empty(index.size)
 
-        base = _pick(base_mean, inverse, index.size)
-        adv_mean = _pick(advance_mean, inverse, index.size)
-        adv_top = _pick(advance_top, inverse, index.size)
-        edge = _pick(edge_mean, inverse, index.size)
-        pull = _pick(pullback_mean, inverse, index.size)
+        # 分组只做一次（见 `_group_columns` 的说明：这就是不许写成 `inverse == slot` 的原因）。
+        groups = _group_columns(inverse, pairs.shape[0])
+
+        for slot, (trough, peak) in enumerate(pairs):
+            positions = groups[slot]
+            cols = index[positions]
+            # 起涨前基准 / 上涨段 / 顶部：起止只由摆动点决定，跨行会重复，故走缓存。
+            base[positions], _ = _cached_aggregates(
+                vol, cache, int(trough) - base_bars, int(trough) - 1, cols
+            )
+            adv_mean[positions], adv_top[positions] = _cached_aggregates(
+                vol, cache, int(trough), int(peak), cols
+            )
+            edge[positions], _ = _cached_aggregates(
+                vol, cache, int(peak) - edge_bars + 1, int(peak), cols
+            )
+            # 回调段 `[peak+1, row]`：它的右端**就是当前行**，故这个窗口每天都是新的，
+            # 缓存不会命中，只会把键越堆越多——只能直接算，不缓存。
+            pull[positions], _ = _window_aggregates(vol, int(peak) + 1, row, cols)
 
         with np.errstate(invalid="ignore", divide="ignore"):
             surge[row, index] = np.where(base > 0.0, adv_top / base, np.nan)
