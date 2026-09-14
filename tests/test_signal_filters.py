@@ -19,6 +19,7 @@ from mbt.signals import (
     above_yellow,
     below_white,
     below_yellow_streak,
+    high_above_white,
     j_below,
     ma_cross_up,
     new_high,
@@ -571,3 +572,75 @@ def test_above_yellow_rejects_a_non_monotonic_index(symbol_frame):
 
     with pytest.raises(ValueError, match="升序"):
         above_yellow(prices, windows=(2,))
+
+
+def test_high_above_white_uses_the_high_not_the_close(panel):
+    """与 :func:`above_white` 的分水岭：最高价摸到白线而收盘又落回下方时，本条为真、那条为假。
+
+    构造：前三根收 10.0（白线 = 10.0），第四根的**最高价** 11.0 冲过白线、**收盘**回到 9.5。
+    故 ``high_above_white`` 为真而 ``above_white`` 为假——两类信号各答一个问题。
+    """
+    closes = [10.0, 10.0, 10.0, 9.5]
+    bars = panel(
+        {
+            "high": {"sh600000": [10.0, 10.0, 10.0, 11.0]},
+            "low": {"sh600000": [9.0, 9.0, 9.0, 9.0]},
+            "close": {"sh600000": closes},
+        }
+    )
+    close_frame = pd.DataFrame({"sh600000": closes}, index=bars["close"].index)
+
+    touched = high_above_white(bars, n=2)["sh600000"]
+    closed_above = above_white(close_frame, n=2, margin=0.0)["sh600000"]
+
+    assert bool(touched.iloc[-1]) is True, "最高价冲过白线，本条应为真"
+    assert bool(closed_above.iloc[-1]) is False, "收盘落在白线下方，那条应为假"
+
+
+def test_high_above_white_is_strict_at_the_line(panel):
+    """最高价**恰好等于**白线不算破——与 :func:`new_high` 的严格比较一致。
+
+    平坦序列上白线恒等于该常数，故最高价（同值）与它相等，应当取假。
+    """
+    flat = panel(
+        {
+            "high": {"sh600000": [10.0, 10.0, 10.0]},
+            "low": {"sh600000": [10.0, 10.0, 10.0]},
+            "close": {"sh600000": [10.0, 10.0, 10.0]},
+        }
+    )
+
+    got = high_above_white(flat, n=2)["sh600000"]
+
+    assert got.tolist() == [False, False, False]
+
+
+def test_high_above_white_takes_false_where_the_high_is_missing(panel):
+    """``high`` 缺失（停牌）处取假——「摸到过白线」是一个判断，不是默认状态。
+
+    注意白线**没有预热窗口**（``ema`` 以首根播种，见 :func:`~mbt.signals.indicators.ema`），
+    故第 0、1 根照常有值、照常可比；只有 ``high`` 本身缺失的那一根取假。
+    """
+    nan = float("nan")
+    bars = panel(
+        {
+            "high": {"sh600000": [10.0, 11.0, nan]},
+            "low": {"sh600000": [9.0, 9.5, nan]},
+            "close": {"sh600000": [9.5, 10.5, 12.0]},
+        }
+    )
+
+    got = high_above_white(bars, n=10)["sh600000"]
+
+    assert got.tolist() == [True, True, False], "只有 high 缺失那一根取假"
+
+
+def test_high_above_white_rejects_a_non_monotonic_index():
+    """契约由所有公开函数共同遵守。"""
+    from mbt.data import Panel
+
+    idx = pd.to_datetime(["2024-01-03", "2024-01-02", "2024-01-04"])
+    frame = pd.DataFrame({"sh600000": [10.0, 11.0, 12.0]}, index=idx)
+
+    with pytest.raises(ValueError, match="升序"):
+        high_above_white(Panel({"high": frame, "low": frame, "close": frame}), n=2)

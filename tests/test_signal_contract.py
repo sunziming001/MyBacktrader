@@ -82,6 +82,10 @@ SYMBOL_FRAME_SIGNALS = [
     ("momentum", lambda frame: signals.momentum(frame, n=3)),
     ("distance_to_high", lambda frame: signals.distance_to_high(frame, n=3)),
     ("yellow_proximity", lambda frame: signals.yellow_proximity(frame, windows=(2, 3))),
+    (
+        "reward_risk_ratio",
+        lambda frame: signals.reward_risk_ratio(frame, white_n=3, windows=(2, 3)),
+    ),
     ("swings", swing_columns),
     ("volume_structure", volume_columns),
     (
@@ -115,16 +119,9 @@ PANEL_SIGNALS = [
     ("atr", lambda panel: signals.atr(panel, n=3)),
     ("kdj", kdj_lines),
     ("j_below", lambda panel: signals.j_below(panel, threshold=50.0, n=3, m1=3, m2=3)),
+    ("j_oversold", lambda panel: signals.j_oversold(panel, 3, 3, 3)),
+    ("high_above_white", lambda panel: signals.high_above_white(panel, n=3)),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
-    (
-        "reward_risk_ratio",
-        lambda panel: signals.reward_risk_ratio(
-            panel,
-            signals.swings(panel["close"], retracement=0.05),
-            windows=(2, 3),
-            stop_buffer=0.01,
-        ),
-    ),
 ]
 
 #: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /

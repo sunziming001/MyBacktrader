@@ -11,11 +11,12 @@ import pandas as pd
 import pytest
 
 from mbt.signals import (
-    Swings,
     distance_to_high,
+    j_oversold,
+    kdj,
     momentum,
     reward_risk_ratio,
-    swings,
+    white_line,
     yellow_line,
     yellow_proximity,
 )
@@ -167,338 +168,177 @@ def test_yellow_proximity_rejects_a_non_monotonic_index(symbol_frame):
         yellow_proximity(prices, windows=(2,))
 
 
-# --- 交易盈亏比（B1 策略的过滤条件与排序因子） -----------------------------------
-
-NAN = float("nan")
+# --- 交易盈亏比：(白线 − 收盘) ÷ (收盘 − 黄线) ---------------------------------
 
 
-def anchors_of(symbol_frame, *, peak_price, peak_age):
-    """只造本函数读到的两条（``peak_price`` / ``peak_age``），``trough_*`` 填同形占位。
+def pullback_frame(symbol_frame, rate, symbol="sh600000", bars=140):
+    """**先涨后浅回调**的一段序列：涨到 20，再按 ``rate`` 逐根回落 ``bars - 130`` 根。
 
-    这样用例可以直接**摆出**段边界，把「盈亏比怎么算」与「拐点怎么认」分成两件事测——
-    后者归 ``test_signal_swings.py``。本函数不读 ``trough_*``，故占位不会掩盖任何东西。
+    这个形状是刻意的：盈亏比的分母是「收盘 − 黄线」，故要让它为正，收盘必须**仍在黄线上方**，
+    而分子要为正又要求收盘**已跌到白线下方**——即价格落在两条线之间。那正是买点所在的位置
+    （回调到支撑上），故这个夹具与策略的语义一致，不是为了凑数。
+
+    用 140 根是因为黄线含 114 日均线：短于此它整列缺失（实测 40 根时黄线全是 NaN）。
     """
-    prices = symbol_frame(peak_price)
-    ages = symbol_frame(peak_age)
-    return Swings(peak_price=prices, peak_age=ages, trough_price=prices, trough_age=ages)
+
+    closes = list(np.linspace(10.0, 20.0, 130))
+    closes += [20.0 * (1.0 - rate * (i + 1)) for i in range(bars - 130)]
+    return symbol_frame({symbol: closes[:bars]})
 
 
-def test_the_yellow_line_is_the_stop_when_it_sits_above_the_prior_low(panel, symbol_frame):
-    """黄线比前低 × 0.99 高时，止损位就是黄线——手算 **6.0**。
+def test_reward_risk_ratio_is_the_reward_over_the_risk(symbol_frame):
+    """手算锁定：``(白线 − 收盘) ÷ (收盘 − 黄线)``。
 
-    收盘 12.6；黄线 = MA3 = (12 + 13 + 12.6) ÷ 3 = 12.5333…；前低 = min(12.0, 12.4) × 0.99
-    = 11.88；故亏头 = 12.6 − 12.5333… = 0.06666…，赚头 = 前高 13 − 12.6 = 0.4 → **6.0**。
-
-    前 4 根为缺失：前 2 根黄线窗口不足，后 2 根峰值尚未确认。
+    期望值由 ``white_line`` / ``yellow_line`` **现算**，而不是写死数字——故两条线的口径若被
+    改动，这条会跟着变红，不会因为「数字还对得上」而静默通过。
     """
-    built = panel(
-        {
-            "close": {"sh600000": [10.0, 11.0, 12.0, 13.0, 12.6]},
-            "low": {"sh600000": [9.0, 10.0, 11.0, 12.0, 12.4]},
-        }
-    )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN] * 4 + [13.0]},
-            peak_age={"sh600000": [NAN] * 4 + [1.0]},
-        ),
-        windows=(3,),
-        stop_buffer=0.01,
-    )["sh600000"]
+    prices = pullback_frame(symbol_frame, 0.006)
+    windows = (14, 28, 57, 114)
 
-    assert got.iloc[:4].isna().all()
-    assert got.iloc[-1] == pytest.approx(0.4 / (12.6 - 37.6 / 3))
+    got = reward_risk_ratio(prices, white_n=10, windows=windows)["sh600000"]
+    white = white_line(prices, 10)["sh600000"]
+    yellow = yellow_line(prices, windows=windows)["sh600000"]
+
+    last = prices.index[-1]
+    close = float(prices.loc[last, "sh600000"])
+    reward = float(white.loc[last]) - close
+    risk = close - float(yellow.loc[last])
+
+    assert risk > 0 and reward > 0, "构造前提：收盘应落在黄线与白线之间"
+    assert float(got.loc[last]) == pytest.approx(reward / risk)
 
 
-def test_the_prior_low_is_the_stop_when_it_sits_above_the_yellow_line(panel, symbol_frame):
-    """前低 × 0.99 比黄线高时，止损位是前低——手算 **1 ÷ 0.229**。
+def test_reward_risk_ratio_is_missing_when_the_close_is_below_the_yellow_line(symbol_frame):
+    """收盘跌破黄线 → 分母 ≤ 0，取**缺失**而不是负数。
 
-    收盘 13.0；黄线 = MA5 = (5 + 5 + 12 + 13 + 13) ÷ 5 = 9.6；前低 = min(12.9, 12.9) × 0.99
-    = 12.771；故亏头 = 13 − 12.771 = 0.229，赚头 = 前高 14 − 13 = 1 → **1 ÷ 0.229**。
-
-    这段构造顺带说明「前低在上」需要什么：**黄线窗口比前低窗口长得多**。黄线是窗口内收盘的
-    均值，而前低只看峰值之后那一段——窗口一短，均值必然高于段内最低价，前低就永远当不上止损位。
+    刻意不给负数：那会在横截面排序里排到最末，看着像「最差的一档」；也不给无穷，那看着像
+    「最好的一档」。这两种观感都在替调用方表态，而事实是「这个比值没有意义」。
     """
-    built = panel(
-        {
-            "close": {"sh600000": [5.0, 5.0, 12.0, 13.0, 13.0]},
-            "low": {"sh600000": [4.9, 4.9, 11.9, 12.9, 12.9]},
-        }
-    )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN] * 4 + [14.0]},
-            peak_age={"sh600000": [NAN] * 4 + [1.0]},
-        ),
-        windows=(5,),
-        stop_buffer=0.01,
-    )["sh600000"]
+    prices = pullback_frame(symbol_frame, 0.010)
+    windows = (14, 28, 57, 114)
 
-    assert got.iloc[-1] == pytest.approx(1.0 / (13.0 - 12.9 * 0.99))
+    got = reward_risk_ratio(prices, white_n=10, windows=windows)["sh600000"]
+    yellow = float(yellow_line(prices, windows=windows)["sh600000"].iloc[-1])
+
+    assert float(prices["sh600000"].iloc[-1]) < yellow, "构造前提：收盘应在黄线下方"
+    assert pd.isna(got.iloc[-1])
 
 
-def test_the_prior_low_starts_at_the_peak_so_an_earlier_low_is_not_counted(panel, symbol_frame):
-    """窗口是「峰值 → 当根」，峰值**之前**的最低价不算——那段属于上一波，不是这次的支撑。
+def test_reward_risk_ratio_goes_negative_when_the_close_is_above_the_white_line(symbol_frame):
+    """收盘站上白线 → 分子 ≤ 0，**照常给负值**（那是一个真实可比的比值，由 ``> 门槛`` 挡掉）。
 
-    最低价 1.0 落在峰值（第 2 根）之前。前低 = min(5.0, 6.0, 6.0) × 0.99 = 4.95；若窗口误
-    从序列开头算起，前低会变成 0.99、盈亏比从 **2 ÷ 1.05** 变成 2 ÷ 1.5 —— 一眼可辨。
+    构造：整段**单调上涨**，故收盘恒在两条线之上、分子恒为负。
     """
-    built = panel(
-        {
-            "close": {"sh600000": [1.0, 5.0, 6.0, 6.0]},
-            "low": {"sh600000": [1.0, 5.0, 6.0, 6.0]},
-        }
+
+    prices = symbol_frame({"sh600000": list(np.linspace(10.0, 20.0, 140))})
+
+    got = reward_risk_ratio(prices, white_n=10, windows=(14, 28, 57, 114))["sh600000"]
+
+    assert pd.notna(got.iloc[-1])
+    assert float(got.iloc[-1]) < 0
+
+
+def test_reward_risk_ratio_is_missing_while_the_yellow_line_is_missing(symbol_frame):
+    """黄线窗口不足处为缺失，比值随之缺失——缺失来自窗口，不是来自数据。"""
+    short = symbol_frame({"sh600000": [10.0 + i for i in range(40)]})
+
+    got = reward_risk_ratio(short, white_n=10, windows=(14, 28, 57, 114))["sh600000"]
+    assert got.isna().all(), "黄线含 114 日均线，40 根里它整列缺失"
+
+    longer = symbol_frame({"sh600000": [10.0 + i for i in range(140)]})
+    assert pd.notna(
+        reward_risk_ratio(longer, white_n=10, windows=(14, 28, 57, 114))["sh600000"].iloc[-1]
     )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN] * 3 + [8.0]},
-            peak_age={"sh600000": [NAN] * 3 + [2.0]},
-        ),
-        windows=(4,),
-        stop_buffer=0.01,
-    )["sh600000"]
-
-    assert got.iloc[-1] == pytest.approx(2.0 / (6.0 - 5.0 * 0.99))
 
 
-def test_a_bar_that_makes_a_new_low_pulls_the_prior_low_down_to_its_own_low(panel, symbol_frame):
-    """含当根的代价：当根创出调整期新低时，前低就是**它自己的最低价**，亏头被压到 1% 的收盘价。
+def test_reward_risk_ratio_is_larger_when_the_close_sits_closer_to_the_yellow_line(symbol_frame):
+    """越大越靠前：贴黄线的那只比值更大，故它能直接当排序因子用。
 
-    最低价逐日下移 8.9 → 7.9 → 7.0，峰值在第 1 根。前低 = 7.0 × 0.99 = 6.93，亏头 =
-    7 − 6.93 = 0.07（恰是 ``stop_buffer`` × 收盘价），赚头 = 9 − 7 = 2 → **2 ÷ 0.07 ≈ 28.6**，
-    门槛 4.0 轻松通过。
-
-    这正是「正在跌破支撑的那一根反而容易通过门槛」：当根的最低点成了止损位，若它同时**收在
-    最低价附近**，亏头就只剩 ``stop_buffer`` × 收盘价。实测（141 只 × 8,558 个交易日）这类
-    格子在放行的 29,667 格里有 2,300 格，其中 1,551 格换成「不含当根」的窗口就直接给不出正
-    亏头——两种口径各有代价，故由调用方选（见函数文档的 warning）。
+    这条把**方向**钉住——若哪天有人把分子分母写反，两者的相对大小会翻转。
     """
-    built = panel(
-        {
-            "close": {"sh600000": [1.0, 9.0, 8.0, 7.0]},
-            "low": {"sh600000": [1.0, 8.9, 7.9, 7.0]},
-        }
-    )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN] * 3 + [9.0]},
-            peak_age={"sh600000": [NAN] * 3 + [2.0]},
-        ),
-        windows=(4,),
-        stop_buffer=0.01,
-    )["sh600000"]
+    shallow = pullback_frame(symbol_frame, 0.002, symbol="near")
+    deep = pullback_frame(symbol_frame, 0.008, symbol="far")
+    prices = pd.concat([shallow, deep], axis=1)
 
-    assert got.iloc[-1] == pytest.approx(2.0 / 0.07)
+    got = reward_risk_ratio(prices, white_n=10, windows=(14, 28, 57, 114)).iloc[-1]
+
+    assert got["far"] > got["near"], "贴黄线（亏头小、赚头大）的那只比值必须更大"
+    assert got["far"] > 4.0, "深回调那只应当越过默认门槛 4.0，否则这条测的不是它"
 
 
-def test_the_ratio_remembers_that_it_is_a_factor_so_bigger_comes_first(panel, symbol_frame):
-    """同一行可比，且**越大越靠前**。两只标的的收盘与止损位完全相同，只有前高不同。
+def test_reward_risk_ratio_needs_only_closing_prices(symbol_frame):
+    """它只吃收盘价的标的宽表——不再需要面板，也不再需要摆动点。
 
-    ``远`` 的前高更高 → 赚头更大 → 排更前。这正是因子契约（``Screen`` 不提供反转开关）。
+    这条是接口契约：前一版要 ``panel`` 与 ``anchors``，各自带来一处「必须与别处同源」的
+    约束。简化之后那些约束一并消失。
     """
-    built = panel(
-        {
-            "close": {"近": [1.0, 9.0, 8.0, 7.0], "远": [1.0, 9.0, 8.0, 7.0]},
-            "low": {"近": [1.0, 8.9, 7.9, 7.0], "远": [1.0, 8.9, 7.9, 7.0]},
-        }
-    )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"近": [NAN] * 3 + [9.0], "远": [NAN] * 3 + [14.0]},
-            peak_age={"近": [NAN] * 3 + [2.0], "远": [NAN] * 3 + [2.0]},
-        ),
-        windows=(4,),
-        stop_buffer=0.01,
-    ).iloc[-1]
+    prices = pullback_frame(symbol_frame, 0.006)
 
-    assert got["远"] > got["近"], "赚头更大的那只必须排更前"
+    got = reward_risk_ratio(prices, white_n=10, windows=(14, 28, 57, 114))
 
-
-def test_a_close_below_the_stop_gives_a_missing_ratio_not_a_negative_one(panel, symbol_frame):
-    """分母 ≤ 0（已跌穿止损位）→ **缺失**，既不给负数也不给无穷。
-
-    给负数会在横截面排序里排到最末，看着像「最差的一档」，而它其实是「这笔交易不成立」；
-    给无穷则看着像「最好的一档」。两者都是把一个不存在判断编成具体数值。
-    """
-    built = panel(
-        {
-            "close": {"sh600000": [10.0, 10.0, 9.0]},
-            "low": {"sh600000": [9.5, 9.5, 8.9]},
-        }
-    )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN] * 2 + [12.0]},
-            peak_age={"sh600000": [NAN] * 2 + [1.0]},
-        ),
-        windows=(2,),
-        stop_buffer=0.01,
-    )["sh600000"]
-
-    assert pd.isna(got.iloc[-1]), "收盘 9.0 已在黄线 9.5 下方，比值没有含义"
-
-
-def test_an_unconfirmed_peak_gives_a_missing_ratio(panel, symbol_frame):
-    """峰值未确认就没有前高，也没有前低——整格缺失，且仍是浮点（因子契约）。"""
-    built = panel(
-        {
-            "close": {"sh600000": [10.0, 11.0, 12.0]},
-            "low": {"sh600000": [9.0, 10.0, 11.0]},
-        }
-    )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN, NAN, NAN]},
-            peak_age={"sh600000": [NAN, NAN, NAN]},
-        ),
-        windows=(2,),
-        stop_buffer=0.01,
-    )
-
-    assert got["sh600000"].isna().all()
+    assert list(got.columns) == ["sh600000"]
+    assert got.index.equals(prices.index)
     assert all(dtype.kind == "f" for dtype in got.dtypes)
 
 
-def test_a_gap_inside_the_window_is_skipped_rather_than_blanking_the_window(panel, symbol_frame):
-    """窗内的缺失根（停牌）**跳过**：不参与取最小值，也不把整窗判为缺失（ADR-0005）。
+def test_reward_risk_ratio_rejects_an_empty_window_list(symbol_frame):
+    """没有均线就谈不上黄线，故报错而不是静默给常数。"""
+    prices = symbol_frame({"sh600000": [10.0, 10.0, 10.0]})
 
-    第 3 根缺价。前低取 min(5.0, 〔缺〕, 7.0) = 5.0 → 4.95。若把缺口当成「不知道」而整窗作废，
-    这一格会变成缺失；若把缺口当成 0，前低会变成 0。
+    with pytest.raises(ValueError, match="不能为空"):
+        reward_risk_ratio(prices, white_n=2, windows=())
+
+
+# --- J 值的超卖程度（B1 的排序因子） -------------------------------------------
+
+
+def test_j_oversold_is_the_negated_j(panel):
+    """``−J``：J 越小越超卖，取负号之后「越大越超卖」，才符合因子「越大越靠前」的约定。"""
+    closes = [10.0, 10.0, 11.0, 10.0, 12.0]
+    bars = panel(
+        {
+            "high": {"sh600000": [c + 1.0 for c in closes]},
+            "low": {"sh600000": [c - 1.0 for c in closes]},
+            "close": {"sh600000": closes},
+        }
+    )
+
+    got = j_oversold(bars, 3, 3, 3)["sh600000"]
+    j = kdj(bars, 3, 3, 3).j["sh600000"]
+
+    pd.testing.assert_series_equal(got, -j, check_names=False)
+
+
+def test_j_oversold_puts_the_more_oversold_symbol_first(panel):
+    """横截面上的方向：J 更低的那只因子更大。
+
+    两个标的走同一段行情，只在最后一根分开——一只继续跌（把 J 压低）、一只继续涨（把 J 抬高）。
     """
-    built = panel(
+    falling = [10.0, 11.0, 12.0, 11.0, 10.0]
+    rising = [10.0, 11.0, 12.0, 11.0, 13.0]
+    bars = panel(
         {
-            "close": {"sh600000": [1.0, 6.0, 5.0, 7.0]},
-            "low": {"sh600000": [1.0, 5.0, NAN, 7.0]},
+            "high": {"falling": [c + 1.0 for c in falling], "rising": [c + 1.0 for c in rising]},
+            "low": {"falling": [c - 1.0 for c in falling], "rising": [c - 1.0 for c in rising]},
+            "close": {"falling": falling, "rising": rising},
         }
     )
-    got = reward_risk_ratio(
-        built,
-        anchors_of(
-            symbol_frame,
-            peak_price={"sh600000": [NAN] * 3 + [9.0]},
-            peak_age={"sh600000": [NAN] * 3 + [2.0]},
-        ),
-        windows=(4,),
-        stop_buffer=0.01,
-    )["sh600000"]
 
-    assert got.iloc[-1] == pytest.approx(2.0 / (7.0 - 5.0 * 0.99))
+    got = j_oversold(bars, 3, 3, 3).iloc[-1]
+
+    assert got["falling"] > got["rising"], "J 更低的那只必须排更前"
 
 
-def test_the_monotonic_queue_matches_a_naive_scan_over_a_real_swing_series(panel, symbol_frame):
-    """拿**朴素写法**（每根重扫整段窗口）对账单调队列——队列是这里唯一有技巧的零件。
-
-    段边界不走占位，而是真的由 :func:`~mbt.signals.swings.swings` 给出，故这条同时验了
-    「前低窗口就是 ``peak_age + 1`` 根，且左端是峰值」这件事与信号的因果性一致。
-    """
-    closes = [
-        10.0,
-        11.0,
-        13.0,
-        12.0,
-        11.0,
-        10.5,
-        10.2,
-        11.0,
-        12.0,
-        13.5,
-        12.5,
-        11.5,
-        11.0,
-        10.8,
-        12.0,
-        13.0,
-        14.0,
-        13.0,
-        12.0,
-        11.5,
-    ]
-    lows = [value - 0.1 for value in closes]
-    values = {"sh600000": closes}
-    frame = symbol_frame(values)
-    anchors = swings(frame, retracement=0.05)
-    lines = yellow_line(frame, windows=(3,))
-
-    got = reward_risk_ratio(
-        panel({"close": values, "low": {"sh600000": lows}}),
-        anchors,
-        windows=(3,),
-        stop_buffer=0.01,
-    )
-
-    naive = pd.DataFrame(
+def test_j_oversold_is_missing_where_the_j_is_missing(panel):
+    """J 缺失处（窗口不足、分母为 0）因子随之缺失——不会因为取负号而变成 0。"""
+    flat = panel(
         {
-            "sh600000": [
-                _naive_ratio(row, closes, lows, anchors, lines["sh600000"])
-                for row in range(len(closes))
-            ]
-        },
-        index=frame.index,
-    )
-    pd.testing.assert_frame_equal(got, naive, check_exact=False, rtol=1e-12)
-
-
-def _naive_ratio(row: int, closes, lows, anchors, line) -> float:
-    """单调队列的对照实现：**每根重扫整段窗口**，不做任何优化。"""
-    age = anchors.peak_age["sh600000"].iloc[row]
-    if not np.isfinite(age):
-        return NAN
-    window = [value for value in lows[row - int(age) : row + 1] if np.isfinite(value)]
-    if not window:
-        return NAN
-    stop = max(float(line.iloc[row]), min(window) * 0.99)
-    risk = closes[row] - stop
-    if risk <= 0.0:
-        return NAN
-    return (float(anchors.peak_price["sh600000"].iloc[row]) - closes[row]) / risk
-
-
-def test_reward_risk_ratio_rejects_a_stop_buffer_outside_the_unit_interval(panel, symbol_frame):
-    """缓冲比例不在 ``[0, 1)`` 内时，止损位要么不降反升、要么非正——报错而不是静默算。"""
-    built = panel(
-        {
-            "close": {"sh600000": [10.0, 11.0]},
-            "low": {"sh600000": [9.0, 10.0]},
+            "high": {"sh600000": [5.0, 5.0, 5.0, 5.0]},
+            "low": {"sh600000": [5.0, 5.0, 5.0, 5.0]},
+            "close": {"sh600000": [5.0, 5.0, 5.0, 5.0]},
         }
     )
-    anchors = anchors_of(
-        symbol_frame,
-        peak_price={"sh600000": [NAN, 12.0]},
-        peak_age={"sh600000": [NAN, 1.0]},
-    )
 
-    for bad in (-0.01, 1.0):
-        with pytest.raises(ValueError, match="stop_buffer"):
-            reward_risk_ratio(built, anchors, windows=(2,), stop_buffer=bad)
+    got = j_oversold(flat, 3, 3, 3)["sh600000"]
 
-
-def test_reward_risk_ratio_rejects_anchors_that_do_not_match_the_panel(panel, symbol_frame):
-    """段边界与行情必须同源：对不上会把段边界对到别的日子上，而那种错不会报错。"""
-    built = panel(
-        {
-            "close": {"sh600000": [10.0, 11.0]},
-            "low": {"sh600000": [9.0, 10.0]},
-        }
-    )
-    elsewhere = anchors_of(
-        symbol_frame,
-        peak_price={"sz000001": [NAN, 12.0]},
-        peak_age={"sz000001": [NAN, 1.0]},
-    )
-
-    with pytest.raises(ValueError, match="标的"):
-        reward_risk_ratio(built, elsewhere, windows=(2,), stop_buffer=0.01)
+    assert got.isna().all()

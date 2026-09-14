@@ -64,14 +64,13 @@ def _window_aggregates(
     # 整段无有效值时**直接给 NaN**，不走 nanmean/nanmax——那两个在空切片上会发
     # RuntimeWarning。但只判「整段」不够：`np.nanmean(..., axis=0)` 只要**任一列**全缺失
     # 就会发 "Mean of empty slice" / "All-NaN slice"，而长期停牌的标的列正是这种情况。
-    # 缺失是正常状态不是异常，故这里连警告一起压掉——不能靠 `errstate`（它管的是浮点
-    # 状态，不是 warnings 模块）。
+    # 缺失是正常状态不是异常，故警告要被压掉——不能靠 `errstate`（它管的是浮点状态，
+    # 不是 warnings 模块）。**压制不在这里做**：见 `volume_structure` 的说明（每次窗口
+    # 进出一次上下文，实测占本函数耗时的约 5%，而它本该是一次性的）。
     if not np.isfinite(window).any():
         blank = np.full(columns.size, np.nan)
         return blank, blank.copy()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmean(window, axis=0), np.nanmax(window, axis=0)
+    return np.nanmean(window, axis=0), np.nanmax(window, axis=0)
 
 
 def _cached_aggregates(
@@ -155,7 +154,29 @@ def volume_structure(
     抛:
         ValueError: ``edge_bars`` / ``base_bars`` 不为正，或 ``volumes`` 与 ``anchors`` 的
             标的或交易日对不上（对不上会把段边界对到别的日子上，而那种错不会报错）。
+
+    .. note::
+
+        **警告压制在这里做一次，不在每个窗口做一次。** ``np.nanmean`` / ``np.nanmax`` 在
+        「某一列全无有效值」（长期停牌）时会发 ``RuntimeWarning``，而那是**正常状态**不是
+        异常，故必须压掉。但它曾写在最热的那个窗口函数里，于是每个窗口都要进出一次
+        ``warnings.catch_warnings()``——实测 36,586 次进出占本函数耗时的约 **5%**，
+        而它本该是一次性的。挪到这一层之后，同一次调用里只进出一次，且它顺带覆盖了
+        ``_window_aggregates`` 的任何被包装/替换版本（警告过滤器是进程级的）。
     """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return _volume_structure(volumes, anchors, edge_bars=edge_bars, base_bars=base_bars)
+
+
+def _volume_structure(
+    volumes: pd.DataFrame,
+    anchors: Swings,
+    *,
+    edge_bars: int,
+    base_bars: int,
+) -> VolumeStructure:
+    """:func:`volume_structure` 的实现体——警告压制由调用方负责，理由见那里的说明。"""
     if edge_bars < 1:
         raise ValueError(f"edge_bars 必须为正，收到 {edge_bars!r}")
     if base_bars < 1:

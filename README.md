@@ -45,14 +45,16 @@
     `volume_structure`（按摆动点切段后的量能结构：放量倍数 / 顶部比值 / 缩量倍数）
   - 过滤信号：`new_high`、`volume_surge`、`ma_cross_up`、`rising_streak`、`above_ma`、
     `white_above_yellow`、`above_yellow`（收盘在黄线上方——与前者不同：前者比两条线，
-    后者比价格与线）、`below_yellow_streak`、`above_white` / `below_white`（卖出规则用的
-    白线两侧）、`j_below`、`pullback_after_advance`（「一波上涨之后的下跌阶段」）、
+    后者比价格与线）、`high_above_white`（**最高价**高于白线——「盘中摸到过」，
+    与 `above_white` 用收盘价不同）、`below_yellow_streak`、`above_white` / `below_white`
+    （白线两侧）、`j_below`、`pullback_after_advance`（「一波上涨之后的下跌阶段」）、
     `volume_contraction`（上涨放量 + 回调缩量）
-  - 排序因子：`momentum`、`distance_to_high`、`yellow_proximity`（黄线贴近度，
-    **越大离黄线越近**）、`reward_risk_ratio`（**交易盈亏比**：`(前高 − 收盘) ÷
-    (收盘 − max(黄线, 前低 × (1 − stop_buffer)))`——**B1 策略用的就是它**。它与回测指标里的
-    盈亏比 `payoff_ratio` 不是同一个量：那个是**已实现**交易的「平均盈利 ÷ 平均亏损」，这个是
-    **建仓前**的预估）
+  - 排序因子：`momentum`、`distance_to_high`、`yellow_proximity`（黄线贴近度）、
+    `j_oversold`（J 值的超卖程度，即 `−J`——**B1 策略用的就是它**）、
+    `reward_risk_ratio`（**交易盈亏比**：`(白线 − 收盘) ÷ (收盘 − 黄线)`，赚头看白线、
+    亏头看黄线。它与回测指标里的盈亏比 `payoff_ratio` 不是同一个量：那个是**已实现**交易的
+    「平均盈利 ÷ 平均亏损」，这个是**建仓前**的预估。B1 曾用它当第七条过滤器，现已移除——
+    它度量的是入场瞬间的空间，而 B1 的卖出规则（最高价一摸白线就卖）不依赖那个空间）
   - **行情面板已实现**（票据 [#14](https://github.com/sunziming001/MyBacktrader/issues/14)）：
     `Panel` + `assemble_panel`。ATR 一行内要用 `high` / `low` / `close` 且必须同日对齐，而标的
     宽表一格只能放一个数，面板补上这一层。它是**按需组装**的显式结构，不落盘、不常驻；字段
@@ -67,7 +69,10 @@
     （默认等权：每个持仓名额拿到等额的**目标仓位**，见 `mbt.backtest.sizing`）。单标的入口
     `run_backtest` 是它的退化情形，**不存在第二套引擎路径**。
   - **股票池**是 boolean 标的宽表，按每个调仓日的当日状态计算：品种只收股票、板块可配置、
-    默认排除次新股（`mbt.universe`）。撮合层**强制**池外不可买、**卖出不受限**。
+    默认排除次新股（`mbt.universe`）。撮合层**强制**池外不可买、**卖出不受限**——
+    判据按**下单那一根**取，不按成交那一根（订单在 T 收盘下定、T+1 开盘成交；按成交那根复查
+    会把入场条件悄悄变成「T 入选**且** T+1 仍入选」）。理由见
+    `mbt.backtest.costs.AStockBroker` 的专节。
   - **品种判定**（`mbt.data.instrument_type`）按市场 + 代码前缀区分股票 / 指数 / 可转债 /
     基金 / 其他；判不出归「其他」而**不报错**（错在「不收」这个安全方向）。
 - **选股规则已实现**（票据 [#7](https://github.com/sunziming001/MyBacktrader/issues/7)）：
@@ -269,8 +274,9 @@ mbt backtest ... --progress 30     # 或指定间隔
   「明显超过该间隔仍无新行」才是信号。
 - **「还需多久」是线性外推**，不是承诺。它拿已观察到的平均速率乘剩余量，而每根的代价并非
   恒定（越往后上市标的越多）。要更可靠的估计，看**阶段结束行的实际用时**，别把外推值排进计划。
-- **要定位到某一行代码**就用标准库的 `faulthandler`（`.scratch/run_b1_full_market.py` 的
-  `--watchdog` 就是这么做的）：进度行是「还在推进」的证据，栈是「卡在哪一行」的证据。
+- **要定位到某一行代码**就用标准库的 `faulthandler`（`python -X faulthandler`，或
+  `faulthandler.dump_traceback_later(秒数)`）：进度行是「还在推进」的证据，栈是「卡在哪一行」
+  的证据。两者答的不是同一个问题，缺一个都会猜错。
 
 按纪律，**库默认不打印**（`progress=None`）：给 `progress=` 才有输出，故它与回测结果无关——
 带进度与不带进度跑出来的净值曲线、成交明细**逐位相同**（`tests/test_progress.py` 盯着这一点）。

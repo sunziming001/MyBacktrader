@@ -141,6 +141,31 @@ def above_yellow(prices: pd.DataFrame, windows: tuple[int, ...]):
     return check_symbol_frame(prices) > yellow_line(prices, windows)
 
 
+def high_above_white(panel: Panel, n: int):
+    """当日**最高价**高于白线（**状态**）——「盘中摸到过白线」。
+
+    与 :func:`above_white` 的差别只在用哪个价：
+
+    ====================  ==========================================
+    ``above_white``       **收盘价**高于白线（站上了）
+    ``high_above_white``  **最高价**高于白线（摸到过）
+    ====================  ==========================================
+
+    区别有实际后果：最高价摸到白线而收盘又落回下方，是「上冲被打回」；``above_white``
+    看不见这一类，``high_above_white`` 看得见。B1 的「最高价破白线即卖出」用的就是后者。
+
+    参数:
+        panel: 行情面板，须含 ``close`` 与 ``high``。
+        n: 白线的双重 EMA 窗口。
+
+    用 ``>`` 而非 ``>=``：最高价恰好等于白线不算破（与 :func:`new_high` 同一口径）。
+    ``high`` 缺失（停牌）处取假；白线窗口不足处为缺失，比较亦假。
+    """
+    close = check_symbol_frame(panel["close"])
+    high = check_symbol_frame(panel["high"])
+    return high > white_line(close, n)
+
+
 def above_white(prices: pd.DataFrame, n: int, margin: float):
     """收盘价**高于白线 ``margin`` 比例以上**（**状态**）。
 
