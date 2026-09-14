@@ -304,3 +304,106 @@ def test_volume_structure_is_invariant_to_scaling_the_volume_series(symbol_frame
     for name in ("surge_ratio", "top_ratio", "pullback_ratio"):
         pd.testing.assert_frame_equal(getattr(scaled, name), getattr(plain, name), rtol=1e-12)
     assert plain.surge_ratio.notna().to_numpy().sum() > 20, "样本太稀薄，这条性质没被真正检验"
+
+
+def wavy_panel(symbol_frame, symbols, bars=120):
+    """每个标的走**各自不同相位**的波浪行情，故它们的摆动点互不相同。
+
+    这正是分组实现最容易出错的那一类输入。共用一条价格序列的样本测不出这种错——那样所有标的
+    落在**同一个**摆动对上，分组退化成一组，于是「分错组」不可能发生。
+    """
+    import math
+
+    prices = {
+        f"s{i:05d}": [100.0 + 20.0 * math.sin(j / 5.0 + i) for j in range(bars)]
+        for i in range(symbols)
+    }
+    volumes = {
+        f"s{i:05d}": [1000.0 + 500.0 * math.cos(j / 3.0 + i) for j in range(bars)]
+        for i in range(symbols)
+    }
+    return symbol_frame(prices), symbol_frame(volumes)
+
+
+def test_output_of_a_symbol_does_not_depend_on_which_other_symbols_are_present(symbol_frame):
+    """一个标的的取值**只取决于它自己那一列**，与同批还有谁在完全无关。
+
+    这不是可有可无的性质，而是一次优化的**许可条件**：实现现在只对被问到的那几列算窗口
+    （见 ``_window_aggregates`` 的说明），而这只有在「每一列独立」成立时才与整体算逐位相同。
+    故这条同时盯两件事——列之间不串味，以及那条优化没把「不串味」弄丢。
+    """
+    price, volume = wavy_panel(symbol_frame, symbols=4)
+    many = volume_structure(volume, swings_of(price, retracement=0.05), edge_bars=3, base_bars=5)
+
+    non_missing = 0
+    for i in range(4):
+        symbol = f"s{i:05d}"
+        # 单独跑第 i 个标的：只留它一列，段边界按它自己那条曲线重算。
+        alone = volume_structure(
+            symbol_frame({symbol: volume[symbol].tolist()}),
+            swings_of(symbol_frame({symbol: price[symbol].tolist()}), retracement=0.05),
+            edge_bars=3,
+            base_bars=5,
+        )
+        for name in ("surge_ratio", "top_ratio", "pullback_ratio"):
+            pd.testing.assert_frame_equal(
+                getattr(alone, name), getattr(many, name)[[symbol]], check_exact=True
+            )
+            non_missing += int(getattr(alone, name).notna().to_numpy().sum())
+
+    assert non_missing > 50, f"判据几乎空转：只比对了 {non_missing} 个有值的格子"
+
+
+def test_a_fully_missing_symbol_does_not_poison_its_group(symbol_frame):
+    """成交量整列缺失的标的自己给 NaN，且**不拖累**与它同组的标的。
+
+    长期停牌的标的列就是这样（整段无有效值），而按列算窗口之后会多出「这一组整段没有有效值」
+    这么一条分支——它若把整组一起置空，同组的邻居就被无辜抹掉了。
+    """
+    prices = symbol_frame({"sh600000": PRICES, "sz000001": PRICES, "sz000002": PRICES})
+    blanks = [float("nan")] * len(PRICES)
+    volumes = symbol_frame({"sh600000": VOLUMES, "sz000001": VOLUMES, "sz000002": blanks})
+
+    got = volume_structure(volumes, swings_of(prices), edge_bars=2, base_bars=4)
+
+    assert pd.isna(got.surge_ratio["sz000002"].iloc[15]), "整列缺失的标的应当缺失"
+    assert got.surge_ratio["sh600000"].iloc[15] == pytest.approx(5.0), "同组的邻居被拖累了"
+    assert got.surge_ratio["sz000001"].iloc[15] == pytest.approx(5.0)
+
+
+def test_the_work_grows_with_the_number_of_symbols_not_with_its_square(symbol_frame, monkeypatch):
+    """标的数翻倍，窗口计算量只该翻倍——**这条盯着的是一个真实出现过的二次开销**。
+
+    曾经每加一个标的，代价按标的数**平方**增长，来源有两处：每行先铺一张「摆动对 × 标的」的
+    表再挑回一列；窗口按全部标的算，而实际只有一两只用到。全市场实测因此从 5 秒涨到一个多
+    小时，且现象是「不报错、只是永远跑不完」——正是最需要一条测试钉住的那类缺陷。
+
+    判据取**比值**而不是绝对秒数：2 = 线性，4 = 二次。绝对耗时依赖机器，比值不依赖，故这条
+    测试不会因为换了台电脑就变红。
+    """
+    from mbt.signals import volume as volume_module
+
+    def work_for(symbols):
+        counted = {"elements": 0}
+        real = volume_module._window_aggregates
+
+        def counting(vol, start, end, columns):
+            rows = max(0, min(end, vol.shape[0] - 1) - max(start, 0) + 1)
+            counted["elements"] += rows * int(columns.size)
+            return real(vol, start, end, columns)
+
+        monkeypatch.setattr(volume_module, "_window_aggregates", counting)
+        price, volume = wavy_panel(symbol_frame, symbols=symbols)
+        volume_structure(volume, swings_of(price, retracement=0.05), edge_bars=3, base_bars=5)
+        monkeypatch.undo()
+        return counted["elements"]
+
+    small = work_for(4)
+    large = work_for(8)
+    assert small > 0, "没数到任何窗口计算——计数器没接上，这条测试在空转"
+
+    growth = large / small
+    assert growth < 3.0, (
+        f"标的数翻倍（4→8），窗口计算量却涨了 {growth:.1f} 倍："
+        f"线性应当在 2 倍上下，接近 4 倍说明二次开销又回来了"
+    )

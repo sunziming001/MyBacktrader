@@ -9,6 +9,8 @@ backtrader 在停牌日返回的是**上一根的陈旧 K 线**：``volume`` 看
 
 from __future__ import annotations
 
+import math
+
 import backtrader as bt
 import pandas as pd
 import pytest
@@ -641,3 +643,398 @@ def test_a_user_defined_prenext_is_respected_and_next_is_not_called_twice(
     total_bars = len(result.equity_curve)
     assert "prenext" in calls, "用户自己的 prenext 必须仍然被调用"
     assert len(calls) == total_bars, f"每根恰好一次回调，实际 {len(calls)} 次 / {total_bars} 根"
+
+
+# --- 喂给引擎的行情表：列序是契约，feed 的类型是性能决定 ---------------------------------
+
+
+def test_the_engine_feed_reads_columns_by_position_so_the_order_is_checked():
+    """行情表列序不对时**当场报错**，而不是把开高低收错位喂进引擎。
+
+    ``PandasDirectData`` 按 ``itertuples`` 的**位置**取数（列 1=open … 列 5=volume），
+    故列序是契约。这类错不会抛异常、也不会在净值曲线上显形，只会让每笔成交价都差一点——
+    正是最该用一道检查换掉的那种静默失真。
+    """
+    from mbt.backtest.engine import _feed
+
+    good = flat_bars(4, 10.0)
+    assert _feed(good) is not None  # 正常列序不报错
+
+    shuffled = good[["open", "high", "low", "close", "volume"]].reindex(
+        columns=["close", "high", "low", "open", "volume"]
+    )
+    with pytest.raises(ValueError, match="列序"):
+        _feed(shuffled)
+
+
+def test_the_engine_feed_is_the_direct_one_because_preload_dominates():
+    """引擎用 ``PandasDirectData``——这条钉住的是**实测得到的一个数量级**，不是偏好。
+
+    两者产出逐位相同（已在真实行情上比对过），但装载一段实测差 6.6 倍（26.5s → 4.0s／232 只），
+    而全市场下装载是引擎阶段的一大半（545s / 1481.6s）。故这里断言类型本身：将来若有人
+    「顺手统一成 PandasData」，这条测试会红，并把他指向这一段注释。
+    """
+    from mbt.backtest.engine import _feed
+
+    feed = _feed(flat_bars(4, 10.0))
+    assert isinstance(feed, bt.feeds.PandasDirectData)
+    # `openinterest=-1` 是「本表没有这一列」。给了它，第 6 列 `amount` 会被当成持仓量。
+    assert feed.p.openinterest == -1
+
+
+# --- 装载：整列拷贝必须与逐根装载**逐位**相同 ---------------------------------
+#
+# `_BarFeed.preload` 把每列一次性拷进 line 缓冲（日期整列向量化），替掉了 `PandasDirectData._load`
+# 的逐根循环——后者是全市场 980 万根 × 6 列的 Python 循环，实测占引擎阶段四成（81s / 212.9s）。
+#
+# 这一组的写法与别处不同：**直接比 line 缓冲的原始数组**，而不是比回测结果。理由是等价性的
+# 论据在「同一批 double」上（见 `_BarFeed.preload` 的三条），比对结果只会在必要时才暴露它；
+# 而这里能给出**逐元素**的比对，且任何一处差（哪怕只差一根、只差末位）都会红。
+
+
+def _preload_both_ways(prices):
+    """同一张行情表分别走**整列**与**逐根**两条装载路径，返回两条路径的 line 缓冲。
+
+    逐根那条用一个显式退回基类的子类来拿——不靠改参数去「碰巧」绕开整列路径。
+    """
+    from mbt.backtest.engine import _BarFeed
+
+    class _ByBar(_BarFeed):
+        def preload(self):
+            # `super(_BarFeed, self)` 是刻意的：跳过 `_BarFeed.preload` 这个覆盖，直落基类
+            # `PandasDirectData` 的逐根原路。tick 那两处 no-op 仍在这里生效，但 `preload`
+            # 不碰 `tick_*`（那是 `advance()` / `next()` 的事），故两边可比。
+            return super(_BarFeed, self).preload()
+
+    def load(feed):
+        # 走 cerebro 的装配顺序：`_env` 由 `adddata` 给（`_start()` 要用它取交易日历），
+        # 然后是 `reset` → `extend(size=lookahead)` → `_start` → `preload`
+        # （见 `Cerebro.runstrategies`）。
+        bt.Cerebro(stdstats=False).adddata(feed)
+        feed.reset()
+        feed.extend(size=1)  # 与 cerebro 一致：`lookahead` 的那一格
+        feed._start()
+        feed.preload()
+        return feed
+
+    columns = load(_BarFeed(dataname=prices, openinterest=-1))
+    bars = load(_ByBar(dataname=prices, openinterest=-1))
+    return columns, bars
+
+
+def _line_snapshot(feed):
+    """把 feed 的全部 line 缓冲照下来：原始数组 + 指针 + 那格 lookahead。"""
+    return {
+        alias: (
+            # `array.array` 的相等是**逐元素**的精确比较，NaN 也按位（nan != nan，故下面用
+            # 自己的比法：先比长度与 `idx`，再逐位比每格的值）。
+            tuple(line.array),
+            line.idx,
+            line.lencount,
+            line.extension,
+            line.buflen(),
+        )
+        for alias, line in ((alias, getattr(feed.lines, alias)) for alias in _LINE_ALIASES)
+    }
+
+
+_LINE_ALIASES = ("datetime", "open", "high", "low", "close", "volume", "openinterest")
+
+
+def _assert_same_lines(columns, bars):
+    """两条装载路径的每一格都要**逐位**相同（含 NaN 的格子与那一格 lookahead）。"""
+    left = _line_snapshot(columns)
+    right = _line_snapshot(bars)
+    assert set(left) == set(right)
+    for alias in left:
+        larr, lidx, llencount, lext, lbuflen = left[alias]
+        rarr, ridx, rlencount, rext, rbuflen = right[alias]
+        assert (lidx, llencount, lext, lbuflen) == (ridx, rlencount, rext, rbuflen), alias
+        assert len(larr) == len(rarr), alias
+        for i, (a, b) in enumerate(zip(larr, rarr, strict=True)):
+            if math.isnan(a) or math.isnan(b):
+                assert math.isnan(a) and math.isnan(b), f"{alias}[{i}]"
+            else:
+                assert a == b, f"{alias}[{i}]：{a!r} != {b!r}"
+
+
+def test_the_engine_feed_loads_whole_columns_and_gets_the_same_lines_as_bar_by_bar():
+    """整列装载与逐根装载产出**逐位相同**的 line 缓冲。
+
+    等价性的三条论据见 ``_BarFeed.preload``：同一批 double、同一套日期（``date2num(午夜)``
+    = ``float(toordinal)``）、以及末尾那 ``extension`` 格 lookahead。
+
+    这里刻意放了两个坑：**周末之后的日子**（真实交易日历的间隔，能抓住「按索引推日期」的写法）
+    与一根 **NaN 的 K 线**（停牌/缺失在面板里长这样，能抓住「NaN 被过滤掉」的写法）。
+    """
+    prices = flat_bars(6, 10.0, start="2024-01-05")  # 2024-01-05 是周五，跨周末
+    prices.loc[prices.index[2], ["open", "high", "low", "close"]] = float("nan")
+
+    columns, bars = _preload_both_ways(prices)
+
+    # `_ByBar` 那一侧没有 mode 可言——它绕开的正是记这个属性的地方。「退回逐根」由
+    # `test_the_engine_feed_falls_back_when_a_time_of_day_is_present` 拿真 feed 钉住。
+    assert columns._mbt_preload_mode == "columns", "这张表本该走整列路径"
+    _assert_same_lines(columns, bars)
+
+
+def test_the_engine_feed_dates_are_the_same_numbers_bt_date2num_produces():
+    """日期线逐格等于 ``bt.date2num(那一天的午夜)`` —— 向量化的那条公式在这里对账。
+
+    ``date2num`` 对午夜时刻取 ``math.fsum((ordinal, 0.0, 0.0, 0.0, 0.0))``，只有一项非零，
+    故结果**恰好**是 ``float(ordinal)``；而 ``ordinal = 719163 + floor(ns / 86400e9)``。
+    两处都是整数进浮点，本世纪内远小于 2^53，故没有舍入。
+    """
+    prices = flat_bars(5, 10.0, start="2024-02-28")  # 跨 2/29（闰日）
+    columns, _ = _preload_both_ways(prices)
+
+    got = list(columns.lines.datetime.array[: len(prices)])  # 末尾那格是 lookahead 的 NAN
+    expected = [bt.date2num(stamp.to_pydatetime()) for stamp in prices.index]
+    assert got == expected
+    assert math.isnan(columns.lines.datetime.array[len(prices)])
+
+
+def test_the_engine_feed_falls_back_when_a_time_of_day_is_present():
+    """带时刻的时间戳退回逐根装载——那条公式只对午夜成立。
+
+    向量化那条路算的是 ``719163 + floor(ns / 86400e9)``，**压根不看时刻**；而 ``date2num``
+    对非午夜时刻取 ``math.fsum((ordinal, h/24, m/1440, s/86400, us/86400e6))``。两者差的不
+    只是末位——是整天。这里同时钉住「退回了」与「退回去之后仍然逐位相同」。
+    """
+    prices = flat_bars(5, 10.0)
+    prices.index = prices.index + pd.Timedelta(hours=15)  # 收盘时刻，非午夜
+
+    columns, bars = _preload_both_ways(prices)
+
+    assert columns._mbt_preload_mode == "bars", "带时刻的表不该走整列路径"
+    _assert_same_lines(columns, bars)
+    assert list(columns.lines.datetime.array[: len(prices)]) == [
+        bt.date2num(stamp.to_pydatetime()) for stamp in prices.index
+    ]
+
+
+# --- 逐根的固定开销：四处「与标的数成正比、与策略无关」的代价 -------------------
+#
+# 这一段钉的都是**每 tick × 每标的**的固定开销，它们不改变任何数值结果，却是全市场
+# （4752 标的 × 2701 根 = 1280 万次）下的分钟量级。四处的账与实测（232 标的、逐根阶段
+# 14.8s → 6.2s）见 `mbt.backtest.engine._drive_engine` 开头那段注释。
+#
+# 之所以每条都要有测试盯着，是因为这些改动全部**不报错的**：改坏了要么只是变慢（没人会
+# 注意到），要么算出的日期偏一天（多标的 + 掩码的组合下不会崩，只会让决策落在另一天）。
+
+
+def test_all_three_clocks_agree_with_the_naive_scan_on_every_tick(make_market, zero_cost_rules):
+    """三处主时钟（策略侧 / 分析器侧 / 撮合侧）**逐根**与「扫一遍标的取最大值」对账。
+
+    三处现在都不再扫标的了，各自的等价论证见 ``_EngineClock`` / ``EngineClock`` /
+    ``AStockBroker._compute_clock``。这条测试把三者放在同一根 K 线上比对，且刻意放进一只
+    **晚上市**的标的——那正是这个时钟存在的理由（第一个标的停在末根时，扫出来的最大值与它
+    的日期会分叉）。
+
+    - 策略侧：``EngineClock.today()``（读策略自己的 ``datetime`` 线）。
+    - 撮合侧：``AStockBroker._compute_clock()``（比浮点日期序号、只转换赢家）。
+    - 分析器侧：它写出的就是净值曲线的索引，故用整条索引逐根比——比只看首尾严得多，
+      中间偏一天也会被抓到。
+    """
+    from examples.strategies import EngineClock
+
+    naive_seen = []
+
+    class Probe(EngineClock, bt.Strategy):
+        def next(self):
+            naive = max(d.datetime.date(0) for d in self.datas if len(d))
+            naive_seen.append(naive)
+            assert self.today() == pd.Timestamp(naive), "策略侧时钟与朴素扫描不一致"
+            assert self.broker._compute_clock() == naive, "撮合侧时钟与朴素扫描不一致"
+
+    early = make_market("sh600000", flat_bars(6, 10.0))
+    late = make_market("sz000001", flat_bars(3, 20.0, start="2024-01-04"))
+
+    result = run_portfolio_backtest(
+        [early, late],
+        Probe,
+        cash=100_000.0,
+        max_positions=2,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+    )
+
+    assert len(naive_seen) == 6, "时钟要走完两个标的日期的并集"
+    assert [stamp.date() for stamp in result.equity_curve.index] == naive_seen
+
+
+def test_the_engine_adds_no_plotting_observers(make_market, zero_cost_rules):
+    """引擎不挂**绘图用**的观察者——它的产物全部来自 analyzers。
+
+    ``bt.observers.Broker`` / ``BuySell`` / ``DataTrades`` 只在 ``cerebro.plot()`` 里有用，
+    而 ``_drive_engine`` 不把 cerebro 交出去（返回的是 :class:`BacktestResult`），故它们在这里
+    纯粹是每标的每根跑一遍的白开销：实测（232 标的）3.5s / 14.8s，是这一组里最大的一笔。
+
+    将来若有人改回默认，这条会红——要加绘图观察者，请先想清楚这 24% 花得值不值。
+    """
+    counts = []
+
+    class Probe(bt.Strategy):
+        def next(self):
+            counts.append(len(self.observers))
+
+    run_portfolio_backtest(
+        [make_market("sh600000", flat_bars(6, 10.0))],
+        Probe,
+        cash=100_000.0,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+    )
+
+    assert counts, "策略应当被调用过"
+    assert set(counts) == {0}, f"不该有观察者，实际每根 {sorted(set(counts))} 个"
+
+
+def test_the_engine_feed_leaves_the_tick_attributes_alone(make_market, zero_cost_rules):
+    """bar 模式的 feed 不做 tick 记账：``tick_*`` 全程是 ``None``。
+
+    唯一读 ``tick_*`` 的是 ``BackBroker._try_exec``，它读不到就退回 ``data.open[0]`` /
+    ``high[0]`` / ``low[0]`` / ``close[0]``——**正是那段记账会抄进去的值**（记账发生在同一
+    tick 的推进里，撮合紧随其后，中间没有第二次推进）。故「成交价仍然对」这件事由
+    ``test_golden_case_of_a_three_symbol_portfolio`` 之类的用例盯着，这里只钉「记账确实省了」。
+    """
+    tick_values = []
+
+    class Probe(bt.Strategy):
+        def next(self):
+            # `tick_*` 是 `_tick_nullify()` 建的（不是 `start()`），省掉记账后这些属性**根本
+            # 不存在**——`BackBroker._try_exec` 用的就是 `getattr(..., None)`，故这里同一种读法。
+            for alias in ("tick_open", "tick_high", "tick_low", "tick_close"):
+                tick_values.append(getattr(self.data0, alias, None))
+
+    run_portfolio_backtest(
+        [make_market("sh600000", flat_bars(4, 10.0))],
+        Probe,
+        cash=100_000.0,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+    )
+
+    assert tick_values
+    assert set(tick_values) == {None}, "tick_* 一次也不该被填"
+
+
+def test_a_rejection_is_dated_on_the_day_it_happened(make_market, zero_cost_rules):
+    """拒单记录上的日期是**当根**，不是上一根。
+
+    ``_RejectionRecorder`` 在 ``notify_order`` 里取主时钟，而它现在读的是策略的 ``datetime``
+    线——那就依赖 ``quicknotify=False``：订单通知必须在 ``_oncepost`` 里送达（那时主时钟**已经**
+    写好），而不是在 ``_brokernotify`` 里立刻送达（那时还停在上一根）。这条测试就是那个依赖的
+    哨兵：一旦有人把 ``quicknotify`` 打开，日期会整体早一根，这条会红。
+
+    构造同 ``test_an_order_expires_when_the_symbol_stays_stale_too_long``：停牌 3 天、容忍 2 天，
+    故第 3 个无 K 线的交易日作废——那一天是 ``2024-01-08``。
+    """
+    a = make_market("sh600000", flat_bars(6, 10.0))
+    b_full = flat_bars(6, 20.0)
+    b = make_market("sz000001", b_full.drop([b_full.index[2], b_full.index[3], b_full.index[4]]))
+
+    class BuyB(bt.Strategy):
+        def next(self):
+            if len(self) == 2 and not self.position:
+                self.buy(data=self.datas[1])
+
+    result = run_portfolio_backtest(
+        [a, b],
+        BuyB,
+        cash=100_000.0,
+        max_positions=1,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+        order_expiry_ticks=2,
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    expired = result.rejected[result.rejected["symbol"] == "sz000001"]
+    assert len(expired) == 1
+    assert expired.iloc[0]["date"] == pd.Timestamp("2024-01-08").date()
+
+
+def test_the_position_table_is_walked_in_symbol_order_and_skips_empty_slots(
+    make_market, zero_cost_rules
+):
+    """持仓表的遍历顺序 = **标的顺序**，且零持仓的标的**不出现在遍历里**。
+
+    两件事，理由各不同（见 ``mbt.backtest.costs._LivePositions`` 的类文档）：
+
+    - **顺序固定** ⇒ ``BackBroker._get_value`` 的浮点求和顺序固定。它按**插入顺序**求和，
+      而浮点加法不满足结合律，于是「哪些标的先被碰过」会改变净值曲线的末位（实测：同一份
+      行情、同一批成交，净值曲线 868 行差在末位，如 ``101524.17725994284`` / ``...285``）。
+      预置后插入顺序恒为标的顺序，与「谁先被碰过」脱钩。
+    - **跳过零持仓** ⇒ 省掉每 tick × 每标的的 ``getcommissioninfo`` + ``data.close[0]``。
+      零持仓在 ``next()`` 的两处循环（都被 ``if pos:`` 挡着）与 ``_get_value`` 里都是**精确
+      的 0**，故跳过逐位不变——只是不再为全市场 4752 标的 × 2701 根各付一遍。
+
+    顺序用「**先碰第 3 只、再碰第 1 只**」来验：若遍历仍按插入顺序，得到的是 ``[d2, d0]``；
+    标的顺序则是 ``[d0, d2]``。第 2 只从头到尾没人碰，它不出现，但仍应**在表里**（预置过了）。
+    """
+    seen = {}
+
+    class Toucher(bt.Strategy):
+        def next(self):
+            if len(self) == 1:
+                self.buy(data=self.datas[2])  # 先碰第 3 只
+            elif len(self) == 2:
+                self.buy(data=self.datas[0])  # 再碰第 1 只
+            # 第 3 根时两笔都已成交，此时遍历顺序才看得出差别。
+            seen[len(self)] = [data._name for data in self.broker.positions]
+
+    result = run_portfolio_backtest(
+        [
+            make_market("sh600000", flat_bars(5, 10.0)),
+            make_market("sh600001", flat_bars(5, 30.0)),
+            make_market("sh600002", flat_bars(5, 20.0)),
+        ],
+        Toucher,
+        cash=100_000.0,
+        max_positions=3,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+        sizer=bt.sizers.FixedSize,
+        sizer_options={"stake": 100},
+    )
+
+    # 第 1 根：还没成交，遍历为空——零持仓被跳过。
+    assert seen[1] == []
+    # 第 2 根：只有第 3 只成交（它先被碰过）。
+    assert seen[2] == ["sh600002"]
+    # 第 3 根：两只都在，顺序必须是**标的顺序**（第 1 只在前），而不是插入顺序（第 3 只在先）。
+    assert seen[3] == ["sh600000", "sh600002"]
+
+    assert len(result.equity_curve) == 5, "顺序变了不该影响曲线长度，这里只是顺带钉住"
+
+
+def test_the_position_table_holds_every_symbol_even_the_untouched_ones(
+    make_market, zero_cost_rules
+):
+    """零持仓标的**跳过遍历**，但**必须留在表里**——否则读它的持仓会造出一个新键。
+
+    这是上一条的另一半：跳过不能顺手改成 ``del``。留着的代价是一次字典插入（全市场 4752 次，
+    毫秒量级），换来的是插入顺序稳定；删掉则会让下一个碰它的标的插到表尾，顺序重新变成
+    「谁先被碰过」，那正是上一条要掐掉的东西。
+    """
+    sizes = []
+
+    class Toucher(bt.Strategy):
+        def next(self):
+            sizes.append([self.broker.positions[data].size for data in self.datas])
+
+    run_portfolio_backtest(
+        [
+            make_market("sh600000", flat_bars(4, 10.0)),
+            make_market("sh600001", flat_bars(4, 30.0)),
+        ],
+        Toucher,
+        cash=100_000.0,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_bars=0),
+    )
+
+    assert sizes, "策略应当被调用过"
+    assert set(tuple(row) for row in sizes) == {(0, 0)}, "没人下过单，两只都该在表里且为零持仓"

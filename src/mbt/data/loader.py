@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Sequence, Sized
 from dataclasses import dataclass
 
 import pandas as pd
@@ -81,6 +81,7 @@ def load_universe_data(
     skip_errors: bool = True,
     start=None,
     end=None,
+    progress=None,
 ) -> UniverseLoad:
     """逐个标的走正门取数，把失败者与失败原因一并交出。
 
@@ -96,6 +97,10 @@ def load_universe_data(
             「越界检查做在哪一段」。这是**必须传对**的一项：不传就等于在整段历史上校验，
             而历史上任何一处说不清的跳空都会让整只标的被拒收——哪怕它落在你的回测之外
             （实测 5.7% 的标的是这个原因，其中九成的坏日子在 2015 之前，票据 #45）。
+        progress: 进度上报的接收端（:class:`~mbt.progress.ProgressReporter`）。``None``
+            （默认）时不输出。逐标的取数在**全市场规模下要几分钟**，而这几分钟里此前一行
+            输出都没有——于是「在正常地慢」与「卡死了」从外部看一模一样（见
+            :mod:`mbt.progress`）。给出时按标的粒度上报。
 
     返回:
         :class:`UniverseLoad`。失败率过高这件事留给调用方判断（CLI 用它决定退出码）。
@@ -103,7 +108,15 @@ def load_universe_data(
     markets: list[MarketData] = []
     skipped: list[SkippedSymbol] = []
 
-    for symbol in symbols:
+    total = len(symbols) if isinstance(symbols, Sized) else None
+    if progress is not None:
+        progress.stage("取数", note=f"{total} 个候选标的" if total else "", unit="只")
+
+    for position, symbol in enumerate(symbols, start=1):
+        if progress is not None:
+            # 报的是**已完成**的数量，故减一：这一轮还没走完。时点用当前标的——取数没有
+            # 「哪一天」可言，有的是「读到哪一个」。
+            progress.tick(position - 1, total, lambda name=symbol: name)
         if not is_stock(symbol):
             skipped.append(SkippedSymbol(symbol, NOT_STOCK, "品种不是股票"))
             continue
@@ -136,6 +149,10 @@ def load_universe_data(
             skipped.append(
                 SkippedSymbol(symbol, UNREADABLE, f"{type(exc).__name__}: {_short(exc)}")
             )
+
+    if progress is not None:
+        # 收尾那一次：循环里报的最后一个数是 total-1，不补这一下，阶段结束行会少一个。
+        progress.tick(len(markets) + len(skipped), total, None)
 
     return UniverseLoad(markets=tuple(markets), skipped=tuple(skipped))
 

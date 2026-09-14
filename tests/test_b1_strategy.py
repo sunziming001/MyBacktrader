@@ -194,3 +194,142 @@ def test_the_prior_low_is_anchored_at_entry_and_is_not_ratcheted_down(
 
     # 建仓发生在索引 0 之后（下一根成交），锚定止损位 9.9；价格最低 10.1，故不该触发止损。
     assert len(_sells(result)) == 0, "价格从未跌破锚定的 9.9，不该有卖出"
+
+
+# --- 「本根该遍历谁」：只走可能动作的标的，但结果必须与走遍全部标的**逐位相同** ----------
+#
+# 循环体对「没持仓、没挂单、不在当日候选、也没有遗留状态」的标的所做的全是空操作，故跳过
+# 它们与逐一遍历语义相同。这一步把每根的开销从 O(全部标的) 降到 O(少数几个)——全市场下
+# 是 1280 万次遍历换几次。它省得很多，故**等价性必须被钉住**，而不是靠推理。
+
+
+def _screen_for(flags):
+    """按一张逐日布尔表选股。表外的地方为「未选中」。"""
+
+    def pick(panel):
+        close = panel["close"]
+        return flags.reindex(index=close.index, columns=close.columns).fillna(False).astype(bool)
+
+    return Screen(filters=(pick,))
+
+
+def _b1_equivalence_scenario(make_market, make_prices, zero_cost_rules, strategy):
+    """跑一个把循环体的**每条路径**都走到的四标的场景。
+
+    刻意安排：
+
+    - **C 一次都没被选中**——它必须整段被跳过；
+    - **A 第 2 根清仓、第 5 根重新入选**——重选那一刻正是「刚清仓的标的要不要单独遍历」
+      这条推理的关键处；
+    - **B 第 5 根减半**——持仓分支里的分批止盈（减仓后仍是持仓）；
+    - **D 第 7 根入选、第 8 根停牌**——买单在停牌日不能成交，会**挂到下一根**，故中间那一根
+      只有「有挂单」这条来源能把它带进遍历范围。
+    """
+    bars = 10
+    flat = make_prices([10.0] * bars, volume=1000)
+    index = flat.index
+    a, b, c, d = "sh600000", "sz000001", "sh600004", "sh600005"
+    columns = [a, b, c, d]
+
+    markets = [
+        make_market(a, flat),
+        make_market(b, flat),
+        make_market(c, flat),
+        # 第 8 根整根缺失＝停牌：那天 `close[0]` 是陈旧价，买单只能留到第 9 根
+        make_market(d, flat.drop(index[8])),
+    ]
+
+    flags = pd.DataFrame(False, index=index, columns=columns)
+    for row in (0, 1, 5, 6):
+        flags.loc[index[row], a] = True
+    for row in (3, 4):
+        flags.loc[index[row], b] = True
+    flags.loc[index[7], d] = True
+
+    fields = {name: pd.DataFrame(0.0, index=index, columns=columns) for name in FIELDS}
+    fields["stop_streak"].loc[index[2], a] = 1.0  # A 第 2 根清仓
+    fields["trim"].loc[index[5], b] = 1.0  # B 第 5 根减半
+
+    return run_portfolio_backtest(
+        markets,
+        strategy,
+        cash=100_000.0,
+        max_positions=4,
+        rules=zero_cost_rules,
+        universe_rules=UniverseRules(min_trading_days=0),
+        screen=_screen_for(flags),
+        signals=fields,
+    )
+
+
+def test_the_candidate_loop_gives_the_same_result_as_walking_every_symbol(
+    make_market, make_prices, zero_cost_rules
+):
+    """只遍历「可能动作的标的」与遍历全部标的，产出的净值曲线与成交明细**逐位相同**。
+
+    ``FullScan`` 就是旧写法（`for data in self.datas`），两条路在同一份输入上比：这是这条
+    优化唯一站得住的理由。若等价性破了，差异会出现在净值或成交价的最后几位上——那正是
+    只看「期末收益差不多」会漏掉的东西，故这里用 ``check_exact=True``。
+    """
+    from examples.strategies import B1
+
+    class FullScan(B1):
+        def _candidates(self, today):
+            return [(data, data._name) for data in self.datas]
+
+    optimized = _b1_equivalence_scenario(make_market, make_prices, zero_cost_rules, B1)
+    walked = _b1_equivalence_scenario(make_market, make_prices, zero_cost_rules, FullScan)
+
+    # 前提：场景本身要有内容，否则「两条路都什么都没做」也能逐位相同。下面这些数字同时
+    # 记录了这个场景到底覆盖了什么，改动它的人会立刻看到覆盖范围变了。
+    assert len(_buys(walked)) == 3, "A 建仓、B 建仓、A 清仓后重新入选再建一次"
+    assert len(_sells(walked)) == 2, "A 止损清仓一次、B 减半一次"
+    assert len(walked.rejected) == 1, "D 的买单被停牌推到下一根，而那天它已不在候选里"
+
+    pd.testing.assert_series_equal(optimized.equity_curve, walked.equity_curve, check_exact=True)
+    pd.testing.assert_frame_equal(optimized.trades, walked.trades, check_exact=True)
+    pd.testing.assert_frame_equal(optimized.rejected, walked.rejected, check_exact=True)
+
+
+def test_the_candidate_loop_actually_leaves_symbols_out(make_market, make_prices, zero_cost_rules):
+    """每一根真正遍历的标的数**少于**标的总数——否则上面那条等价性测试是空的。
+
+    一个把 ``_candidates`` 写成「返回全部标的」的实现会顺利通过等价性测试（它本来就是旧
+    写法），却一点没省。这条负责把那种退化抓出来。
+    """
+    from examples.strategies import B1
+
+    widths: list[int] = []
+
+    class Counting(B1):
+        def _candidates(self, today):
+            picked = super()._candidates(today)
+            widths.append(len(picked))
+            return picked
+
+    result = _b1_equivalence_scenario(make_market, make_prices, zero_cost_rules, Counting)
+
+    assert widths, "策略应当被调用过"
+    assert min(widths) < 4, f"每根都遍历了全部 4 只标的（最少一次是 {min(widths)}）"
+    assert len(_buys(result)) == 3, "跳过归跳过，该建的仓一只都不能少"
+
+
+def test_the_strategy_refuses_a_selection_table_that_misses_a_trading_day():
+    """选股表缺一天就**报错**，而不是那天静默地一根都不建仓。
+
+    候选集只从选股表来，而查不到当天时 ``.get`` 会退化成「当日无人入选」——那与「当天确实
+    没有候选」长得一模一样。这类静默失真必须在建索引时（第一根 K 线）当场暴露。
+    """
+    import types
+
+    from examples.strategies import B1
+
+    days = pd.bdate_range("2024-01-02", periods=3)
+    fake = types.SimpleNamespace(
+        broker=types.SimpleNamespace(
+            selection_mask=pd.DataFrame(True, index=days[:2], columns=["sh600000"]),
+            tradability_mask=pd.DataFrame(True, index=days, columns=["sh600000"]),
+        )
+    )
+    with pytest.raises(ValueError, match="缺少"):
+        B1._index_selected_days(fake)
