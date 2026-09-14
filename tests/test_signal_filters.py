@@ -23,6 +23,7 @@ from mbt.signals import (
     j_below,
     ma_cross_up,
     new_high,
+    no_contained_run,
     pullback_after_advance,
     rising_streak,
     volume_surge,
@@ -644,3 +645,172 @@ def test_high_above_white_rejects_a_non_monotonic_index():
 
     with pytest.raises(ValueError, match="升序"):
         high_above_white(Panel({"high": frame, "low": frame, "close": frame}), n=2)
+
+
+# --- 调整期内不得有「连续 days 根内含」 ----------------------------------------
+
+
+def contained_panel(panel, flags, symbol="sh600000", count=20):
+    """造一个「内含」标志完全可控的面板。
+
+    手法：把每根的高/低固定为 100 / 90，于是「收盘落在前一根区间内」等价于
+    ``90 <= 收盘 <= 100``。故 ``flags[t]=True`` 时收盘给 95、``False`` 时给 105
+    （上破前一根的最高价）——这样逐根的内含标志与 ``flags`` 一致，便于手算。
+    """
+    high = [100.0] * count
+    low = [90.0] * count
+    close = [95.0 if flag else 105.0 for flag in flags]
+    return panel({"high": {symbol: high}, "low": {symbol: low}, "close": {symbol: close}})
+
+
+def anchors_with_peak(symbol="sh600000", peak_at=2, count=20):
+    """手造摆动点：峰值固定在 ``peak_at``，故第 ``t`` 根的 ``peak_age = t - peak_at``。
+
+    第 ``peak_at`` 根之前为缺失（那时峰值尚未确认）——这正是本过滤器「没有调整期就不给
+    乐观答案」那条分界。手造而不调 :func:`swings`，是为了让段起点完全可控、落点可手算。
+    """
+    from mbt.signals import Swings
+
+    index = pd.bdate_range("2024-01-02", periods=count)
+    age = [float("nan")] * peak_at + [float(t - peak_at) for t in range(peak_at, count)]
+    blank = pd.DataFrame({symbol: [float("nan")] * count}, index=index, dtype=float)
+    return Swings(
+        peak_price=blank.copy(),
+        peak_age=pd.DataFrame({symbol: age}, index=index, dtype=float),
+        trough_price=blank.copy(),
+        trough_age=blank.copy(),
+    )
+
+
+def test_no_contained_run_says_qualified_when_the_pullback_has_no_such_stretch(panel):
+    """**取向**：它的 True 表示「合格」= 调整期内**没有**连续 ``days`` 根内含。
+
+    这一条单独存在是因为取向写反过一次：函数名叫 ``no_...`` 而实现返回了「存在这样的串」，
+    于是单测与实现一起错、彼此印证，谁也没抓住它——直到它在真实行情上把所有格子都挡掉
+    （夹具上 134~140 全是 False）才暴露。故这条断言只做最直白的一件事：给一串**没有**横盘的
+    标志，整列必须为真。
+    """
+    flags = [True, False] * 10  # 内含与不内含交替，最长连续只有 1 根
+    got = no_contained_run(contained_panel(panel, flags), anchors_with_peak(peak_at=2), days=3)[
+        "sh600000"
+    ]
+
+    assert got.iloc[3:].all(), "没有三连横盘时，应当是「合格」"
+
+
+def test_no_contained_run_rejects_the_bar_once_the_window_fits_in_the_pullback(panel):
+    """手算锁定边界：窗口必须**完整落在调整期内**，早一根就不算。
+
+    峰值在索引 2，故调整期从索引 3 起。**内含标志**在索引 2~5 为真（``contained[t]`` 看的是
+    ``close[t]``，故标志按索引给），取 ``days=3``：
+
+    ======  ==========  ====================  ======================
+    第几根   调整期      最近一个合格窗口      合格？
+    ======  ==========  ====================  ======================
+    3        [3, 3]      无（放不下窗口）       是 ← 确凿没有，不是猜
+    4        [3, 4]      [2, 4]（左端 2）       是 ← 窗口跨出了调整期
+    5        [3, 5]      [3, 5]（左端 3）       否
+    6        [3, 6]      [3, 5]（左端 3）       否 ← 已出现的窗口仍在期内
+    7        [3, 7]      [3, 5]（左端 3）       否
+    ======  ==========  ====================  ======================
+
+    索引 4 那一格是关键：合格的窗口确实存在（索引 2~4 都内含），但它的**左端在调整期之前**，
+    故「调整期内连续 3 根」不成立——漏掉这个左端检查的实现会在这里误判为不合格。
+    """
+    flags = [False, False, True, True, True, True] + [False] * 14
+    got = no_contained_run(contained_panel(panel, flags), anchors_with_peak(peak_at=2), days=3)[
+        "sh600000"
+    ]
+
+    assert bool(got.iloc[3]) is True, "调整期只有一根，装不下窗口——确凿合格"
+    assert bool(got.iloc[4]) is True, "窗口 [2,4] 跨出了调整期，不算"
+    assert bool(got.iloc[5]) is False, "窗口 [3,5] 完整落在期内，不合格"
+    assert bool(got.iloc[6]) is False, "已出现的窗口仍在期内，状态保持"
+    assert bool(got.iloc[7]) is False
+
+
+def test_no_contained_run_is_unqualified_before_the_peak_is_confirmed(panel):
+    """峰值未确认处**不合格**——没有调整期就无从谈「期内」。
+
+    与其余过滤器「缺失即不合格」同一契约（ADR-0005）：宁可漏判，也不凭空造出合格。
+    注意这一条与「调整期过短则合格」是**两回事**：前者是无从判断，后者是确凿成立。
+    """
+    got = no_contained_run(
+        contained_panel(panel, [True] * 20), anchors_with_peak(peak_at=2), days=3
+    )["sh600000"]
+
+    assert got.iloc[:2].tolist() == [False, False], "峰值确认之前不该有答案"
+    assert bool(got.iloc[2]) is True, "峰值那一根的调整期是空集，空真成立"
+    assert bool(got.iloc[3]) is True, "调整期 [3,3] 装不下窗口，确凿合格"
+    assert bool(got.iloc[4]) is True, "调整期 [3,4] 只有两根，仍装不下"
+    assert bool(got.iloc[5]) is False, "调整期到 [3,5] 就装得下且确实横盘了三根"
+
+
+def test_no_contained_run_needs_consecutive_days_not_a_total(panel):
+    """要的是**连续**，不是累计。
+
+    标志取 ``[T,F,T,T,F]`` 重复四遍：真值不少（每五根有两处），但连续的不超过 2 根，
+    故 ``days=3`` 在峰值确认之后整列**合格**。若实现误用「累计和 >= days」，这一列会变红。
+    """
+    flags = ([True, False, True, True, False] * 4)[:20]
+    got = no_contained_run(contained_panel(panel, flags), anchors_with_peak(peak_at=2), days=3)[
+        "sh600000"
+    ]
+
+    assert got.iloc[:2].tolist() == [False, False], "峰值确认之前不该有答案"
+    assert got.iloc[2:].all(), "没有任何 3 连，确认之后应当全部合格"
+
+
+def test_no_contained_run_forgets_a_run_that_belongs_to_the_previous_pullback(panel):
+    """新峰值把调整期起点往前推之后，旧的那一段不再计入——由不合格翻回合格。
+
+    构造：内含在索引 2~5 为真，峰值先在索引 2（调整期从 3 起），故索引 5 处凑满窗口
+    ``[3,5]`` → 不合格。随后峰值改到索引 8（调整期从 9 起），旧窗口左端 3 已落在本期之外，
+    且后面没有新的三连，故索引 9 起应当**合格**。
+    """
+    flags = [False, False, True, True, True, True] + [False] * 14
+    count = 20
+    index = pd.bdate_range("2024-01-02", periods=count)
+    age = [float("nan")] * count
+    for t in range(2, 8):
+        age[t] = float(t - 2)
+    for t in range(8, count):
+        age[t] = float(t - 8)
+    blank = pd.DataFrame({"sh600000": [float("nan")] * count}, index=index, dtype=float)
+
+    from mbt.signals import Swings
+
+    anchors = Swings(
+        peak_price=blank.copy(),
+        peak_age=pd.DataFrame({"sh600000": age}, index=index, dtype=float),
+        trough_price=blank.copy(),
+        trough_age=blank.copy(),
+    )
+
+    got = no_contained_run(contained_panel(panel, flags), anchors, days=3)["sh600000"]
+
+    assert bool(got.iloc[5]) is False, "窗口 [3,5] 落在峰值 2 的调整期内"
+    assert bool(got.iloc[9]) is True, "峰值改到 8 之后，旧窗口不再属于当期"
+
+
+def test_no_contained_run_rejects_a_non_positive_window(panel):
+    """``days`` 至少为 1：0 会让「窗口和 == 0」恒真，那不是放松条件而是条件消失。"""
+    with pytest.raises(ValueError, match="至少为 1"):
+        no_contained_run(contained_panel(panel, [True] * 20), anchors_with_peak(), days=0)
+
+
+def test_no_contained_run_rejects_a_panel_that_does_not_match_the_anchors(panel):
+    """面板与摆动点必须同日同标的——对不上会把段边界对到别的日子上，而那种错不报错。"""
+    from mbt.data import Panel
+
+    bars = contained_panel(panel, [True] * 20)
+    short = Panel(
+        {
+            "high": bars["high"].iloc[:10],
+            "low": bars["low"].iloc[:10],
+            "close": bars["close"].iloc[:10],
+        }
+    )
+
+    with pytest.raises(ValueError, match="索引"):
+        no_contained_run(short, anchors_with_peak(count=20), days=3)

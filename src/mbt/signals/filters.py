@@ -256,3 +256,92 @@ def pullback_after_advance(
         & (age >= min_peak_age)
         & (age <= max_peak_age)
     )
+
+
+def no_contained_run(panel: Panel, anchors, *, days: int) -> pd.DataFrame:
+    """调整期内**没有**连续 ``days`` 根「**内含**」（**状态**）。
+
+    「内含」指当天的**收盘价**落在**前一根**的 ``[最低价, 最高价]`` 之内——即当日既没有
+    上破、也没有下破前一根的区间。注意它**不是**「今天收在今天的区间里」（那是恒真的废话），
+    也不是 K 线形态里的「吞没」（那个要求区间互相包含，方向相反）。
+
+    连续多根内含意味着价格在原地震荡：既创不出新高、也砸不出新低。B1 用它要求那段「回调」
+    真的是回调，而不是一段横盘——横盘既不给回调幅度，也不给回调缩量。
+
+    **范围是调整期**：只数 ``[峰值+1, 当根]`` 这一段（``anchors`` 给的段边界）。窗口右端就是
+    当根，左端随峰值前进。
+
+    参数:
+        panel: 行情面板，须含 ``high`` / ``low`` / ``close``，且三者同日对齐。
+        anchors: :func:`~mbt.signals.swings.swings` 的输出，须与 ``panel`` 出自**同一段行情**。
+        days: 禁止的连续根数（如 ``10``）。**含** ``days`` 本身，即恰好 ``days`` 根也算。
+
+    缺失一律取 ``False``（不合格）：
+
+    - **拐点未确认**（``anchors`` 在那行为缺失）——没有调整期就无从谈「期内」，故不合格；
+    - 前一根的 ``high`` / ``low`` 缺失（序列首根、停牌）——那一根不算内含。
+
+    反过来，**调整期短于 ``days`` 根时一律放行**（合格）：那种长度里根本装不下 ``days`` 根
+    连续的串，「没有这样的串」是**确凿成立**的，不是猜的——故它不该被当成缺失来处置。
+    峰值那一根本身也在这一列里（此时调整期是**空集**，同样空真成立）。实际使用中这些格子很少
+    落到判定上：调用方（B1）同时要求自峰值起至少 5 根。
+
+    .. note::
+
+        实现是**线性**的（每个标的一遍），不是逐行重扫：
+
+        1. 先算逐根的内含标志 ``c[t]``（一次向量化比较）；
+        2. 用累积和求「以 ``t`` 结尾的 ``days`` 根是否全为内含」——即 ``c`` 上长度为 ``days``
+           的滑动窗口和是否等于 ``days``（``cumsum`` 之差，O(根数)）；
+        3. 记下**最近一次**满足条件的窗口右端 ``last_w``（``maximum.accumulate``）；
+        4. 当根合格的条件就是「那个窗口完整落在调整期内」，即其左端 ``last_w - days + 1``
+           不低于段起点。取**最近**那次即可：更早的窗口左端只会更靠前。
+    """
+    import numpy as np
+
+    if days < 1:
+        raise ValueError(f"days 至少为 1，收到 {days!r}")
+
+    close = check_symbol_frame(panel["close"])
+    high = check_symbol_frame(panel["high"])
+    low = check_symbol_frame(panel["low"])
+    if not high.columns.equals(low.columns) or not high.columns.equals(close.columns):
+        raise ValueError("high / low / close 的列（标的）必须一致，且顺序相同")
+    if not high.index.equals(close.index) or not low.index.equals(close.index):
+        raise ValueError("high / low / close 的索引（交易日）必须一致")
+    if not close.columns.equals(anchors.peak_age.columns):
+        raise ValueError("panel 与 anchors 的列（标的）必须一致，且顺序相同")
+    if not close.index.equals(anchors.peak_age.index):
+        raise ValueError("panel 与 anchors 的索引（交易日）必须一致")
+
+    rows, columns = close.shape
+    # 内含：收盘落在**前一根**的区间内。shift(1) 处缺失 ⇒ 比较为假，正是「不给乐观答案」。
+    contained = ((close <= high.shift(1)) & (close >= low.shift(1))).to_numpy(dtype=bool)
+    bits = contained.astype(np.int64)
+
+    # c 上长度为 days 的滑动窗口和（截止当根、含当根）；不足 days 根处不可能满足。
+    cumulative = np.cumsum(bits, axis=0)
+    base = np.zeros((rows, columns), dtype=np.int64)
+    if rows > days:
+        base[days:] = cumulative[:-days]
+    window_sum = cumulative - base
+    window = window_sum == days
+    if rows < days:
+        window[:] = False
+
+    # 最近一次满足的行号；-1 表示此前没有。
+    positions = np.where(window, np.arange(rows, dtype=np.int64)[:, None], -1)
+    latest = np.maximum.accumulate(positions, axis=0)
+
+    # 段起点 = 峰值 + 1 = (row - peak_age) + 1；窗口左端 = latest - days + 1。
+    # 「窗口完整落在期内」即 latest - days + 1 >= row - peak_age + 1。
+    peak_age = anchors.peak_age.to_numpy(dtype=float)
+    with np.errstate(invalid="ignore"):
+        left_edge = latest - days + 1
+        segment_start = np.arange(rows, dtype=np.int64)[:, None] - peak_age + 1
+        # 本函数答的是「**没有**这样的串才算合格」，故这里必须**取反**：
+        # `has_run` 为真表示调整期内确实存在那么一段，那一格不合格。
+        has_run = left_edge >= segment_start
+        # 拐点未确认处不合格（没有调整期就无从谈「期内」），这一条不随取反而变。
+        qualified = np.isfinite(peak_age) & ~has_run
+    return pd.DataFrame(qualified, index=close.index, columns=close.columns, dtype=bool)

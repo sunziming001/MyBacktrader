@@ -121,6 +121,12 @@ PANEL_SIGNALS = [
     ("j_below", lambda panel: signals.j_below(panel, threshold=50.0, n=3, m1=3, m2=3)),
     ("j_oversold", lambda panel: signals.j_oversold(panel, 3, 3, 3)),
     ("high_above_white", lambda panel: signals.high_above_white(panel, n=3)),
+    (
+        "no_contained_run",
+        lambda panel: signals.no_contained_run(
+            panel, signals.swings(panel["close"], retracement=0.05), days=2
+        ),
+    ),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
 ]
 
