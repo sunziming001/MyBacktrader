@@ -315,3 +315,47 @@ def test_the_screen_raises_a_clear_error_when_the_valuation_fields_are_missing(b
 
     with pytest.raises(ValueError, match="valuation_for"):
         b1_screen().apply(without)
+
+
+def test_the_contained_run_filter_is_wired_and_can_bite(b1_setup):
+    """证明「调整期不含横盘串」那条**已接上**且真的会咬人。
+
+    原始夹具证明不了这件事：它的回调段每天收盘都跌破前一根的低点，**一根内含都没有**，
+    故门槛收到最严也咬不到。所以这里把回调段改成**横盘**（130 起收到 30.0 附近，相对峰值
+    35.00 仍是 14% 的回调，其余条件照旧成立），横盘才会真的生出内含串。
+
+    断言的是**单调性**而不是具体落点：门槛越小，落点只能越少，且收到某一档时全空。这比写死
+    几根更稳——它同时证明「接上了」与「方向对」，而写死落点只证明前者。
+    """
+    import numpy as np
+
+    from mbt.data import Panel
+
+    close, volume = climb_fall_bounce()
+    sideways = np.array(close, dtype=float)
+    sideways[130:] = 30.0  # 回调段横盘，不再逐日下破
+    bars = len(sideways)
+    index = b1_setup["close"].index
+    fields = {
+        "open": pd.DataFrame({"sh600000": sideways}, index=index),
+        "high": pd.DataFrame({"sh600000": sideways * 1.005}, index=index),
+        "low": pd.DataFrame({"sh600000": sideways * 0.995}, index=index),
+        "close": pd.DataFrame({"sh600000": sideways}, index=index),
+        "volume": pd.DataFrame({"sh600000": volume}, index=index),
+        "pe": pd.DataFrame({"sh600000": [15.0] * bars}, index=index),
+        "pe_percentile": pd.DataFrame({"sh600000": [0.05] * bars}, index=index),
+    }
+    flat = Panel(fields)
+
+    loose = set(selected_bars(b1_screen(contained_days=10), flat))
+    tight = set(selected_bars(b1_screen(contained_days=6), flat))
+    tighter = set(selected_bars(b1_screen(contained_days=4), flat))
+
+    assert loose, "门槛 10 时应当还有入选——否则这条测的不是「咬人」而是「夹具本身没候选」"
+    assert tighter == set(), "门槛收到 4 时应当一个都不放行"
+    assert tight <= loose, "门槛变小不该让落点变大"
+    assert tighter <= tight
+
+    # 原始夹具上反过来：回调段没有内含，故门槛收到 1 也咬不到——这正是「只看调整期」的
+    # 直接体现（不是「历史上出现过就排除」）。
+    assert list(selected_bars(b1_screen(contained_days=1), b1_setup)) == list(PASSING_BARS)

@@ -592,11 +592,12 @@ def b1_screen(
     volume_base_bars=10,
     min_surge=2.0,
     max_pullback=0.5,
+    contained_days=10,
     pe_above=0.0,
     percentile_below=0.20,
     top_n=None,
 ) -> Screen:
-    """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + 估值，
+    """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + 调整期形态 + 估值，
     **按 J 值的超卖程度**排序。
 
     它是 ``Screen``，故同一条件既能用于 ``mbt screen`` 选股，也能作为回测的入场闸门——
@@ -610,6 +611,7 @@ def b1_screen(
     位置                「一波上涨之后的下跌阶段」
     J 值                ``J < j_max``（默认 8）
     量能                上涨放量 + 回调缩量
+    调整期不含横盘串     调整期内**没有**连续 ``contained_days`` 根「内含」
     PE 为正             ``PE > pe_above``（默认 0，剔除亏损）
     PE 百分位低         ``PE 百分位 < percentile_below``（默认 0.20）
     ==================  ================================================
@@ -617,6 +619,14 @@ def b1_screen(
     排序因子是 :func:`~mbt.signals.factors.j_oversold`（``−J``，越大越超卖）。它回答
     「今天谁的 J 更低」，而 J 的**门槛**由上一条过滤器管（``j_max``）——两者分工不同：
     因子排序、过滤器取舍。
+
+    .. note::
+
+        **「内含」与「横盘串」的定义见** :func:`~mbt.signals.filters.no_contained_run`：
+        当天的**收盘价**落在**前一根**的 ``[最低价, 最高价]`` 之内。连续 ``contained_days``
+        根及以上这样的 K 线意味着价格在原地震荡——既创不出新高、也砸不出新低，那说明这段
+        「回调」其实是横盘而不是回调。取 ``[峰值+1, 当根]`` 为范围（与「位置」「量能」同一段
+        边界）。
 
     .. note::
 
@@ -672,6 +682,7 @@ def b1_screen(
         above_yellow,
         j_below,
         j_oversold,
+        no_contained_run,
         pullback_after_advance,
         swings,
         volume_contraction,
@@ -710,6 +721,11 @@ def b1_screen(
             max_pullback=max_pullback,
         )
 
+    def no_flat_pullback(panel):
+        return no_contained_run(
+            panel, swings(panel["close"], retracement=retracement), days=contained_days
+        )
+
     def profitable(panel):
         return _valuation_field(panel, PE) > pe_above
 
@@ -726,6 +742,7 @@ def b1_screen(
             position,
             low_j,
             volume,
+            no_flat_pullback,
             profitable,
             cheap,
         ),

@@ -48,7 +48,11 @@
     后者比价格与线）、`high_above_white`（**最高价**高于白线——「盘中摸到过」，
     与 `above_white` 用收盘价不同）、`below_yellow_streak`、`above_white` / `below_white`
     （白线两侧）、`j_below`、`pullback_after_advance`（「一波上涨之后的下跌阶段」）、
-    `volume_contraction`（上涨放量 + 回调缩量）
+    `volume_contraction`（上涨放量 + 回调缩量）、`no_contained_run`（**调整期**内**没有**
+    连续 `days` 根「**内含**」——当天的**收盘价**落在**前一根**的 `[最低价, 最高价]` 之内，
+    即当日既没上破也没下破前一根的区间。连续多根内含意味着价格在原地震荡，那种「回调」
+    其实是横盘。门槛默认 10 根；真实行情里约 5% 的回调格会撞上这条线（收到 8 根是约 9%，
+    但实测那一步多排掉的 106 笔本身是赚的、与总体无从区分，故没有筛出坏样本）。
   - 排序因子：`momentum`、`distance_to_high`、`yellow_proximity`（黄线贴近度）、
     `j_oversold`（J 值的超卖程度，即 `−J`——**B1 策略用的就是它**）、
     `reward_risk_ratio`（**交易盈亏比**：`(白线 − 收盘) ÷ (收盘 − 黄线)`，赚头看白线、
