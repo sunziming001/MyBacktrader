@@ -34,8 +34,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from examples.strategies import B1, b1_screen
+from examples.strategies import B1
 from mbt.data import Panel
+from mbt.screen import b1_screen
 from mbt.signals import j_oversold, reward_risk_ratio, swings, volume_pattern, yellow_line
 
 WINDOWS = (14, 28, 57, 114)
@@ -446,8 +447,8 @@ def test_the_volume_filter_judges_the_pullback_against_the_spike_not_the_top(b1_
     """
     import numpy as np
 
-    from examples.strategies import b1_screen
     from mbt.data import Panel
+    from mbt.screen import b1_screen
 
     close, _ = climb_fall_bounce()
     bars = len(close)

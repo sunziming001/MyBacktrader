@@ -516,6 +516,366 @@ def valuation_screen(
     )
 
 
+def b1_signals(
+    markets,
+    *,
+    align_to=None,
+    white_n=10,
+    yellow_windows=(14, 28, 57, 114),
+    stop_days=2,
+    retracement=0.08,
+) -> dict[str, pd.DataFrame]:
+    """算出卖点与止损要读的信号（**标的宽表**），供 ``run_portfolio_backtest(signals=...)``。
+
+    在**完整历史**上算，再截到回测区间——这正是「先算后截」的口径
+    （:func:`mbt.data.panel.clip_fields` 的说明）。若先截再算，摆动点与黄线都会因为起点
+    不同而给出不同的值，于是同一段行情在两个区间里结论不同。
+
+    参数:
+        markets: 一组已质检行情。**必须是完整历史**（``load_market_data`` 的返回值），
+            不是切过窗口的那些——否则「先算后截」就反了。
+        align_to: 一组行情；给了就把结果的**标的集合与交易日范围**对齐到它。
+            **回测时必须给**，且必须传**切过窗口的**那一组行情：引擎要求信号与行情面板
+            逐日同列对齐，而完整历史的信号比切过的行情长、也可能多出被跳过的标的，
+            不对齐就会以「index / columns 不一致」报错。
+
+            刻意接受一个「行情组」而不是 ``(start, end)`` 两个值：那两个值若与实际切片
+            不一致，结果仍是错的，而**行情的边界就在行情里**——从它推出来不会漂移。
+
+    返回的四个字段都是**浮点**（布尔信号转成 0.0/1.0）：它们的消费方是策略侧
+    :func:`signal_value`，读的是标量，而面板字段保持数值型可以省掉一处类型分支。
+
+    ==================  ====================================================
+    字段                含义
+    ==================  ====================================================
+    ``below_white``     收盘严格低于白线（0/1）——「T+2 仍在白线下」那条用
+    ``high_above_white`` 当日最高价严格高于白线（0/1）——「最高价破白线」那条用
+    ``stop_streak``     连续 ``stop_days`` 根收盘低于黄线（0/1）
+    ``peak_age``        自最近一段已完成上涨的峰值起经过的根数（缺失=拐点未确认）
+    ==================  ====================================================
+
+    ``above_white`` 与 ``trim`` 两个字段随旧卖出规则一并去掉了：前者用于「武装」趋势离场，
+    后者用于分批止盈，两条规则都已不存在。留着它们是死字段——而信号面板里多一个没人读的
+    列，下一次改卖出规则时会先让人以为它还在用。
+    """
+    from mbt.data.panel import clip_fields
+    from mbt.signals import (
+        below_white,
+        below_yellow_streak,
+        high_above_white,
+        swings,
+    )
+
+    closes = {market.symbol: market.prices["close"] for market in markets}
+    highs = {market.symbol: market.prices["high"] for market in markets}
+    close_frame = pd.DataFrame(closes)
+    window_frame = {
+        "close": close_frame,
+        "high": pd.DataFrame(highs),
+    }
+
+    def as_float(frame):
+        return frame.astype(float)
+
+    anchors = swings(close_frame, retracement=retracement)
+    fields = {
+        "below_white": as_float(below_white(close_frame, white_n)),
+        "high_above_white": as_float(high_above_white(window_frame, white_n)),
+        "stop_streak": as_float(
+            below_yellow_streak(close_frame, white_n, tuple(yellow_windows), stop_days)
+        ),
+        "peak_age": anchors.peak_age.astype(float),
+    }
+    if align_to is None:
+        return fields
+
+    bounds = [market.prices.index for market in align_to]
+    lower = min(index.min() for index in bounds)
+    upper = max(index.max() for index in bounds)
+    return clip_fields(fields, align_to, start=lower, end=upper)
+
+
+def _valuation_field(panel, name: str):
+    """取一个**来自财务数据**的面板字段；缺了就说清该怎么办。
+
+    估值不在行情里，故它只能由调用方经 ``signals=`` 并进面板。缺字段时 ``Panel`` 本身会抛
+    ``KeyError``，但那句话只说「没有这个字段」，不够回答「那我该做什么」——而这是本规则最
+    容易踩的一脚（行情全都对得上，唯独估值没接上）。
+    """
+    if name not in panel:
+        raise ValueError(
+            f"B1 的选股规则需要面板含 {name!r}，而它来自财务数据、不在行情里。"
+            "调用方要先把 `mbt.data.valuation.valuation_for(...)` 的字段并进传给引擎的 "
+            "`signals=`（见 `mbt.data.panel.with_signals`），或用 `mbt screen --cw-root` 取估值。"
+        )
+    return panel[name]
+
+
+def b1_screen(
+    *,
+    white_n=10,
+    yellow_windows=(14, 28, 57, 114),
+    kdj_n=9,
+    kdj_m1=3,
+    kdj_m2=3,
+    j_max=8.0,
+    retracement=0.08,
+    min_advance=0.10,
+    min_drop=0.08,
+    max_drop=0.35,
+    min_peak_age=5,
+    max_peak_age=50,
+    volume_edge_bars=3,
+    volume_base_bars=10,
+    min_surge=2.0,
+    max_pullback=0.5,
+    atr_n=14,
+    shadow_threshold=1.0,
+    contained_days=10,
+    pe_above=0.0,
+    percentile_below=0.20,
+    top_n=None,
+) -> Screen:
+    """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + 调整期形态 + 估值，
+    **按形态分数**排序（ADR-0012）。
+
+    它是 ``Screen``，故同一条件既能用于 ``mbt screen`` 选股，也能作为回测的入场闸门——
+    不必写两遍（ADR-0001）。
+
+    ==================  ================================================
+    过滤器              判据
+    ==================  ================================================
+    趋势                白线在黄线上
+    价格在慢线上        收盘 > 黄线
+    位置                「一波上涨之后的下跌阶段」
+    J 值                ``J < j_max``（默认 8）
+    量能                上涨放量 + 回调缩量（缩量那条的分母是上涨段**单日最大量**，见 ADR-0011）
+    调整期不含横盘串     调整期内**没有**连续 ``contained_days`` 根「内含」
+    PE 为正             ``PE > pe_above``（默认 0，剔除亏损）
+    PE 百分位低         ``PE 百分位 < percentile_below``（默认 0.20）
+    ==================  ================================================
+
+    排序因子是**形态分数**：三项各自在**当日全市场（可交易池）**内转成百分位，再等权相加。
+
+    ========================  ==================================================
+    组件                       读法（都是**越小越好**，故先取负再进秩）
+    ========================  ==================================================
+    顶部无量                   ``− (vol(顶部那根) ÷ max(上涨段除去顶部那根))``
+    调整缩量                   ``− (mean(回调段) ÷ mean(上涨段除去顶部那根))``
+    长上影                     ``− max(0, 影 ÷ ATR − shadow_threshold)``
+    ========================  ==================================================
+
+    .. note::
+
+        **门仍走旧口径的「量能」，只把另三条降级成分**（ADR-0012）。那三句量能条件原先都是
+        门，② 的读数把它们分开了：`顶部无量` 在真实持有期尺度上的区分力是法定费用的 3.6 倍
+        （h=3 价差 +0.3137%、t=3.03，三个尺度同号），而 `放量` 在同一尺度上正好是零
+        （+0.0091%、t=0.09）。但按 ADR-0012 的元规则，「不赚钱」只能把它从判据**降级**、
+        不能据此删掉原话里的某条，故这道门本轮不动。
+
+        **这道门按旧口径算**（:func:`~mbt.signals.volume_contraction` 的两半，即放量**且**
+        缩量），也就是 ① 那三版对照里的 A 版。③ 接线时曾把它一并换成新口径的
+        ``surge_vs_base``、并去掉缩量那半条，④ 的全市场对照把那处连带改动量出来是
+        **单独 −7.53 pt**——量级是分数那一步收益（+3.01 pt）的三倍，方向相反；而它本来就
+        没有独立证据（② 说的是「放量的区分力是零」，不是「门的窗口该加宽」）。故退回旧口径。
+        这样本规则与 A 的差别**只剩排序因子一处**，④ 的对照才可归因。
+
+        **门为什么仍用「放量」而不是「顶部无量」**：① 与 ② 两条独立量法都指向「放量不挣
+        自己的饭钱」，而改门得先拿留出期复现的数字。这是一个有意保留的、与读数相抵的选择。
+
+    .. note::
+
+        **``shadow_threshold`` 是这道扣分唯一的旋钮，而力度 ``k`` 在这里没有作用。**
+        ADR-0012 把它写成 ``k × max(0, 影÷ATR − 1)`` 并标「力度 k 待定」——在**等权 +
+        逐日秩归一**下这个 k 不可辨识：``k > 0`` 只是给整个分量乘一个正常数，百分位完全不变。
+        故那条待办自动消解，剩下的只有门槛 ``shadow_threshold``（默认 1.0，由实测里
+        ``>1.0`` 只占 12.5% 定）。
+
+    .. warning::
+
+        **② 量的是** ``−影÷ATR``（未截的原始读数），而这里接的是**截过的扣分**。两者的秩在
+        门槛之下不同：截过之后约 87.5% 的候选格并列为 0、只由另两个分量分胜负。故 ② 那个
+        ``+0.2183%`` 不能直接读作本实现的预期——它是**这一项有方向性**的证据，不是这一个
+        函数形式的读数。④ 的对照会照出差别；若结果不理想，未截的原始形式是第一个该试的变体。
+
+    排序因子从 :func:`~mbt.signals.factors.j_oversold` 换下来之后，J 值**只剩门槛**
+    （``j_max``）这一个作用：因子排序、过滤器取舍，两者分工不同。``j_oversold`` 本身仍
+    留在信号层（公开、有测试），只是不再被这条规则使用——与
+    :func:`~mbt.signals.factors.yellow_proximity` 的处置相同。
+
+    .. note::
+
+        **「内含」与「横盘串」的定义见** :func:`~mbt.signals.filters.no_contained_run`：
+        当天的**收盘价**落在**前一根**的 ``[最低价, 最高价]`` 之内。连续 ``contained_days``
+        根及以上这样的 K 线意味着价格在原地震荡——既创不出新高、也砸不出新低，那说明这段
+        「回调」其实是横盘而不是回调。取 ``[峰值+1, 当根]`` 为范围（与「位置」「量能」同
+        一处边界）。
+
+    .. note::
+
+        **这里不再有「交易盈亏比 > 门槛」那一条。** 它曾是第七条（赚头看白线、亏头看黄线，
+        ``min_reward_risk`` 默认 4.0，见 :func:`~mbt.signals.factors.reward_risk_ratio`），
+        现已移除。那个函数本身**仍留在信号层**（公开、有测试），只是不再被这条规则使用——
+        与 :func:`~mbt.signals.factors.yellow_proximity` 的处置相同。
+
+    .. warning::
+
+        **最后两条读的是财务数据，不在行情里。** 调用方必须把
+        :func:`~mbt.data.valuation.valuation_for` 的 ``pe`` / ``pe_percentile`` 并进
+        传给引擎的 ``signals=``（它会经 :func:`~mbt.data.panel.with_signals` 成为面板字段）。
+        面板若缺这两个字段，本规则会**报错并说明该怎么办**，而不是静默少一条过滤。
+
+        它们与 ``UndervaluedGrowth`` 的对应条件同源同口径（都是
+        ``mbt.data.valuation``），故 `mbt screen` 那边需要 ``--cw-root``。
+
+    .. note::
+
+        **「PE 为正」不是「PE 百分位低」的冗余。** 百分位是 ``[0, 1]`` 的 min-max 归一化
+        位置，而**非正 PE 照常参与** ``LLV``/``HHV``（见 :func:`~mbt.data.valuation.pe_percentile`
+        的说明）。故一只亏损股完全可能落在低位（它自己的 PE 在窗口里最低），必须由这一条
+        单独剔除。
+
+    .. note::
+
+        **盈亏比换了参照**，从「前高 ÷ 前低」改为 **``(白线 − 收盘) ÷ (收盘 − 黄线)``**：
+        赚头看白线、亏头看黄线，与两条卖出规则（最高价破白线、连续破黄线）对得上。
+        故它现在只依赖收盘价，不再需要摆动点。同一改动把它的参数从
+        ``(panel, anchors, windows, stop_buffer)`` 简化为 ``(prices, white_n, windows)``。
+
+    .. warning::
+
+        **排序因子换成形态分数之后，「盈亏比」就只剩过滤这一个作用了。** 而 ``top_n=None``
+        （默认，「本金不限」）意味着每个合格标的都买一份——那时排序因子对买入**没有影响**，
+        只在给了 ``top_n`` 时才决定「取哪 N 只」。这是两条独立的旋钮，不要指望改排序会
+        改变不限额下的结果。**回测走的就是不限额那条路**，故 ④ 的对照必须先给 ``top_n``，
+        否则新旧两个因子会跑出逐笔完全相同的结果。
+
+    .. warning::
+
+        **``j_max`` 从 20 收到 8。** 九个样本的信号日 J 落在 −13.4 ~ 19.8（中位 −4.8），
+        故 20 覆盖 9/9，而 8 只覆盖一部分（J 在 8~19.8 之间的样本会被挡掉）。收紧它是
+        需求方的决定，不是标定出来的；实测影响见下面的注记。
+
+    .. note::
+
+        :func:`~mbt.signals.swings.swings` 与 :func:`~mbt.signals.volume_pattern` 在这里各
+        只算**一次**：``Screen.apply`` 把**同一个**面板对象依次递给每条过滤器与每个因子
+        （``as_of`` 为空时它原样返回），故这两项可以按面板对象记住。这不是精致化——
+        ``volume_pattern`` 全市场约 59 秒而三个分量要用到它 3 次，``swings`` 约 33 秒而要用
+        到 3 次（「位置」「量能」「调整期横盘」）。重算几遍会把每次选股多拖几分钟，而结果
+        逐位相同。
+
+        （这道「量能」门走的是另一个函数 :func:`~mbt.signals.volume_contraction`，它内部
+        自算一遍 :func:`~mbt.signals.volume_structure`，**不复用**上面那份 ``volume_pattern``
+        ——两者口径不同、不可互换，见 ADR-0012。故门那一项的耗时是它自己的，实测全市场约
+        315 秒，比记一次 ``volume_pattern`` 贵得多；这是退回旧口径的代价之一。）
+    """
+    from mbt.data.valuation import PE, PE_PERCENTILE
+    from mbt.signals import (
+        above_yellow,
+        j_below,
+        no_contained_run,
+        pullback_after_advance,
+        swings,
+        volume_contraction,
+        volume_pattern,
+        white_above_yellow,
+    )
+
+    windows = tuple(yellow_windows)
+
+    #: `Screen.apply` 递下来的面板在同一次调用里是**同一个对象**（见上面那条注记），故中间量
+    #: 按对象本身记住。缓存按 ``is`` 认而不是按 ``id``：``id`` 会在旧面板被回收后指到新对象上。
+    anchors_cache: dict[str, object] = {}
+    pattern_cache: dict[str, object] = {}
+
+    def anchors_of(panel):
+        if anchors_cache.get("panel") is not panel:
+            anchors_cache["panel"] = panel
+            anchors_cache["value"] = swings(panel["close"], retracement=retracement)
+        return anchors_cache["value"]
+
+    def pattern_of(panel):
+        if pattern_cache.get("panel") is not panel:
+            pattern_cache["panel"] = panel
+            pattern_cache["value"] = volume_pattern(
+                panel, anchors_of(panel), base_bars=volume_base_bars, atr_n=atr_n
+            )
+        return pattern_cache["value"]
+
+    def trend(panel):
+        return white_above_yellow(panel["close"], white_n, windows)
+
+    def not_below_the_line(panel):
+        return above_yellow(panel["close"], windows)
+
+    def position(panel):
+        return pullback_after_advance(
+            panel["close"],
+            retracement=retracement,
+            min_advance=min_advance,
+            min_drop=min_drop,
+            max_drop=max_drop,
+            min_peak_age=min_peak_age,
+            max_peak_age=max_peak_age,
+        )
+
+    def low_j(panel):
+        return j_below(panel, j_max, kdj_n, kdj_m1, kdj_m2)
+
+    def volume(panel):
+        # 门按**旧口径**（A 版）算：`volume_contraction` 的两半同时成立，即放量**且**缩量。
+        # ③ 曾换成新口径的 `surge_vs_base`（并去掉缩量那半条），④ 量出那处连带改动单独值
+        # −7.53 pt 且无独立证据，故退回。理由见函数 docstring 里那条注记。
+        return volume_contraction(
+            panel["volume"],
+            anchors_of(panel),
+            edge_bars=volume_edge_bars,
+            base_bars=volume_base_bars,
+            min_surge=min_surge,
+            max_pullback=max_pullback,
+        )
+
+    def no_flat_pullback(panel):
+        return no_contained_run(panel, anchors_of(panel), days=contained_days)
+
+    def profitable(panel):
+        return _valuation_field(panel, PE) > pe_above
+
+    def cheap(panel):
+        return _valuation_field(panel, PE_PERCENTILE) < percentile_below
+
+    # 三个分量都「越小越好」，而因子契约是「越大越靠前」，故一律**取负**。取负之后
+    # ``normalize="rank"`` 会把负值转成百分位，方向就统一了；不必各自手写换标度。
+    def top_calm(panel):
+        return -pattern_of(panel).top_calm
+
+    def pullback_shrink(panel):
+        return -pattern_of(panel).pullback_vs_advance
+
+    def top_shadow(panel):
+        # 「长上影扣分」是**门槛式**的：只有超过 ``shadow_threshold`` 的那部分才算扣分。
+        # ``np.maximum`` 会把缺失原样留下（不会把 NaN 变成 0）——缺失不是「没有上影」。
+        return -np.maximum(0.0, pattern_of(panel).top_shadow_atr - shadow_threshold)
+
+    return Screen(
+        filters=(
+            trend,
+            not_below_the_line,
+            position,
+            low_j,
+            volume,
+            no_flat_pullback,
+            profitable,
+            cheap,
+        ),
+        factors=(top_calm, pullback_shrink, top_shadow),
+        weights=(1.0, 1.0, 1.0),
+        normalize="rank",
+        top_n=top_n,
+    )
+
+
 def _combine(
     raws: list[pd.DataFrame],
     weights: tuple[float, ...] | None,
