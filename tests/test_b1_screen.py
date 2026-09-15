@@ -414,24 +414,49 @@ def test_the_contained_run_filter_is_wired_and_can_bite(b1_setup):
     assert list(selected_bars(b1_screen(contained_days=1), b1_setup)) == list(PASSING_BARS)
 
 
-def test_the_volume_gate_is_surge_only_and_the_shrinkage_half_is_gone(b1_setup):
-    """「放量」那道门**只看放量**——缩量那半条已从门里移走（ADR-0012 把它降级成分数一项）。
+def test_the_volume_filter_judges_the_pullback_against_the_spike_not_the_top(b1_setup):
+    """门是**旧口径的两半**：``surge_ratio >= 2`` **且** ``pullback_ratio <= max_pullback``，
+    后者比的是「回调段 ÷ 上涨段**单日最大量**」，不是「顶部段均量」。
 
-    构造一段「上涨放量、回调却几乎同样热闹」的量：基准 500、上涨段 900→1100（单日最大
-    1100），故放量 **2.2 倍**；回调段给到 600，于是「回调 ÷ 上涨段单日最大量」= **0.545**，
-    **高过**旧口径的门槛 0.5。按旧口径（``volume_contraction`` 要求两条同时成立）这段行情
-    会被挡掉，按新口径它**应当照常入选**。
+    **这条在 ③ 接线时被删过、由 ④ 的对照退回来**（ADR-0012）：③ 把这道门整条换成了新口径的
+    ``surge_vs_base``、并去掉缩量那半条，于是「回调再热闹也能入选」。④ 的全市场对照把那处
+    连带改动量出来是**单独 −7.53 pt**——量级是分数那一步收益（+3.01 pt）的三倍、方向相反，
+    且它本来就没有独立证据。故退回旧口径，本条随之恢复。
 
-    双向：把 ``min_surge`` 提到 2.5（高过实际的 2.2 倍）之后必须变空，否则这条退化成恒真
-    断言——「没被挡掉」可能只是因为门根本没在判。
+    为什么需要它：夹具原来的上涨段末尾是**平的 6000**，故「顶部段均量」与「上涨段最大量」
+    相等，两个口径给出同一个数——换参照物时全套测试没红。这里把量改成**爆量在中段、顶部反而
+    安静**，两口径才分家：
+
+    - 上涨段 90 根：前 45 根 1000 → 8000，后 45 根 8000 → 1800（故顶部 3 根系均约 1941）
+    - 回调段 11 根：1200
+
+    ====================  ==================  ==========  ==============
+    口径                  算式                结果        门槛 0.5
+    ====================  ==================  ==========  ==============
+    相对上涨段**最大**量   1200 / 8000         0.150       **放行**
+    相对**顶部段均量**     1200 / 1940.9       0.618       不放行
+    ====================  ==================  ==========  ==============
+
+    故默认参数下**仍应入选**（判据看的是前者）。两半各配一条**双向**断言——收紧哪一半都必须
+    变空，否则这一条就退化成「门没在判」而不是「门在放行」。
+
+    **顶部口径为什么不在用**：它实现过、也跑过全市场对照，结果为**更差**——逐笔 8,601 → 3,145、
+    收益率均值 +0.164% → +0.116%、均值/标准误 3.90 → 1.68，而被它排掉的 5,969 笔反而更好
+    （均值 +0.190%、均值/标准误 +3.74）。见 ADR-0011。
     """
     import numpy as np
 
+    from examples.strategies import b1_screen
+    from mbt.data import Panel
+
     close, _ = climb_fall_bounce()
     bars = len(close)
-    volume = np.full(bars, 500.0)
-    volume[40:130] = np.linspace(900.0, 1100.0, 90)  # 上涨段：单日最大 1100
-    volume[130:] = 600.0  # 回调段：600 ÷ 1100 = 0.545 > 0.5
+    volume = np.full(bars, 1000.0)
+    # 上涨段 = [40, 129]（夹具里 up 的 90 根），爆量在中段、到顶部已回落
+    volume[40:130] = np.concatenate(
+        [np.linspace(1000.0, 8000.0, 45), np.linspace(8000.0, 1800.0, 45)]
+    )
+    volume[130:] = 1200.0  # 回调与反弹
 
     fields = dict(b1_setup.fields)
     fields["volume"] = pd.DataFrame({"sh600000": volume}, index=b1_setup["close"].index)
@@ -439,8 +464,24 @@ def test_the_volume_gate_is_surge_only_and_the_shrinkage_half_is_gone(b1_setup):
 
     kept = selected_bars(b1_screen(), flat)
     assert list(kept) == list(PASSING_BARS), (
-        f"缩量不再当门，回调那半条不该挡人；落点应为 {PASSING_BARS}，实际 {kept}"
+        f"相对上涨最大量是 0.15 <= 0.5、放量 8.0 >= 2.0，两半都过，落点应为 {PASSING_BARS}，"
+        f"实际 {kept}——若为空说明判据改看顶部段了"
     )
     assert (
-        selected_bars(b1_screen(min_surge=2.5), flat) == []
-    ), "放量倍数 2.2 < 2.5，该被挡住——否则上一条不是「门在放行」而是「门没在判」"
+        selected_bars(b1_screen(max_pullback=0.10), flat) == []
+    ), "把缩量那半收到 0.10 应当挡住 0.15——否则缩量那半不在门里（③ 删过它）"
+    assert (
+        selected_bars(b1_screen(min_surge=9.0), flat) == []
+    ), "把放量那半收到 9.0 应当挡住 8.0——否则门根本没在判"
+
+
+def test_the_volume_gate_still_accepts_both_knobs():
+    """门的两个旋钮都还在签名里：``volume_edge_bars`` 与 ``max_pullback``。
+
+    ③ 接线时这两个参数被删掉过（门换成只看放量的新口径），④ 的对照把那处连带改动量出来是
+    单独 −7.53 pt，故退回旧口径、两个旋钮一并回来。这条盯着它们别再被删掉——**留着没人读的
+    参数**固然不好（``min_reward_risk`` 的处置），但**门自己读**它们，删掉就等于把门换了。
+    """
+    params = inspect.signature(b1_screen).parameters
+    assert "volume_edge_bars" in params, "门的「上涨段取几根」旋钮被删了——门被换过"
+    assert "max_pullback" in params, "缩量那半的旋钮被删了——门被换成只看放量的新口径了"

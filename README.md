@@ -42,24 +42,31 @@
     `kdj`（通达信递推均值口径，返回 `K/D/J` 三线）、`white_line` / `yellow_line`
     （行情软件图上那对快慢线，见 `CONTEXT.md`）、`swings`（**已确认**的摆动点：
     最近一段已完成上涨的起涨点与峰值，顺序扫描，只报确认过的拐点）、
-    `volume_structure`（按摆动点切段后的量能结构：放量倍数 / 顶部比值 / 缩量倍数）
+    `volume_structure`（按摆动点切段后的量能结构：放量倍数 / 顶部比值 / 缩量倍数）、
+    `volume_pattern`（**新口径**的量能形态读数：放量 / 顶部无量 / 调整缩量 / 顶部那根的上影
+    ÷ATR / 顶部落在收盘峰值之后几根。它与 `volume_structure` **不是同义词**，字段名刻意不同
+    ——ADR-0012）
   - 过滤信号：`new_high`、`volume_surge`、`ma_cross_up`、`rising_streak`、`above_ma`、
     `white_above_yellow`、`above_yellow`（收盘在黄线上方——与前者不同：前者比两条线，
     后者比价格与线）、`high_above_white`（**最高价**高于白线——「盘中摸到过」，
     与 `above_white` 用收盘价不同）、`below_yellow_streak`、`above_white` / `below_white`
     （白线两侧）、`j_below`、`pullback_after_advance`（「一波上涨之后的下跌阶段」）、
-    `volume_contraction`（上涨放量 + 回调缩量。缩量那条的分母是上涨段的**单日最大量**——它只答
+    `volume_contraction`（上涨放量 + 回调缩量——**B1 的门就是它**。缩量那条的分母是上涨段的
+    **单日最大量**——它只答
     「相对那根爆量，回调萎缩了吗」，**不答**「回调比上涨安静」（实测 1,109 笔成交里 53% 并不缩量，
     ADR-0010）。**试过**改用「相对顶部段」的口径：它更贴原始提示的「而」字、九个标注样本 9/9 成立，
     但全市场对照**更差**（逐笔 8,601 → 3,145、均值/标准误 3.90 → 1.68，被它排掉的 5,969 笔反而更好），
-    故未采用，见 [ADR-0011](docs/adr/0011-pullback-reference-stays-the-spike.md)）、
+    故未采用，见 [ADR-0011](docs/adr/0011-pullback-reference-stays-the-spike.md)。2026-09-15 曾
+    把这道门换成只看放量的新口径，[ADR-0012](docs/adr/0012-volume-readings-become-a-pattern-score.md)
+    的 ④/⑤ 量出那处连带改动单独值 −7.53 pt，已退回本条）、
     `no_contained_run`（**调整期**内**没有**
     连续 `days` 根「**内含**」——当天的**收盘价**落在**前一根**的 `[最低价, 最高价]` 之内，
     即当日既没上破也没下破前一根的区间。连续多根内含意味着价格在原地震荡，那种「回调」
     其实是横盘。门槛默认 10 根；真实行情里约 5% 的回调格会撞上这条线（收到 8 根是约 9%，
     但实测那一步多排掉的 106 笔本身是赚的、与总体无从区分，故没有筛出坏样本）。
   - 排序因子：`momentum`、`distance_to_high`、`yellow_proximity`（黄线贴近度）、
-    `j_oversold`（J 值的超卖程度，即 `−J`——**B1 策略用的就是它**）、
+    `j_oversold`（J 值的超卖程度，即 `−J`。它**曾**是 B1 的排序因子，2026-09-15 起被**形态
+    分数**取代——那三项写在策略层的 `b1_screen` 里，故不在本清单；ADR-0012）、
     `reward_risk_ratio`（**交易盈亏比**：`(白线 − 收盘) ÷ (收盘 − 黄线)`，赚头看白线、
     亏头看黄线。它与回测指标里的盈亏比 `payoff_ratio` 不是同一个量：那个是**已实现**交易的
     「平均盈利 ÷ 平均亏损」，这个是**建仓前**的预估。B1 曾用它当第七条过滤器，现已移除——

@@ -588,8 +588,10 @@ def b1_screen(
     max_drop=0.35,
     min_peak_age=5,
     max_peak_age=50,
+    volume_edge_bars=3,
     volume_base_bars=10,
     min_surge=2.0,
+    max_pullback=0.5,
     atr_n=14,
     shadow_threshold=1.0,
     contained_days=10,
@@ -597,7 +599,7 @@ def b1_screen(
     percentile_below=0.20,
     top_n=None,
 ) -> Screen:
-    """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + **放量** + 调整期形态 + 估值，
+    """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + 调整期形态 + 估值，
     **按形态分数**排序（ADR-0012）。
 
     它是 ``Screen``，故同一条件既能用于 ``mbt screen`` 选股，也能作为回测的入场闸门——
@@ -610,7 +612,7 @@ def b1_screen(
     价格在慢线上        收盘 > 黄线
     位置                「一波上涨之后的下跌阶段」
     J 值                ``J < j_max``（默认 8）
-    放量                ``max(上涨段) ÷ mean(起涨前基准) >= min_surge``
+    量能                上涨放量 + 回调缩量（缩量那条的分母是上涨段**单日最大量**，见 ADR-0011）
     调整期不含横盘串     调整期内**没有**连续 ``contained_days`` 根「内含」
     PE 为正             ``PE > pe_above``（默认 0，剔除亏损）
     PE 百分位低         ``PE 百分位 < percentile_below``（默认 0.20）
@@ -628,14 +630,21 @@ def b1_screen(
 
     .. note::
 
-        **「放量」当门、其余三条当分**（ADR-0012）。三句量能条件原先都是门，② 的读数把它
-        分开了：`顶部无量` 在真实持有期尺度上的区分力是法定费用的 3.6 倍（h=3 价差
-        +0.3137%、t=3.03，三个尺度同号），而 `放量` 在同一尺度上正好是零（+0.0091%、
-        t=0.09）。但按 ADR-0012 的元规则，「不赚钱」只能把它从判据**降级**、不能据此删掉
-        原话里的某条，且放量是唯一还站着的门候选——故它留作门。
+        **门仍走旧口径的「量能」，只把另三条降级成分**（ADR-0012）。那三句量能条件原先都是
+        门，② 的读数把它们分开了：`顶部无量` 在真实持有期尺度上的区分力是法定费用的 3.6 倍
+        （h=3 价差 +0.3137%、t=3.03，三个尺度同号），而 `放量` 在同一尺度上正好是零
+        （+0.0091%、t=0.09）。但按 ADR-0012 的元规则，「不赚钱」只能把它从判据**降级**、
+        不能据此删掉原话里的某条，故这道门本轮不动。
 
-        **门仍用「放量」而不是「顶部无量」**，这是一个有意保留的、与读数相抵的选择：
-        ① 与 ② 两条独立量法都指向「放量不挣自己的饭钱」。要改门得先拿留出期复现的数字。
+        **这道门按旧口径算**（:func:`~mbt.signals.volume_contraction` 的两半，即放量**且**
+        缩量），也就是 ① 那三版对照里的 A 版。③ 接线时曾把它一并换成新口径的
+        ``surge_vs_base``、并去掉缩量那半条，④ 的全市场对照把那处连带改动量出来是
+        **单独 −7.53 pt**——量级是分数那一步收益（+3.01 pt）的三倍，方向相反；而它本来就
+        没有独立证据（② 说的是「放量的区分力是零」，不是「门的窗口该加宽」）。故退回旧口径。
+        这样本规则与 A 的差别**只剩排序因子一处**，④ 的对照才可归因。
+
+        **门为什么仍用「放量」而不是「顶部无量」**：① 与 ② 两条独立量法都指向「放量不挣
+        自己的饭钱」，而改门得先拿留出期复现的数字。这是一个有意保留的、与读数相抵的选择。
 
     .. note::
 
@@ -662,9 +671,8 @@ def b1_screen(
         **「内含」与「横盘串」的定义见** :func:`~mbt.signals.filters.no_contained_run`：
         当天的**收盘价**落在**前一根**的 ``[最低价, 最高价]`` 之内。连续 ``contained_days``
         根及以上这样的 K 线意味着价格在原地震荡——既创不出新高、也砸不出新低，那说明这段
-        「回调」其实是横盘而不是回调。取 ``[峰值+1, 当根]`` 为范围——与「位置」同段，但与
-        「放量」**不同段**：后者按 ADR-0012 把上涨段的右端延到「最高价那根」，故它的段边界
-        比「位置」更宽（``max(收盘口径峰值, 顶部那根)``）。
+        「回调」其实是横盘而不是回调。取 ``[峰值+1, 当根]`` 为范围（与「位置」「量能」同
+        一处边界）。
 
     .. note::
 
@@ -716,9 +724,14 @@ def b1_screen(
         :func:`~mbt.signals.swings.swings` 与 :func:`~mbt.signals.volume_pattern` 在这里各
         只算**一次**：``Screen.apply`` 把**同一个**面板对象依次递给每条过滤器与每个因子
         （``as_of`` 为空时它原样返回），故这两项可以按面板对象记住。这不是精致化——
-        ``volume_pattern`` 全市场约 59 秒而门的三个分量加门本身要用到它 4 次，
-        ``swings`` 约 33 秒而要用到 2 次（「位置」与「调整期横盘」）。
-        重算 4 遍会把每次选股多拖三分钟，而结果逐位相同。
+        ``volume_pattern`` 全市场约 59 秒而三个分量要用到它 3 次，``swings`` 约 33 秒而要用
+        到 3 次（「位置」「量能」「调整期横盘」）。重算几遍会把每次选股多拖几分钟，而结果
+        逐位相同。
+
+        （这道「量能」门走的是另一个函数 :func:`~mbt.signals.volume_contraction`，它内部
+        自算一遍 :func:`~mbt.signals.volume_structure`，**不复用**上面那份 ``volume_pattern``
+        ——两者口径不同、不可互换，见 ADR-0012。故门那一项的耗时是它自己的，实测全市场约
+        315 秒，比记一次 ``volume_pattern`` 贵得多；这是退回旧口径的代价之一。）
     """
     from mbt.data.valuation import PE, PE_PERCENTILE
     from mbt.signals import (
@@ -727,6 +740,7 @@ def b1_screen(
         no_contained_run,
         pullback_after_advance,
         swings,
+        volume_contraction,
         volume_pattern,
         white_above_yellow,
     )
@@ -773,9 +787,17 @@ def b1_screen(
         return j_below(panel, j_max, kdj_n, kdj_m1, kdj_m2)
 
     def volume(panel):
-        # 「放量」是**唯一留下的门**（ADR-0012）。口径按新读数取：上涨段的右端延到「最高价
-        # 那根」，故这道门比旧口径**更松**——ADR-0012 已记下这处连带变化会让逐笔记录变动。
-        return pattern_of(panel).surge_vs_base >= min_surge
+        # 门按**旧口径**（A 版）算：`volume_contraction` 的两半同时成立，即放量**且**缩量。
+        # ③ 曾换成新口径的 `surge_vs_base`（并去掉缩量那半条），④ 量出那处连带改动单独值
+        # −7.53 pt 且无独立证据，故退回。理由见函数 docstring 里那条注记。
+        return volume_contraction(
+            panel["volume"],
+            anchors_of(panel),
+            edge_bars=volume_edge_bars,
+            base_bars=volume_base_bars,
+            min_surge=min_surge,
+            max_pullback=max_pullback,
+        )
 
     def no_flat_pullback(panel):
         return no_contained_run(panel, anchors_of(panel), days=contained_days)
