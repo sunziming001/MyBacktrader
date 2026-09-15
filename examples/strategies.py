@@ -230,7 +230,7 @@ class B1(bt.Strategy, EngineClock):
     **持有与卖出**——三条卖出规则全都依赖「已经持有」与「建仓时的价格」，是**路径依赖**的，
     而选股规则按定义不管持仓。
 
-    三条卖出规则（任一满足即动作）:
+    四条卖出规则（任一满足即动作；第四条默认关着）:
 
     ==========  ==========================================  ================
     规则        判据                                        动作
@@ -240,13 +240,35 @@ class B1(bt.Strategy, EngineClock):
     最高价破白线 ``high_above_white``：当日最高价 > 白线       清仓
     两日未站上   建仓后第 ``confirm_white_days`` 根收盘仍在    清仓
                 白线**下方**
+    持有封顶     建仓后第 ``max_hold_bars`` 个可交易日       清仓
+                （``None`` 时这条不存在，不看任何信号）
     ==========  ==========================================  ================
 
-    **成交时点**：订单在本根收盘下定、在**下一根开盘**成交，且 T+1 使当日买入不可当日卖出。
-    故上面三条的判据都读**当根**的收盘价／最高价，而成交价是**下一根的开盘价**。规则若被读成
-    「以当日收盘价卖出」，那是本引擎做不到的一项——本项目的撮合一律在次根开盘，没有「按当根
-    收盘成交」的口径（`mbt.backtest.costs` 的 `_execute` 只接受引擎给的成交价，而引擎按
-    `coc=False` 运行）。这处偏差的方向不定，故不假装它不存在。
+    **成交时点**：订单在本根收盘下定、在**下一根**成交，且 T+1 使当日买入不可当日卖出。
+    故上面三条的判据都读**当根**的收盘价／最高价。至于成交价取下一根的**哪个价**，由
+    ``exit_exec`` 定：
+
+    ==============  ==========================================================
+    ``exit_exec``   成交价
+    ==============  ==========================================================
+    ``"open"``（默认） 次根**开盘价**（``bt.Order.Market``，引擎的默认路径）
+    ``"close"``      次根**收盘价**（``bt.Order.Close``）
+    ==============  ==========================================================
+
+    ``"close"`` 这一档是 ADR-0012 ⑥ 的第三刀要求加的：把同一批入场的出口从「次根开盘」挪到
+    「次根收盘」，**卖日不动、只改成交时段**，实测值 +0.0416 pt/笔。它**不含任何未来信息**——
+    卖日是用前一根的收盘数据决定的，持到那个卖日的收盘才走，用的仍是已经不用的那根的数据。
+    但要记住它确实动了引擎的一条老口径（本类原来写着「本项目的撮合一律在次根开盘，没有按当根
+    收盘成交的口径」）：那一句现在只在 ``"open"`` 下成立，且**只对卖出放开**（买入侧仍一律次根
+    开盘，因为「收盘看到信号、次日开盘买入」是策略侧的真实时序，不该跟着一起变）。
+
+    **``max_hold_bars`` 是第四条卖出规则**（默认为 ``None``，即关着）：持有到建仓后第 N 个
+    **可交易日**就清仓，不看任何信号。落地方式与另三条一致——本根下单、次根成交，故它在
+    「本根是我第 ``N − 1`` 个可交易日」时下单，成交落在建仓后第 N 个交易日（开盘或收盘由
+    ``exit_exec`` 定）。``None`` 时这条规则整个不参与，行为与关掉它之前逐笔相同。
+
+    根数只在**当日可交易**时递增（与 ``confirm_white_days`` 同一套计数），故停牌不会让它提前
+    或推后：停牌期间这根不进账，复牌后才继续往上数。
 
     **买入侧的掩码按「下单那一根」判**（`AStockBroker._mask_says(at_creation=True)`），
     故「T 入选、T+1 已不入选」的订单**照样成交**。这一点在 B1 上不是细节：J 阈值收紧到 8 之后
@@ -268,6 +290,10 @@ class B1(bt.Strategy, EngineClock):
         stop_buffer: 前低止损的缓冲比例（跌破前低 × (1 − 它) 才触发）。默认 0.01。
         confirm_white_days: 建仓后第几根仍未站上白线就离场，数的是**交易日**。默认 2，
             即 T+2。根数只在**当日可交易**时才递增，故停牌不会把它提前或推后。
+        exit_exec: 卖单的成交价取次根的哪个价，``"open"``（默认）或 ``"close"``。
+            见上面「成交时点」一节——``"close"`` 是 ADR-0012 ⑥ 加的那一档。
+        max_hold_bars: 持有多久（**可交易日**）就无条件清仓；``None``（默认）表示不加这条规则。
+            填 2 即「成交落在建仓后第 2 个交易日」，与「本根下单、次根成交」一致。
 
     **前低取「峰值之后」的那一段**（调整期的前低），不是「峰值之前」的波段起点。两者
     位置差得很远：实测九个样本上，取波段起点给出的止损距中位 **−36.9%**（最松 −70.5%），
@@ -294,6 +320,8 @@ class B1(bt.Strategy, EngineClock):
         ("stop_days", 2),
         ("stop_buffer", 0.01),
         ("confirm_white_days", 2),
+        ("exit_exec", "open"),
+        ("max_hold_bars", None),
     )
 
     def __init__(self):
@@ -432,11 +460,15 @@ class B1(bt.Strategy, EngineClock):
     # --- 卖出 -----------------------------------------------------------------
 
     def _manage_exit(self, data, name, position, signals, today) -> None:
-        """三条卖出规则，任一满足即清仓。判据都读**当根**，成交落在**下一根开盘**。
+        """四条卖出规则，任一满足即清仓。判据都读**当根**，成交落在**下一根**
+        （取开盘还是收盘见 ``exit_exec``）。
 
         顺序：止损在最前——同一根上若既触发止损又触发离场，两者的动作相同（都是清仓），
         但先判止损能保证「止损优先」这件事在换规则时不被顺手改掉。``position`` 参数保留
         是为了与旧签名一致（曾经用它算「卖一半」的股数）。
+
+        持有封顶放在**最后**：它与另三条的动作完全相同（都是清仓），故顺序不改变任何一笔的
+        成交；放最后只是为了让「它是一条额外的兜底」这件事在代码里也看得出来。
         """
         _ = position
         close = data.close[0]
@@ -445,12 +477,12 @@ class B1(bt.Strategy, EngineClock):
         stop_level = self._stop_price.get(name)
         stop_hit = signal_value(signals, "stop_streak", today, name) > 0.5
         if stop_hit or (stop_level == stop_level and close < stop_level):
-            self.close(data=data)
+            self._close(data)
             return
 
-        # 2) 最高价破白线 → 清仓。建仓当根若已成立，卖单落在下一根开盘，正是「第二日开盘」。
+        # 2) 最高价破白线 → 清仓。建仓当根若已成立，卖单落在下一根，正是「第二日开盘」。
         if signal_value(signals, "high_above_white", today, name) > 0.5:
-            self.close(data=data)
+            self._close(data)
             return
 
         # 3) T+confirm_white_days 收盘仍在白线下方 → 清仓。
@@ -460,7 +492,28 @@ class B1(bt.Strategy, EngineClock):
             and (self.broker.tradability_mask.at[today, name])
         ):
             if signal_value(signals, "below_white", today, name) > 0.5:
-                self.close(data=data)
+                self._close(data)
+                return
+
+        # 4) 持有封顶（默认关着）：本根是第 ``max_hold_bars − 1`` 个可交易日时下单，成交落在
+        #    建仓后第 ``max_hold_bars`` 个可交易日。``>=`` 而不是 ``==``：停牌会让计数在某根上
+        #    直接跳过「恰好等于」的那个值，用 ``==`` 会永久漏掉这笔的封顶。
+        cap = self.p.max_hold_bars
+        if cap is not None and self._held_bars.get(name, 0) >= cap - 1:
+            self._close(data)
+
+    def _close(self, data) -> None:
+        """清仓，成交价按 ``exit_exec`` 取次根的收盘或开盘。
+
+        ``Order.Close`` 在本引擎里落到的正是**次根收盘**：订单在 ``T`` 根下定，撮合在
+        ``T+1`` 根的 ``_try_exec`` 里按 ``data.close[0]``（= ``close[T+1]``）成交。
+        这一点靠 ``tests/test_b1_strategy.py`` 的成交价用例钉住——它是本档唯一的依据，
+        backtrader 的语义一旦变了，这里必须先红。
+        """
+        if self.p.exit_exec == "close":
+            self.close(data=data, exectype=bt.Order.Close)
+        else:
+            self.close(data=data)
 
     def _anchored_prior_low(self, data, signals, today, name) -> float:
         """建仓时锚定「调整期的前低」= 峰值之后到建仓日之间的最低价。
