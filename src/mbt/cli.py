@@ -51,7 +51,7 @@ from mbt.data import (
 )
 from mbt.data.errors import MarketDataError
 from mbt.progress import DEFAULT_INTERVAL, ConsoleProgress
-from mbt.report import DEFAULT_BENCHMARK_SYMBOL, write_run_artifacts
+from mbt.report import DEFAULT_BENCHMARK_SYMBOL, WATCHLIST_NAME, write_run_artifacts
 from mbt.screen import SCREEN_FIELDS, momentum_screen
 from mbt.universe import ALL_BOARDS, UniverseRules, combine_masks
 
@@ -148,10 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument(
         "--screen",
-        choices=("none", "momentum", "undervalued_growth", "valuation"),
+        choices=("none", "momentum", "undervalued_growth", "valuation", "b1"),
         default="none",
-        help="入场闸门：指名库里的一条选股规则（undervalued_growth 需 --cw-root；"
-        "valuation 是它的旧版，留给对照）",
+        help="入场闸门：指名库里的一条选股规则（undervalued_growth 与 b1 需 --cw-root；"
+        "valuation 是前者的旧版，留给对照）",
     )
     backtest.add_argument(
         "--screen-top-n",
@@ -196,12 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     screen.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
     screen.add_argument(
-        "--watchlist-out",
+        "--watchlist-dir",
         default=None,
-        metavar="PATH",
-        help="把候选另写一份**通达信自选股文件**（每行一个 6 位裸代码，从优到劣，"
-        "固定名覆盖）。用 `mbt screen` 落产物之外多要这一份，是为了每天把同一个文件名"
-        "喂给通达信——它按**文件名**认自选股",
+        metavar="DIR",
+        help=f"把候选另写一份**通达信自选股文件**到 DIR 里（固定名 {WATCHLIST_NAME}，"
+        "每行一个 6 位裸代码，从优到劣，直接覆盖）。收**目录**而不是文件名，是因为那个名字"
+        "是固定的——通达信按文件名认自选股。指向 `T0002\\blocknew` 即可被客户端直接读到",
     )
     screen.add_argument(
         "--master",
@@ -615,6 +615,17 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         print("错误：没有任何标的可用，选股无从做起", file=stderr)
         return 1
 
+    # 门与回测共用同一个常数，而选股这边**更硬**：名单残缺时形状毫无异样（候选、排序、
+    # CSV 全都在），而自选股那份产物是**覆盖式**的——它会把前一天的名单连同这次算出的一份
+    # 残缺名单一起盖掉。定时任务没人在看，退出码是这条链上唯一还能说话的环节。
+    if loaded.failure_rate > MAX_FAILURE_RATE:
+        print(
+            f"错误：跳过率 {loaded.failure_rate:.0%} 超过阈值 {MAX_FAILURE_RATE:.0%}，"
+            "名单不足以采信",
+            file=stderr,
+        )
+        return 1
+
     from mbt.data import assemble_panel
     from mbt.universe import build_universe
 
@@ -624,6 +635,10 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             as_of = _resolve_as_of(panel, stdout, stderr)
             if as_of is None:
                 return 1
+        else:
+            # 显式给了日期也印一行：日志里总得有一处写明「这次按哪天评估」——候选清单上
+            # 只有代码，没有日期，从产物反推不回来（定时任务留下的日志尤其如此）。
+            print(f"评估日：{as_of:%Y-%m-%d}（由 --as-of 指定）", file=stdout)
         listing_dates = None
         if args.master:
             every = load_listing_dates(args.master, symbols=[m.symbol for m in loaded.markets])
@@ -691,9 +706,9 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         return 1
     _report_candidates(candidates, as_of, run_dir, stdout)
 
-    if args.watchlist_out:
+    if args.watchlist_dir:
         try:
-            _write_watchlist(candidates, args.watchlist_out, stdout, stderr)
+            _write_watchlist(candidates, args.watchlist_dir, stdout, stderr)
         except Exception as exc:  # noqa: BLE001
             # 同上：落盘失败以退出码收场。**不回滚** run 目录——那份产物本身是完好的。
             print(f"错误：写自选股文件失败——{type(exc).__name__}: {exc}", file=stderr)
@@ -701,16 +716,18 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     return 0
 
 
-def _write_watchlist(candidates, path, stdout, stderr) -> None:
-    """落一份通达信自选股文件，并在**空清单**时把后果嚷出来。
+def _write_watchlist(candidates, directory, stdout, stderr) -> None:
+    """落一份通达信自选股文件到 ``directory`` 里，并在**空清单**时把后果嚷出来。
 
     空清单照样覆盖（理由见 :func:`mbt.report.write_watchlist`），而代价是通达信那边的自选股
     会被清空——这是唯一一处「每天跑一次」会**破坏既有状态**的地方，故它必须在日志里显眼。
-    定时任务跑的时候没人在看，所以这句话也进 stderr，好让 `>` 重定向之外的读者也能撞上它。
+    定时任务跑的时候没人在看，所以这句话也进 stderr，好让日志的读者不会漏掉它。
     """
-    from mbt.report import write_watchlist
+    from pathlib import Path
 
-    target = write_watchlist(candidates, path)
+    from mbt.report import WATCHLIST_NAME, write_watchlist
+
+    target = write_watchlist(candidates, Path(directory) / WATCHLIST_NAME)
     print(f"\n自选股：{target}（{len(candidates)} 个，从优到劣）", file=stdout)
     if not candidates:
         print(

@@ -133,6 +133,12 @@ def describe_screen(screen, label: str | None = None) -> dict | None:
     }
 
 
+#: 每日选股产出的自选股文件名。**固定**——通达信按文件名认自选股，名字一变，每天导入的
+#: 就成了另一个板块。它是产物契约的一部分（仓库根目录的 `b1_daily.bat` 与测试都指向它），
+#: 故写在这里当唯一出处，而不是散在命令行字符串里。
+WATCHLIST_NAME = "每日选股.EBK"
+
+
 def write_watchlist(candidates, path):
     """把候选写成**通达信自选股文件**（``.EBK``）：每行一个 6 位裸代码，**顺序即优劣**。
 
@@ -141,6 +147,9 @@ def write_watchlist(candidates, path):
         path: 落盘路径。父目录不在会被建出来——定时任务跑的那一刻没人能在旁边先 mkdir。
 
     返回落盘后的 :class:`~pathlib.Path`，便于调用方把它印进日志。
+
+    固定的文件名见 :data:`WATCHLIST_NAME`；本函数收**路径**而不是目录，为的是让「固定名」
+    这件事只住在 :data:`WATCHLIST_NAME` 一处，由调用方拼装，而不是在这里再写一遍。
 
     **与 run 目录那套约定刻意相反。** ``write_run_artifacts`` 用时间戳目录且**拒绝覆盖**
     （一次运行是一份不可变的证据）；而这一份是**固定名、每天覆盖**的——通达信按**文件名**

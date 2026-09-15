@@ -122,7 +122,7 @@ def screen_args(**overrides):
         non_loss=False,
         master=None,
         output_dir=None,
-        watchlist_out=None,
+        watchlist_dir=None,
         limit=None,
         symbols_file=None,
     )
@@ -825,6 +825,20 @@ def test_the_screen_command_says_which_rule_it_used(tmp_path):
     assert "近似口径" in out.getvalue()
 
 
+def test_an_explicit_as_of_is_still_named_in_the_log(tmp_path):
+    """显式给了 ``--as-of`` 也要印出评估日——日志该自证「这次按哪天算的」。
+
+    缺省那条路径自己会印（连同被跳过的残缺日）。这条钉的是另一条：给了日期时别把
+    「按哪天评估」弄丢——候选清单上只有代码，没有日期，从日志反推不出来。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = screen_args(tdx_root=str(root), gbbq=str(gbbq), output_dir=str(tmp_path / "screens"))
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "评估日：2024-03-01" in out.getvalue()
+
+
 def test_a_malformed_as_of_is_reported(tmp_path):
     root, gbbq = make_dataroot(tmp_path)
     args = screen_args(
@@ -1082,6 +1096,51 @@ def test_the_b1_screen_needs_a_cw_root_because_two_of_its_filters_read_financial
     assert "cw-root" in err.getvalue()
 
 
+def test_backtest_can_also_use_the_b1_gate(tmp_path):
+    """``backtest`` 的 ``--screen`` 也要收 ``b1``——否则搬进库的 ``b1_signals`` 没有调用者。
+
+    两条命令共用同一个 :func:`_screen_and_signals`，里面那条 b1 分支本来就写得能从两边用
+    （它用 ``getattr`` 兜 ``start`` / ``end``）。可只要回测侧的 ``choices`` 不收 ``b1``，
+    那条分支在回测侧就**永远够不着**，而 ADR-0012 那批全市场结论正是用 b1 入口跑出来的——
+    「搬进库」若只搬到一个够不着的角落，等于没搬。
+
+    这里钉的不是参数层收不收，而是**它真的走到了 b1 分支**：缺 ``--cw-root`` 时给出的
+    是 b1 自己那句错，而不是 ``choices`` 甩回来的「invalid choice」。
+    """
+    parser = build_parser()
+    parsed = parser.parse_args(
+        [
+            "backtest",
+            "--strategy",
+            "m:S",
+            "--tdx-root",
+            "x",
+            "--gbbq",
+            "y",
+            "--cw-root",
+            "w",
+            "--output-dir",
+            "z",
+            "--screen",
+            "b1",
+        ]
+    )
+    assert parsed.screen == "b1", "回测侧的 choices 不收 b1，这条分支就永远够不着"
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = make_args(
+        screen="b1",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+        cw_root=None,
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 1
+    assert "cw-root" in err.getvalue()
+
+
 def test_omitting_as_of_takes_the_latest_day_in_the_data_and_says_which(tmp_path):
     """定时任务喂不了日期参数，故缺省要能自己定出评估日，并把它印出来。
 
@@ -1127,15 +1186,59 @@ def test_a_stub_tail_is_skipped_and_the_skipped_days_are_named_in_the_log():
     assert "只有 5 只" in out.getvalue()
 
 
-def test_the_watchlist_export_writes_bare_codes_in_rank_order(tmp_path):
-    """自选股文件的内容 = 候选清单的**裸代码**，顺序一致（从优到劣）。"""
-    root, gbbq = make_dataroot(tmp_path, periods=60)
-    target = tmp_path / "每日选股.EBK"
+def test_a_screen_whose_load_collapsed_fails_instead_of_writing_a_watchlist(tmp_path):
+    """跳过率过高时选股必须以 ``1`` 收场——它**还会覆盖自选股**，这条尤其要紧。
+
+    门与回测那道共用同一个常数（:data:`MAX_FAILURE_RATE`）。为什么选股也非要这道门：一张从
+    四分之一市场上算出来的名单，与从满市场算出来的**长得一模一样**——候选、排序、CSV 的
+    形状都不变，故它只能靠退出码说话。而定时任务没人在看，退出码是唯一能拦住「拿残缺名单
+    覆盖通达信自选股」的东西（自选股那份是**破坏性**的，每天都盖掉前一天）。
+    """
+    from mbt.report import WATCHLIST_NAME
+
+    root, gbbq = make_dataroot(tmp_path, symbol="sh600000")
+    index = pd.bdate_range("2024-01-02", periods=80)
+    for symbol in ("sh600001", "sh600002", "sh600003"):
+        # 一天跳 +400%，越出任何板块的涨跌幅——真实数据里「数据不可信」那批就是这个形状。
+        prices = [1000] * 40 + [5000] * 40
+        write_day(
+            root / symbol[:2] / "lday" / f"{symbol}.day",
+            [
+                (int(f"{stamp:%Y%m%d}"), price, price, price, price, 0.0, 1000)
+                for stamp, price in zip(index, prices, strict=True)
+            ],
+        )
+    watchlist_dir = tmp_path / "自选股"
     args = screen_args(
         tdx_root=str(root),
         gbbq=str(gbbq),
         output_dir=str(tmp_path / "screens"),
-        watchlist_out=str(target),
+        watchlist_dir=str(watchlist_dir),
+    )
+    out, err = capture()
+
+    code = run_screen_command(args, stdout=out, stderr=err)
+
+    assert code == 1, f"四只里三只读不出来，不该以 0 收场：{out.getvalue()}"
+    assert "跳过率" in err.getvalue()
+    assert not (watchlist_dir / WATCHLIST_NAME).exists(), "残缺名单不该覆盖自选股"
+
+
+def test_the_watchlist_export_writes_bare_codes_in_rank_order(tmp_path):
+    """自选股文件的内容 = 候选清单的**裸代码**，顺序一致（从优到劣）。
+
+    文件名来自 ``mbt.report.WATCHLIST_NAME``——它是产物契约的一部分，故这里也走那个常量，
+    免得改个名字这条测试还绿着。
+    """
+    from mbt.report import WATCHLIST_NAME
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    watchlist_dir = tmp_path / "自选股"
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        watchlist_dir=str(watchlist_dir),
     )
     out, err = capture()
 
@@ -1143,17 +1246,19 @@ def test_the_watchlist_export_writes_bare_codes_in_rank_order(tmp_path):
 
     run_dir = next((tmp_path / "screens").iterdir())
     ranked = pd.read_csv(run_dir / "candidates.csv")["symbol"].tolist()
+    target = watchlist_dir / WATCHLIST_NAME
     assert target.read_text(encoding="utf-8").splitlines() == [name[2:] for name in ranked]
     assert str(target) in out.getvalue()
 
 
 def test_an_empty_watchlist_is_written_but_the_loss_is_announced(tmp_path):
     """没有候选时文件照写，但**必须嚷**——导入一份空自选股会把通达信那边的清空。"""
-    target = tmp_path / "每日选股.EBK"
+    from mbt.report import WATCHLIST_NAME
+
     out, err = capture()
 
-    _write_watchlist([], target, out, err)
+    _write_watchlist([], tmp_path, out, err)
 
-    assert target.read_text(encoding="utf-8") == ""
+    assert (tmp_path / WATCHLIST_NAME).read_text(encoding="utf-8") == ""
     assert "没有候选" in err.getvalue()
     assert "清空" in err.getvalue()
