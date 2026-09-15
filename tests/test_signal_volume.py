@@ -551,9 +551,7 @@ def test_the_pattern_readings_match_the_hand_computed_ratios(symbol_frame, panel
     assert got.surge_vs_base[symbol].iloc[9] == pytest.approx(4.0)
     assert got.top_calm[symbol].iloc[9] == pytest.approx(100.0 / 60.0)
     assert got.pullback_vs_advance[symbol].iloc[9] == pytest.approx(0.4)
-    assert got.top_shadow_atr[symbol].iloc[9] == pytest.approx(
-        2.0 / atr(built, 3)[symbol].iloc[5]
-    )
+    assert got.top_shadow_atr[symbol].iloc[9] == pytest.approx(2.0 / atr(built, 3)[symbol].iloc[5])
 
 
 def test_the_top_bar_is_the_highest_high_not_the_close_peak(symbol_frame, panel):
@@ -702,9 +700,7 @@ def ohlcv_of(prices, volumes):
         pad = [0.3 + 0.6 * math.sin(i / 2.0) ** 2 for i in range(len(close))]
         fields["open"][symbol] = open_
         fields["close"][symbol] = close
-        fields["high"][symbol] = [
-            max(o, c) + p for o, c, p in zip(open_, close, pad, strict=True)
-        ]
+        fields["high"][symbol] = [max(o, c) + p for o, c, p in zip(open_, close, pad, strict=True)]
         fields["low"][symbol] = [
             min(o, c) - p / 2.0 for o, c, p in zip(open_, close, pad, strict=True)
         ]
@@ -799,8 +795,12 @@ def test_the_pattern_readings_match_a_brute_force_pass_over_every_cell(symbol_fr
     for name in want:
         mine = getattr(got, name)
         pd.testing.assert_frame_equal(
-            mine, pd.DataFrame(want[name], index=mine.index, columns=mine.columns),
-            check_exact=False, rtol=1e-12, atol=1e-12, check_names=False,
+            mine,
+            pd.DataFrame(want[name], index=mine.index, columns=mine.columns),
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+            check_names=False,
         )
         filled += int(mine.notna().to_numpy().sum())
 
@@ -816,9 +816,7 @@ def test_the_pattern_readings_never_depend_on_bars_after_the_evaluation_day(symb
     """
     prices, volumes = wavy_panel(symbol_frame, symbols=3, bars=90)
     built = panel(ohlcv_of(prices, volumes))
-    full = volume_pattern(
-        built, swings_of(prices, retracement=0.05), base_bars=5, atr_n=3
-    )
+    full = volume_pattern(built, swings_of(prices, retracement=0.05), base_bars=5, atr_n=3)
 
     checked = 0
     for k in range(1, len(prices) + 1):
@@ -832,4 +830,3 @@ def test_the_pattern_readings_never_depend_on_bars_after_the_evaluation_day(symb
             checked += int(want.notna().to_numpy().sum())
 
     assert checked > 100, f"判据几乎空转：只比对了 {checked} 个有值的格子"
-

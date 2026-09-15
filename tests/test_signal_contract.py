@@ -183,6 +183,7 @@ PANEL_VALUES = {
     },
 }
 
+
 def test_every_public_signal_is_covered_here():
     """公开了什么就要检查什么——否则新增信号会悄悄绕过契约测试。"""
     covered = {name for name, _ in SYMBOL_FRAME_SIGNALS + PANEL_SIGNALS}

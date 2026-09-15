@@ -249,9 +249,7 @@ class Screen:
                 if progress is not None:
                     suffix = "" if len(parts) == 1 else f" {position}/{len(parts)}"
                     progress.stage(f"排序因子{suffix}：{_part_name(one_factor)}")
-                out = _validate(
-                    one_factor(working), index, columns, f"第 {position} 个排序因子"
-                )
+                out = _validate(one_factor(working), index, columns, f"第 {position} 个排序因子")
                 if out.dtypes.map(lambda dtype: dtype.kind != "f").any():
                     raise ValueError(
                         "排序因子返回的不是浮点数——因子要能横向比较大小，布尔答不了"
@@ -288,9 +286,7 @@ class Screen:
 
         if not parts:
             if self.weights or self.normalize:
-                raise ValueError(
-                    "给了 weights / normalize 却没有给因子：没有可加权的对象。"
-                )
+                raise ValueError("给了 weights / normalize 却没有给因子：没有可加权的对象。")
             return ()
 
         if self.weights is None:
