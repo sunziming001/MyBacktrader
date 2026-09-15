@@ -19,13 +19,17 @@ import pytest
 from conftest import GBBQ_FIXTURE
 
 from mbt.cli import (
+    ALL_CANDIDATES,
     DEFAULT_START,
     MAX_FAILURE_RATE,
+    _resolve_as_of,
+    _write_watchlist,
     build_parser,
     parse_params,
     run_backtest_command,
     run_screen_command,
 )
+from mbt.data import Panel
 
 EXAMPLE_STRATEGY = "examples.strategies:BuyAndHold"
 
@@ -118,6 +122,7 @@ def screen_args(**overrides):
         non_loss=False,
         master=None,
         output_dir=None,
+        watchlist_out=None,
         limit=None,
         symbols_file=None,
     )
@@ -1004,3 +1009,151 @@ def test_the_report_counts_the_skips_from_loading_not_just_from_slicing(tmp_path
     assert isinstance(sliced, UniverseLoad)
     assert [item.symbol for item in sliced.skipped] == ["sh000001"], "上游的跳过被丢掉了"
     assert len(sliced.markets) == 1
+
+
+# --- 每日选股：评估日、全池、自选股文件 ----------------------------------------
+#
+# 这一段钉的是「一个 .bat 每天盘后跑一次」所需的那些接口：喂不了日期参数、要全池而不是
+# 前 10、产物是一个**固定名**的自选股文件。
+
+
+def test_the_parser_takes_all_as_a_top_n_meaning_no_truncation():
+    parser = build_parser()
+
+    given = parser.parse_args(
+        ["screen", "--tdx-root", "x", "--gbbq", "y", "--output-dir", "z", "--top-n", "all"]
+    )
+    omitted = parser.parse_args(["screen", "--tdx-root", "x", "--gbbq", "y", "--output-dir", "z"])
+
+    assert given.top_n == ALL_CANDIDATES
+    assert omitted.top_n == 10, "不给仍是原来的默认——这一条改的是新取值，不是默认值"
+
+
+def test_a_top_n_that_is_neither_a_count_nor_all_names_what_it_wanted():
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["screen", "--tdx-root", "x", "--gbbq", "y", "--output-dir", "z", "--top-n", "abc"]
+        )
+
+
+def test_all_reaches_the_rule_as_no_truncation_rather_than_falling_back():
+    """``--top-n all`` 必须到得了规则那一层，不能被「取第一个给了的」的回退链吞掉。
+
+    回退链的原样是 ``or``，而 ``all`` 映射成 ``None`` 之后在 ``or`` 里等于「没给」——
+    于是「不截断」会静默变成「取 5」。这条是冲着那个静默去的。
+    """
+    from mbt.cli import _screen_and_signals
+
+    out = io.StringIO()
+    args = screen_args(screen="momentum", top_n=ALL_CANDIDATES)
+
+    screen, _ = _screen_and_signals(args, None, None, out)
+
+    assert screen.top_n is None, "「不截断」没到规则那一层"
+
+
+def test_a_top_n_of_ten_still_reaches_the_rule_as_ten():
+    """对照面：数字照旧传下去——否则上一条可以通过「一律不截断」而假绿。"""
+    from mbt.cli import _screen_and_signals
+
+    out = io.StringIO()
+    args = screen_args(screen="momentum", top_n=10)
+
+    screen, _ = _screen_and_signals(args, None, None, out)
+
+    assert screen.top_n == 10
+
+
+def test_the_b1_screen_needs_a_cw_root_because_two_of_its_filters_read_financials(tmp_path):
+    """B1 的最后两条过滤（PE 为正、PE 百分位低）不在行情里，故缺 --cw-root 要报错而不是少两条。"""
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = screen_args(
+        screen="b1",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=None,
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 1
+    assert "cw-root" in err.getvalue()
+
+
+def test_omitting_as_of_takes_the_latest_day_in_the_data_and_says_which(tmp_path):
+    """定时任务喂不了日期参数，故缺省要能自己定出评估日，并把它印出来。
+
+    **印出来这一半和定出来那一半同样要紧**：数据新鲜度的闸门是刻意不要的，于是
+    「跑的是哪一天」是唯一还能发现「数据没跟上」的地方。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        as_of=None,
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "评估日：2024-03-25" in out.getvalue(), out.getvalue()
+    assert "最近一个齐全的交易日" in out.getvalue()
+
+
+def test_a_stub_tail_is_skipped_and_the_skipped_days_are_named_in_the_log():
+    """末根残缺时要回退，且**把跳过的日子连同只数印出来**——否则回退是静默的。
+
+    本机真实数据的末根就是这个样子（4,718 只 → 5 只），故这条不是假想。
+    """
+
+    dates = pd.bdate_range("2024-01-02", periods=22)
+    width = 100
+    data = [[1.0] * width for _ in range(21)] + [[1.0] * 5 + [float("nan")] * 95]
+    panel = Panel(
+        {
+            "close": pd.DataFrame(
+                data, index=dates, columns=[f"sh{600000 + i}" for i in range(width)]
+            )
+        }
+    )
+    out, err = capture()
+
+    got = _resolve_as_of(panel, out, err)
+
+    assert got == dates[20].date(), "应回退到残桩之前那个交易日"
+    assert "跳过更晚的 1 个交易日" in out.getvalue()
+    assert "只有 5 只" in out.getvalue()
+
+
+def test_the_watchlist_export_writes_bare_codes_in_rank_order(tmp_path):
+    """自选股文件的内容 = 候选清单的**裸代码**，顺序一致（从优到劣）。"""
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    target = tmp_path / "每日选股.EBK"
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        watchlist_out=str(target),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    ranked = pd.read_csv(run_dir / "candidates.csv")["symbol"].tolist()
+    assert target.read_text(encoding="utf-8").splitlines() == [name[2:] for name in ranked]
+    assert str(target) in out.getvalue()
+
+
+def test_an_empty_watchlist_is_written_but_the_loss_is_announced(tmp_path):
+    """没有候选时文件照写，但**必须嚷**——导入一份空自选股会把通达信那边的清空。"""
+    target = tmp_path / "每日选股.EBK"
+    out, err = capture()
+
+    _write_watchlist([], target, out, err)
+
+    assert target.read_text(encoding="utf-8") == ""
+    assert "没有候选" in err.getvalue()
+    assert "清空" in err.getvalue()

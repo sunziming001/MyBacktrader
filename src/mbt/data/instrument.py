@@ -100,3 +100,19 @@ def instrument_type(symbol: str) -> str:
 def is_stock(symbol: str) -> bool:
     """该标的是否为股票——股票池只从判为股票的品种中构建（ADR-0004）。"""
     return instrument_type(symbol) == "股票"
+
+
+def bare_code(symbol: str) -> str:
+    """取 6 位裸代码：``sh600000`` → ``600000``；已经是裸代码的原样返回。
+
+    通达信自己那几处文件格式只认裸代码——按期财报（``gpcw``）、证券主表 ``base.dbf``、
+    以及导出的自选股 ``.EBK``。它是**符号的两种写法**之间的转换，不是品种判定。
+
+    **不校验市场前缀与代码是否匹配**：``sh000001`` 是上证指数、``sz000001`` 是平安银行，
+    两者都是合法的（市场, 代码）组合，去掉市场段之后都是 ``000001``。那件校验是
+    :func:`instrument_type` 的事。
+
+    **判不出时不报错**（短于 7 个字符就原样返回）：调用方拿到的可能是已经裸着的代码，
+    替它报错只会逼每个调用方先自己判一次长度。
+    """
+    return symbol[2:] if len(symbol) > 6 else symbol

@@ -62,6 +62,29 @@ DEFAULT_START = "2015-08-01"
 MAX_FAILURE_RATE = 0.30
 
 
+#: ``--top-n all`` 的取值：**不截断**（每个合格标的都留，即规则自己的默认）。
+#:
+#: 用独立常量而不是 ``None``：``None`` 与「参数**没给**」在 `_screen_and_signals` 的多个
+#: 来源之间不可区分（``--screen-top-n`` 与 ``--max-positions`` 都可能是 ``None``），
+#: 而这两件事的后果相反——「没给」该回退到默认只数，「给了 all」该一个都不截。
+ALL_CANDIDATES = "all"
+
+
+def _count_or_all(raw: str):
+    """``--top-n`` 的取值解析：整数，或字面 ``all``。"""
+    if raw == ALL_CANDIDATES:
+        return ALL_CANDIDATES
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--top-n 要一个整数或 {ALL_CANDIDATES}，收到 {raw!r}"
+        ) from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"--top-n 至少取 1，收到 {value}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造参数解析器。**独立成函数**，便于测试断言用法错误的退出码。"""
     parser = argparse.ArgumentParser(prog="mbt", description="A 股策略回测与选股工具")
@@ -145,8 +168,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     screen = sub.add_parser("screen", help="在指定评估日跑一次选股")
-    screen.add_argument("--as-of", required=True, help="评估日，必须是交易日")
-    screen.add_argument("--top-n", type=int, default=10, help="取前 N 名")
+    screen.add_argument(
+        "--as-of",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="评估日，必须是交易日。不给则取数据里**最近一个齐全的交易日**——定时任务喂不了"
+        "日期参数，而行情末根常常只是没写全的半根（取法见 mbt.data.panel.latest_complete_day）",
+    )
+    screen.add_argument(
+        "--top-n",
+        type=_count_or_all,
+        default=10,
+        metavar="N|all",
+        help="取前 N 名；给 all 表示**不截断**（每个合格标的都留，即规则自己的默认）。默认 10",
+    )
     screen.add_argument("--tdx-root", required=True, help="通达信 vipdoc 根目录")
     screen.add_argument("--gbbq", required=True, help="权息文件 gbbq 的路径")
     screen.add_argument(
@@ -160,6 +195,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="启用「非亏损」过滤（按公告日的累计归母净利润；缺财报的标的排除）",
     )
     screen.add_argument("--output-dir", required=True, help="产物落盘目录（必须显式给出）")
+    screen.add_argument(
+        "--watchlist-out",
+        default=None,
+        metavar="PATH",
+        help="把候选另写一份**通达信自选股文件**（每行一个 6 位裸代码，从优到劣，"
+        "固定名覆盖）。用 `mbt screen` 落产物之外多要这一份，是为了每天把同一个文件名"
+        "喂给通达信——它按**文件名**认自选股",
+    )
     screen.add_argument(
         "--master",
         default=None,
@@ -184,9 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     screen.add_argument(
         "--screen",
-        choices=("momentum", "undervalued_growth", "valuation"),
+        choices=("momentum", "undervalued_growth", "valuation", "b1"),
         default="momentum",
-        help="用哪条选股规则（undervalued_growth 需 --cw-root；valuation 是它的旧版）"
+        help="用哪条选股规则（undervalued_growth 与 b1 需 --cw-root；valuation 是前者的旧版）"
         "。默认 momentum",
     )
     screen.add_argument(
@@ -420,29 +463,38 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
         return None, None
 
     # 候选集大小默认取最大持仓数：取前 N 却只持有 M < N 只，多出来的候选没有意义。
-    top_n = (
-        getattr(args, "screen_top_n", None)
-        or getattr(args, "max_positions", None)
-        or getattr(args, "top_n", None)
-        or 5
-    )
+    #
+    # 三个来源按优先级取**第一个明确给了的**，而 ``--top-n all`` 要先于回退单独判——
+    # 它是「不截断」，不能被 ``or`` 链当成「没给」而落到 5（理由见 :data:`ALL_CANDIDATES`）。
+    requested = [getattr(args, name_, None) for name_ in ("screen_top_n", "max_positions", "top_n")]
+    if ALL_CANDIDATES in requested:
+        top_n = None
+    else:
+        top_n = next((value for value in requested if value is not None), 5)
 
     if name == "momentum":
         return momentum_screen(window=20, top_n=top_n), None
 
-    if name not in ("undervalued_growth", "valuation"):
+    if name not in ("undervalued_growth", "valuation", "b1"):
         raise ValueError(f"未知的 --screen {name!r}")
 
     # `valuation` 是旧名（无跌幅条件、按百分位排序），留给对照实验。
     legacy = name == "valuation"
 
     if not args.cw_root:
-        raise ValueError(f"--screen {name} 需要 --cw-root：估值的每股收益来自财务数据")
+        raise ValueError(
+            f"--screen {name} 需要 --cw-root："
+            + (
+                "B1 的最后两条过滤读的是财务数据（PE 为正、PE 百分位低）"
+                if name == "b1"
+                else "估值的每股收益来自财务数据"
+            )
+        )
 
     from mbt.data.fundamental import CwDataSource
     from mbt.data.panel import clip_fields
     from mbt.data.valuation import valuation_for
-    from mbt.screen import drawdown_fields, undervalued_growth_screen, valuation_screen
+    from mbt.screen import b1_screen, drawdown_fields, undervalued_growth_screen, valuation_screen
 
     # 传的是**原始**行情：PE 要用当时的成交价，而后复权价以首根为基准放大（见 valuation_for）。
     if progress is not None:
@@ -455,6 +507,18 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
     )
 
     signals = dict(valuation.as_fields())
+
+    # **B1 到这里就够了。** 它另外两条量能过滤要的 `swings` 与 `volume_pattern` 是规则
+    # 内部自算并记忆在面板对象上的（见 `mbt.screen.b1_screen`），不是外部喂进来的信号。
+    if name == "b1":
+        return b1_screen(top_n=top_n), clip_fields(
+            signals,
+            loaded.markets,
+            # 选股命令没有 --start/--end（评估日由 --as-of 承担），故用 getattr 兜底。
+            start=getattr(args, "start", None),
+            end=getattr(args, "end", None),
+        )
+
     if not legacy:
         # 跌幅要回看 252 个交易日，故同样**先算后截**（见 drawdown_fields）。
         if progress is not None:
@@ -477,15 +541,55 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
     return factory(top_n=top_n), signals
 
 
+def _resolve_as_of(panel, stdout, stderr):
+    """定出该按哪一天评估：``--as-of`` 给了就用它，没给则由数据自己回答。
+
+    **为什么不能默认取「最后一根」。** 通达信的数据是分批落盘的，行情末根常常只有少数
+    标的被写到（本机实测 ``2026-09-11`` 那根只有 5/4,752 只）。按它评估会静静地选出一个
+    残缺的日子，而结果看起来只是「今天候选很少」。取法见
+    :func:`mbt.data.panel.latest_complete_day`。
+
+    跳过的更晚交易日要**印出来**：这是本工具唯一还能发现「数据没写全」的地方——数据新鲜度
+    的闸门是刻意不要的，那就让这一天至少是可见的，而不是沉默的。
+
+    返回 ``datetime.date``，或 ``None``（此时已经把错误写进 ``stderr``）。
+    """
+    import datetime as dt
+
+    from mbt.data.panel import coverage, latest_complete_day
+
+    resolved = latest_complete_day(panel)
+    if resolved is None:
+        print("错误：无法从数据里定出评估日——取到的行情里一天都没有可用价格", file=stderr)
+        return None
+
+    counts = coverage(panel)
+    print(
+        f"评估日：{resolved:%Y-%m-%d}（未给 --as-of，取数据里**最近一个齐全的交易日**；"
+        f"当日有价 {counts.loc[resolved]:,} 只）",
+        file=stdout,
+    )
+
+    later = counts.loc[counts.index > resolved]
+    if len(later) > 0:
+        detail = "、".join(f"{day:%Y-%m-%d} 只有 {int(count):,} 只" for day, count in later.items())
+        print(f"  跳过更晚的 {len(later)} 个交易日（数据没写全）：{detail}", file=stdout)
+
+    return dt.date(resolved.year, resolved.month, resolved.day)
+
+
 def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     """执行一次选股命令，返回退出码。**纯函数**，理由同上。"""
     import datetime as dt
 
-    try:
-        as_of = dt.date.fromisoformat(args.as_of)
-    except ValueError:
-        print(f"错误：--as-of {args.as_of!r} 不是合法日期（应形如 2026-09-11）", file=stderr)
-        return 1
+    if args.as_of is None:
+        as_of = None
+    else:
+        try:
+            as_of = dt.date.fromisoformat(args.as_of)
+        except ValueError:
+            print(f"错误：--as-of {args.as_of!r} 不是合法日期（应形如 2026-09-11）", file=stderr)
+            return 1
 
     symbols = _select_symbols(args, stderr)
     if symbols is None:
@@ -516,6 +620,10 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     try:
         panel = assemble_panel(list(loaded.markets), SCREEN_FIELDS)
+        if as_of is None:
+            as_of = _resolve_as_of(panel, stdout, stderr)
+            if as_of is None:
+                return 1
         listing_dates = None
         if args.master:
             every = load_listing_dates(args.master, symbols=[m.symbol for m in loaded.markets])
@@ -555,7 +663,9 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 选，两边给出的候选完全不是一回事。
         screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout, progress)
         if screen is None:
-            screen = momentum_screen(window=20, top_n=args.top_n)
+            # `--screen none` 才走到这里；`--top-n all` 在规则自己的默认里也是不截断。
+            top_n = None if args.top_n == ALL_CANDIDATES else args.top_n
+            screen = momentum_screen(window=20, top_n=top_n)
 
         from mbt.data.panel import with_signals
 
@@ -580,7 +690,33 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         print(f"错误：写入选股产物失败——{type(exc).__name__}: {exc}", file=stderr)
         return 1
     _report_candidates(candidates, as_of, run_dir, stdout)
+
+    if args.watchlist_out:
+        try:
+            _write_watchlist(candidates, args.watchlist_out, stdout, stderr)
+        except Exception as exc:  # noqa: BLE001
+            # 同上：落盘失败以退出码收场。**不回滚** run 目录——那份产物本身是完好的。
+            print(f"错误：写自选股文件失败——{type(exc).__name__}: {exc}", file=stderr)
+            return 1
     return 0
+
+
+def _write_watchlist(candidates, path, stdout, stderr) -> None:
+    """落一份通达信自选股文件，并在**空清单**时把后果嚷出来。
+
+    空清单照样覆盖（理由见 :func:`mbt.report.write_watchlist`），而代价是通达信那边的自选股
+    会被清空——这是唯一一处「每天跑一次」会**破坏既有状态**的地方，故它必须在日志里显眼。
+    定时任务跑的时候没人在看，所以这句话也进 stderr，好让 `>` 重定向之外的读者也能撞上它。
+    """
+    from mbt.report import write_watchlist
+
+    target = write_watchlist(candidates, path)
+    print(f"\n自选股：{target}（{len(candidates)} 个，从优到劣）", file=stdout)
+    if not candidates:
+        print(
+            "警告：今天**没有候选**，那份自选股是空的——导入通达信会把自选股清空",
+            file=stderr,
+        )
 
 
 def run_update_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:

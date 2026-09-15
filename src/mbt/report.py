@@ -133,6 +133,37 @@ def describe_screen(screen, label: str | None = None) -> dict | None:
     }
 
 
+def write_watchlist(candidates, path):
+    """把候选写成**通达信自选股文件**（``.EBK``）：每行一个 6 位裸代码，**顺序即优劣**。
+
+    参数:
+        candidates: 一串标的符号（``sz300888`` 这种带市场前缀的），顺序按**从优到劣**。
+        path: 落盘路径。父目录不在会被建出来——定时任务跑的那一刻没人能在旁边先 mkdir。
+
+    返回落盘后的 :class:`~pathlib.Path`，便于调用方把它印进日志。
+
+    **与 run 目录那套约定刻意相反。** ``write_run_artifacts`` 用时间戳目录且**拒绝覆盖**
+    （一次运行是一份不可变的证据）；而这一份是**固定名、每天覆盖**的——通达信按**文件名**
+    认自选股，名字一变，每天导入的就成了另一个板块。
+
+    **空清单照样落一份空文件**：文件必须**总是**代表「今日候选」，留一份昨天的清单在原地
+    是更坏的谎——它看起来像今天的答案。代价是空文件会把通达信那边的自选股清空，故调用方
+    **必须**把「今天没有候选」嚷出来（``mbt screen`` 那条日志的责任，不是这里的）。
+
+    **行尾用 CRLF**：消费它的是一个 Windows 程序，而通达信自己的板块文件就是这个行尾。
+    编码不影响内容（代码全是 ASCII 数字），故按平台无关的方式显式写死行尾，不靠 os.linesep。
+    """
+    from pathlib import Path
+
+    from mbt.data.instrument import bare_code
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [bare_code(symbol) for symbol in candidates]
+    target.write_bytes(("".join(f"{code}\r\n" for code in lines)).encode("ascii"))
+    return target
+
+
 def write_run_artifacts(
     result,
     *,

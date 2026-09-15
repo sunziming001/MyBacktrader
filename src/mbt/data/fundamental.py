@@ -69,6 +69,7 @@ import numpy as np
 import pandas as pd
 
 from .errors import MarketDataError
+from .instrument import bare_code
 
 #: 头部大小（字节）。
 HEADER_SIZE = 20
@@ -283,8 +284,9 @@ def _core_code(symbol: str) -> str:
 
     ``gpcw`` 只存裸代码，故 join 时也要裸代码。**不**在这里校验前缀与代码是否匹配
     （``sh000001`` 是上证指数而 ``sz000001`` 是平安银行）——那是 :func:`_symbol_of` 的事。
+    实现与另两处入口共用一份（:func:`mbt.data.instrument.bare_code`）。
     """
-    return symbol[2:] if len(symbol) > 6 else symbol
+    return bare_code(symbol)
 
 
 def _symbol_of(code: str) -> str:

@@ -49,6 +49,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .errors import MarketDataError
+from .instrument import bare_code
 
 #: dBase III 的头部大小。
 HEADER_SIZE = 32
@@ -156,8 +157,9 @@ def _bare_to_symbol(symbols) -> dict[str, str]:
 
 
 def _bare(symbol: str) -> str:
-    """``sh600000`` 与 ``600000`` 都归一成 ``600000``。"""
-    return symbol[2:] if len(symbol) > 6 else symbol
+    """``sh600000`` 与 ``600000`` 都归一成 ``600000``。实现见
+    :func:`mbt.data.instrument.bare_code`。"""
+    return bare_code(symbol)
 
 
 def _decode_date(text: str) -> dt.date | None:

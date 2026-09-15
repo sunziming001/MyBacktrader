@@ -590,3 +590,70 @@ def test_verifying_without_a_digest_reports_rather_than_passing_silently(tmp_pat
     from mbt.report import verify_snapshot
 
     assert verify_snapshot({}, []) != []
+
+
+# --- 自选股文件（.EBK）：给通达信看的候选清单 ---------------------------------
+#
+# 产物是**固定名、每天覆盖**的，与 run 目录那套「时间戳 + 拒绝覆盖」刻意相反：
+# 通达信按**文件名**认自选股，故名字必须稳定，否则每天导入的是另一个板块。
+
+
+def test_the_watchlist_is_one_bare_code_per_line_in_the_given_order(tmp_path):
+    """每行一个 6 位裸代码，**顺序即优劣**——通达信按文件顺序列出它们。"""
+    from mbt.report import write_watchlist
+
+    path = write_watchlist(["sz300888", "sh600000", "bj920819"], tmp_path / "每日选股.EBK")
+
+    assert path.read_text(encoding="utf-8").splitlines() == ["300888", "600000", "920819"]
+
+
+def test_the_watchlist_keeps_the_order_it_was_given(tmp_path):
+    """顺序不许被排序掉：候选顺序就是**从优到劣**，排过之后就再读不出优劣了。"""
+    from mbt.report import write_watchlist
+
+    path = write_watchlist(["sh600000", "sz000001", "sz300888"], tmp_path / "w.EBK")
+
+    assert path.read_text(encoding="utf-8").splitlines() == ["600000", "000001", "300888"]
+
+
+def test_the_watchlist_overwrites_an_existing_file(tmp_path):
+    """覆盖是**本格式的要求**，不是疏忽——与 run 目录「拒绝覆盖」的取舍相反。"""
+    from mbt.report import write_watchlist
+
+    target = tmp_path / "每日选股.EBK"
+    write_watchlist(["sh600000", "sz000001"], target)
+
+    write_watchlist(["sz300888"], target)
+
+    assert target.read_text(encoding="utf-8").splitlines() == ["300888"]
+
+
+def test_an_empty_watchlist_still_writes_the_file(tmp_path):
+    """没有候选时也要落一份空文件：文件必须**总是**代表「今日候选」。
+
+    留一份昨天的清单在原地是更坏的谎——它看起来像今天的答案。（空文件会把通达信的自选股
+    清空，故调用方**必须**把这件事嚷出来；那是 `mbt screen` 那条日志的责任，不是这里的。）
+    """
+    from mbt.report import write_watchlist
+
+    path = write_watchlist([], tmp_path / "每日选股.EBK")
+
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_the_watchlist_uses_windows_line_endings(tmp_path):
+    """行尾用 CRLF：消费它的是一个 Windows 程序，而通达信自己的板块文件就是这个行尾。"""
+    from mbt.report import write_watchlist
+
+    path = write_watchlist(["sh600000", "sz000001"], tmp_path / "w.EBK")
+
+    assert path.read_bytes() == b"600000\r\n000001\r\n"
+
+
+def test_the_watchlist_directory_is_created_when_missing(tmp_path):
+    """目录不在就建——定时任务跑的那一刻没人能在旁边先 mkdir。"""
+    from mbt.report import write_watchlist
+
+    path = write_watchlist(["sh600000"], tmp_path / "a" / "b" / "每日选股.EBK")
+
+    assert path.is_file()

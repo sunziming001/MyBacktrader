@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from mbt.data import MarketDataError, Panel, assemble_panel
+from mbt.data.panel import coverage, latest_complete_day
 
 
 def test_assemble_panel_uses_symbols_as_columns_and_keeps_their_order(make_prices, make_market):
@@ -139,3 +140,83 @@ def test_asking_for_an_undeclared_field_lists_what_is_declared(panel):
     assert "high" not in got
     with pytest.raises(KeyError, match="面板没有字段 'high'"):
         got["high"]
+
+
+# --- 选股该按哪一天评估 -------------------------------------------------------
+#
+# **末根残桩**：本机真实数据的最后一根 K 线（2026-09-11）只有 **5/4,752** 只标的有价，
+# 而它前面每一天都是约 4,718 只。这不是偶发——它是「通达信还没把当天数据写全」的常态。
+# 一个每日选股的工具若按「最后一根」评估，就会静静地选出一个 5 只标的的日子，
+# 而结果看起来只是「今天候选很少」。故「哪一天算数」必须由数据本身回答。
+
+
+def _coverage_panel(counts: list[int], *, width: int = 100):
+    """造一个「第 ``i`` 行只有 ``counts[i]`` 只标的有价」的面板（其余为缺失）。"""
+    dates = pd.bdate_range("2024-01-01", periods=len(counts))
+    columns = [f"sh{600000 + i:06d}" for i in range(width)]
+    data = [[1.0] * count + [float("nan")] * (width - count) for count in counts]
+    return Panel({"close": pd.DataFrame(data, index=dates, columns=columns)})
+
+
+def test_coverage_counts_the_symbols_with_a_price_per_day():
+    got = coverage(_coverage_panel([3, 1, 2]))
+
+    assert got.tolist() == [3, 1, 2]
+    assert got.index.equals(pd.bdate_range("2024-01-01", periods=3))
+
+
+def test_the_trailing_stub_bar_is_not_taken_as_the_evaluation_day():
+    """尾巴上那根只有少数标的有价的 K 线要**跳过去**——这正是本机数据现在的样子。"""
+    panel_ = _coverage_panel([100] * 10 + [5])
+
+    got = latest_complete_day(panel_)
+
+    assert got == pd.bdate_range("2024-01-01", periods=10)[-1], "应回退到残桩之前那天"
+
+
+def test_an_ordinary_tail_is_kept_as_is():
+    """数据是全的时候不许乱回退——否则这条规则本身就会变成一个新坑。"""
+    panel_ = _coverage_panel([100] * 10)
+
+    assert latest_complete_day(panel_) == pd.bdate_range("2024-01-01", periods=10)[-1]
+
+
+def test_it_returns_the_last_complete_day_not_the_first():
+    """回退要走**尽可能少**的步数：连着几天残缺时取最晚的那个合格日。"""
+    panel_ = _coverage_panel([100] * 5 + [7, 9, 4])
+
+    assert latest_complete_day(panel_) == pd.bdate_range("2024-01-01", periods=5)[-1]
+
+
+def test_a_day_with_half_the_names_is_still_a_trading_day():
+    """门槛是**宽的**：正常交易日不会有一半标的缺席，故半个市场停牌不该触发回退。"""
+    panel_ = _coverage_panel([100] * 5 + [60])
+
+    assert latest_complete_day(panel_) == pd.bdate_range("2024-01-01", periods=6)[-1]
+
+
+def test_the_threshold_is_relative_to_the_panel_so_a_small_universe_still_works():
+    """门槛按**同一份面板的中位数**算，故 ``--limit 5`` 那种小样本照样给出最后一天。
+
+    绝对的「至少 N 只」在这里一定是错的：试跑时全市场只有几只，而「只有几只」不等于
+    「数据没写全」。故这条同时也钉住了**不许**把门槛写成常数。
+    """
+    small = _coverage_panel([5, 5, 5], width=5)
+
+    assert latest_complete_day(small) == pd.bdate_range("2024-01-01", periods=3)[-1]
+
+
+def test_a_day_is_never_invented_when_there_is_no_data_at_all():
+    """空面板没有「最后一天」可言——返回 ``None``，让调用方自己决定怎么收场。"""
+    empty = Panel({"close": pd.DataFrame(index=pd.DatetimeIndex([]), dtype="float64")})
+
+    assert coverage(empty).empty
+    assert latest_complete_day(empty) is None
+
+
+def test_asking_for_a_field_the_panel_lacks_names_what_is_declared():
+    """缺字段要报错并说清该怎么办——与 ``Panel.__getitem__`` 同口径。"""
+    got = _coverage_panel([1, 2])
+
+    with pytest.raises(KeyError, match="面板没有字段 'volume'"):
+        latest_complete_day(got, field="volume")

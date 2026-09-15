@@ -208,3 +208,53 @@ def assemble_panel(markets: Sequence[MarketData], fields: Sequence[str]) -> Pane
         built[field] = pd.concat(series, axis=1, keys=symbols)
 
     return Panel(built)
+
+
+#: 「最近这些天」的窗口长度，用来算**覆盖率的中位参照**。取 21——一个月左右的交易日，
+#: 足够抗住少数几天(如春节前后)的稀疏，又短到能跟上标的数量的变化（新股上市、退市）。
+COVERAGE_REFERENCE_DAYS = 21
+
+#: 判定「这天算数」的宽松程度：覆盖数要达到参照中位数的这个比例。**故意取得很宽**——
+#: 真实交易日不会有一半标的缺席，故半个市场停牌不该触发回退；而真正的残桩是数量级之差
+#: （本机实测：4,718 → 5）。
+COMPLETE_DAY_MIN_RATIO = 0.5
+
+
+def coverage(panel: Panel, *, field: str = "close") -> pd.Series:
+    """逐日的**覆盖数**：那天有多少只标的在该字段上有值（缺失即不计）。
+
+    取 ``close`` 而非任意字段：收盘价是「这天有没有行情」最没有歧义的标记——``volume``
+    在停牌日可能补 0，而 0 是**有值**，于是停牌被算成有行情。
+    """
+    return panel[field].notna().sum(axis=1)
+
+
+def latest_complete_day(
+    panel: Panel,
+    *,
+    field: str = "close",
+    lookback: int = COVERAGE_REFERENCE_DAYS,
+    min_ratio: float = COMPLETE_DAY_MIN_RATIO,
+) -> pd.Timestamp | None:
+    """最近一个**数据齐全**的交易日；一天都没有可用的就返回 ``None``。
+
+    **为什么不能直接取「最后一根」。** 通达信的数据是**分批**落盘的，于是行情文件的末根
+    常常只有少数标的被写到——本机实测 ``2026-09-11`` 那根只有 **5/4,752** 只标的有价，
+    而它前面每一天都是约 4,718 只。按「最后一根」评估的每日选股会静静地选中那个残缺的
+    日子，而结果看起来只是「今天候选很少」。故这个日子必须由数据本身回答。
+
+    判据是**相对的**：覆盖数要达到最近 ``lookback`` 天里**中位数**的 ``min_ratio`` 倍。
+    绝对门槛在这里一定是错的——``--limit 5`` 试跑时全市场只有几只，而「只有几只」不等于
+    「数据没写全」。故小样本照样能得到它最后一天。
+
+    被跳过的日子不报错也不回填：这是**数据没写好**，不是本函数的问题。调用方若要把它
+    嚷出来，对 :func:`coverage` 取那几个日期即可（``mbt screen`` 就是这么做的）。
+    """
+    counts = coverage(panel, field=field)
+    if counts.empty:
+        return None
+
+    reference = counts.tail(lookback).median()
+    acceptable = counts >= reference * min_ratio
+    ok = counts.index[acceptable]
+    return None if len(ok) == 0 else ok[-1]

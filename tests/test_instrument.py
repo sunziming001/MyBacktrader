@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from mbt.data import instrument_type
+from mbt.data.instrument import bare_code
 from mbt.rules import RuleTableError, board_of
 
 #: 每个品种各取一组**真实前缀**的样本。编码的是「这些代码是这种东西」这一事实，
@@ -110,3 +111,47 @@ def test_an_index_is_accepted_by_instrument_type_but_rejected_by_board_of():
     assert instrument_type("sh000001") == "指数"
     with pytest.raises(RuleTableError):
         board_of("sh000001")
+
+
+# --- 裸代码：去掉市场那一段 ---------------------------------------------------
+
+
+def test_bare_code_strips_the_market_prefix_off_real_codes():
+    """通达信自己那几处文件格式（``gpcw`` 的按期财报、证券主表、导出的自选股）只认裸代码。
+
+    取**真实代码**而不是编造的：编码的是「这些符号指这些股票」这一事实，不是实现细节。
+    """
+    assert bare_code("sh600000") == "600000"
+    assert bare_code("sz000001") == "000001"
+    assert bare_code("sz300888") == "300888"
+    assert bare_code("bj920819") == "920819"
+
+
+def test_bare_code_leaves_a_bare_code_alone():
+    """已经是裸代码的原样返回——调用方不必先问「它带前缀吗」。"""
+    assert bare_code("600000") == "600000"
+    assert bare_code("300888") == "300888"
+
+
+def test_bare_code_does_not_validate_the_prefix_against_the_code():
+    """**不校验前缀与代码是否匹配**——那是 :func:`instrument_type` 的事。
+
+    ``sh000001`` 是上证指数、``sz000001`` 是平安银行，两者都是合法的（市场, 代码）组合，
+    去掉市场段之后**都是** ``000001``。本函数只回答「去掉市场那一段之后是什么」。
+    """
+    assert bare_code("sh000001") == bare_code("sz000001") == "000001"
+
+
+def test_the_three_bare_code_entry_points_agree():
+    """三处入口必须给出同一个答案——它们是同一件事，此前是三份拷贝。
+
+    ``mbt.data.fundamental._core_code`` 与 ``mbt.data.master._bare`` 都是这段代码的副本
+    （逐字相同），本函数是它们收敛出来的那一份。谁再各自演化，这条会先响。
+    """
+    from mbt.data.fundamental import _core_code
+    from mbt.data.master import _bare
+
+    samples = ["sh600000", "sz300888", "bj920819", "600000", "", "sh"]
+    for symbol in samples:
+        assert _core_code(symbol) == bare_code(symbol), f"{symbol!r} 在 fundamental 那边不一致"
+        assert _bare(symbol) == bare_code(symbol), f"{symbol!r} 在 master 那边不一致"
