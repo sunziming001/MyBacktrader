@@ -52,11 +52,18 @@ from mbt.signals.indicators import (
     yellow_line,
 )
 from mbt.signals.swings import Swings, swings
-from mbt.signals.volume import VolumeStructure, volume_contraction, volume_structure
+from mbt.signals.volume import (
+    VolumePattern,
+    VolumeStructure,
+    volume_contraction,
+    volume_pattern,
+    volume_structure,
+)
 
 __all__ = [
     "KDJ",
     "Swings",
+    "VolumePattern",
     "VolumeStructure",
     "above_ma",
     "above_white",
@@ -83,6 +90,7 @@ __all__ = [
     "sma",
     "swings",
     "volume_contraction",
+    "volume_pattern",
     "volume_ratio",
     "volume_structure",
     "volume_surge",

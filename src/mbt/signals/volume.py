@@ -30,20 +30,35 @@
 
 .. warning::
 
+    本模块的**口径与判据在 2026-09-15 已改**（ADR-0012）：缩量不再当门，改与「顶部无量」
+    「顶部那根的长上影」合成一个排序用的**形态分数**；「顶部」也从「上涨段末尾若干根」
+    改为一根（最高价所在那根），故这两个缩量比值在新口径下的分母是**上涨段除去顶部那根**。
+    本模块仍按旧口径算并暴露这两个比值，是为了让 ADR-0010/0011 的那些对照可复算；
+    新口径的读数另在 :func:`volume_pattern` 里，字段不同名。
+
     ``pullback_ratio``（分母是单日最大量）**不可**读作「回调比上涨安静」：实测 1,109 笔成交里
     53% 按其字面含义并不缩量，上涨段「最大量 ÷ 均量」的中位是 2.95 倍（ADR-0010）。也**不要**
     把它与 ``pullback_vs_top_ratio`` 当同义词——两者秩相关只有约 0.48，且后者当判据时更差
-    （ADR-0011）。
+    （ADR-0011）。两条独立对照都指向同一处：按字面读法，**回调期并不比上涨期安静**——换用
+    「上涨段除去顶部那根的平均量」作分母后中位是 1.074（ADR-0012），与 ADR-0010 用另一条管线
+    量到的 1.044 互证。
+
+新口径在 :func:`volume_pattern` 里另起一组字段（``surge_vs_base`` / ``top_calm`` /
+``pullback_vs_advance`` / ``top_shadow_atr``），**不复用**上面这四个名字：两组同名不同义的
+比值在这个项目里已经被误读过一次（ADR-0010），改口径时换名字是刻意的。
 """
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
+from mbt.data.panel import Panel
+from mbt.signals.indicators import atr
 from mbt.signals.swings import Swings
 
 
@@ -59,8 +74,9 @@ class VolumeStructure(NamedTuple):
     - ``pullback_ratio``：分母是上涨段的**单日最大量**。它答的是「相对那根爆量，回调是否萎缩」，
       容易被单根异常量操纵（ADR-0010）。**判据用的就是它。**
     - ``pullback_vs_top_ratio``：分母是**顶部段均量**。它答的是「回调是否比它前面那段顶部安静」，
-      即原始提示里那个「而」字指向的比较；九个用户标注样本上 9/9 成立，比「相对上涨段**均**量」
-      的 2/9 好得多。**但全市场对照更差**（ADR-0011），故只作数据保留、不作判据。
+      即原始提示里那个「而」字指向的比较；在 `[P−edge_bars+1, P]` 这个**窗口**上九个样本 9/9 成立
+      （那九张截图只标注日期、未标出顶部，窗口是分析者按 `edge_bars=3` 切的），比「相对上涨段
+      **均**量」的 2/9 好得多。**但全市场对照更差**（ADR-0011），故只作数据保留、不作判据。
 
     段边界未确认处一律缺失。
     """
@@ -309,37 +325,41 @@ def volume_contraction(
     两条判据（都取自 :func:`volume_structure`）::
 
         surge_ratio            >= min_surge      上涨段确实放过量
-        pullback_vs_top_ratio  <= max_pullback   回调段相对**顶部段**明显萎缩
+        pullback_ratio         <= max_pullback   回调段相对上涨段**单日最大量**明显萎缩
 
-    第二条的参照物是**顶部段**，不是上涨段的单日最大量。依据是原始提示那句「在上涨的顶部，
-    成交量没有继续放大，保持平量或缩量。**而在下跌阶段**，成交量会明显萎缩」——「而」字把回调
-    那句接在顶部那句之后，故它的天然参照物是紧邻的顶部。九个标注样本实测：顶部口径 9/9 成立，
-    而「相对上涨段均值」只有 3/9（ADR-0011）。
-
-    若要用旧口径（相对单日爆量），那个比值仍在 ``volume_structure.pullback_ratio`` 里可取，
-    但**不要**把它当同义词——两者实测秩相关约 0.48。
+    第二条看的是 ``pullback_ratio``（÷ 上涨段单日最大量），**不是** ``pullback_vs_top_ratio``
+    （÷ 顶部段均量）——后者在九个样本上更贴原话，但**全市场对照更差**，且它排掉的那批反而更好
+    （ADR-0011）。两者实测秩相关只有约 0.48，故不可互当同义词（ADR-0010）。
 
     参数:
         volumes / anchors / edge_bars / base_bars: 同 :func:`volume_structure`。
         min_surge: 放量倍数下界（如 ``2.0``）。九个样本实测 1.21~15.07、中位 9.27，
             ``2.0`` 通过 8/9。
-        max_pullback: 缩量倍数上界——**现在量的是「回调均量 ÷ 顶部段均量」**。九个标注样本
-            实测 0.298~0.564（中位 0.450），门槛按候选群体的分布定，见 ADR-0011。
+        max_pullback: 缩量倍数上界——量的是「回调均量 ÷ **上涨段单日最大量**」。按字面读法它
+            **不代表「回调比上涨安静」**：实测 1,109 笔成交里 53% 按字面含义并不缩量（ADR-0010）。
+
+    .. warning::
+
+        **本函数连同上面这两条在 2026-09-15 已改**（ADR-0012）：缩量整条不再当门，改与
+        「顶部无量」「顶部那根的长上影」合成一个**形态分数**；门只留「上涨放量」。故这里的两条
+        是历史口径，保留是为了让 ADR-0010/0011 的对照可复算。
 
     .. warning::
 
         **提示里的第三条（「上涨的顶部成交量没有继续放大，保持平量或缩量」）没有实现**，
-        因为九个样本一致地**反过来**：爆量落在上涨段的**末尾**而非开头——量峰在上涨段内的
+        因为九个样本的**窗口读数**反过来：爆量落在上涨段的**末尾**而非开头——量峰在上涨段内的
         相对位置是 0.72~1.00（中位 0.95，0 = 起涨点、1 = 峰值），9/9 都在后半段。
         顶部均量相对上涨段均量是 1.09~5.37 倍（中位 2.39），即顶部正是最活跃的一段。
 
-        （ADR-0011 用**用户自己标注的九个样本**复核过这一条：顶部均量 ÷ 上涨段均量 ≤ 1 的
-        有 **0/9**、中位 2.39。故这次不是「九个样本说反了」，而是标注本身如此。）
+        （复核过的是「顶部均量 ÷ 上涨段均量」在 `[P−edge_bars+1, P]` 这个**窗口**上的读数：
+        ≤ 1 的有 **0/9**、中位 2.39。ADR-0011 原把这一条写成「不是样本量的问题——标注本身
+        如此」，**那是错的**：窗口是分析者按 `edge_bars=3` 切的，而那九张截图只标注日期、
+        未标出顶部。故 0/9 是**那个窗口**的性质，取多宽就会跟着变。）
 
         唯一能给出「9/9 通过」的写法是「顶部均量 ≤ 上涨段最大量」，但那**是同义反复**：
         顶部段是上涨段的子集，子集的均值不会超过全集的最大值。拿它当判据等于没判据。
 
-        故这一条只剩两种出路：要么承认它与样本不符而放弃，要么换一个检验方式（例如比较
+        故这一条只剩两种出路：要么承认它与窗口不符而放弃，要么换一个检验方式（例如比较
         顶部与前一轮顶部、或要求顶部不出现逐日递增）。两者都需要先有更多样本才能判断，
         在那之前不实现它，比实现一个恒真的判据诚实。
 
@@ -347,3 +367,293 @@ def volume_contraction(
     """
     structure = volume_structure(volumes, anchors, edge_bars=edge_bars, base_bars=base_bars)
     return (structure.surge_ratio >= min_surge) & (structure.pullback_ratio <= max_pullback)
+
+
+class VolumePattern(NamedTuple):
+    """新口径下的量能形态读数（ADR-0012）——**排序因子，不是门**。
+
+    五条宽表同形（行 = 交易日，列 = 标的），方向各不同，故**不要**直接当排序因子用——因子
+    约定「越大越靠前」，而这五条里 ``top_calm`` / ``pullback_vs_advance`` / ``top_shadow_atr``
+    都是**越小越好**。合成分数的写法见 :func:`~mbt.screen.Screen` 的 ``factors`` 与
+    ``normalize="rank"``（各自逐日秩归一后加权求和，秩会统一方向）。
+
+    每个比值的方向与「分母取哪一段」::
+
+        surge_vs_base        max(上涨段) ÷ mean([T−base, T−1])   越大越放量（旧口径统计量）
+        top_calm             顶量 ÷ max(上涨段除去顶)            越**小**越「顶部无量」
+        pullback_vs_advance  mean([R+1, S]) ÷ mean(上涨段除去顶) 越**小**越「调整缩量」
+        top_shadow_atr       顶部的上影 ÷ ATR(顶)                越**小**越好（长上影扣分）
+        top_after_peak       顶部那根在收盘峰值 P 之后几根        诊断用，不参与打分
+
+    后三个的分母都取「**上涨段除去顶部那根**」（``[T, 顶−1] ∪ [顶+1, R]``），而不是整段。
+    这不是精致化：顶部那根往往就是上涨段里量最大的那根（九个样本里量峰落在上涨段后半段，
+    中位相对位置 0.95），把它留在分母里，分母就被那一根抬起来，于是分子（顶部量）与分母
+    **共用了同一个数**——「顶部无量」会退化成常数附近的一个比值，量不出任何东西。
+
+    ``surge_vs_base`` 是例外：它的分母是**起涨前基准**（与「上涨段」比会变成与自己比），
+    故不含顶部那根的问题；但它仍按旧口径的统计量取**单日最大量**，只是段右端从 ``P`` 延到
+    ``max(P, 顶)``。它**不是** ③ 用的那道门——门仍是 :func:`volume_contraction`（ADR-0012
+    决定「放量」这道门本轮不动），这里给出来只是为了与 ② 的读数对得上。
+
+    ``top_after_peak`` 是给「收盘价峰值不是最高价」这件事留的账：实测**候选形态**里
+    有 **31.2%** 的最高价落在 ``P`` 之后（``probe_b1_top_late.py``），即冲高被砸回来的
+    「假突破」占比不低。上涨段的右端因此取 ``max(P, 顶部那根)``，让上涨段与回调段
+    不重叠也不漏掉那一段。
+    """
+
+    surge_vs_base: pd.DataFrame
+    top_calm: pd.DataFrame
+    pullback_vs_advance: pd.DataFrame
+    top_shadow_atr: pd.DataFrame
+    top_after_peak: pd.DataFrame
+
+
+def _top_of_advance(high: np.ndarray, trough_pos: np.ndarray) -> np.ndarray:
+    """上涨段 ``[T, 本行]`` 内**最高价**所在那根的行号；段无效处为 ``-1``。
+
+    「顶部」按**最高价**取一根，而不是按收盘价取（收盘口径的峰值由 :func:`~mbt.signals.
+    swings.swings` 给出）。两者会分叉：冲高回落的 `high` 落在下一根阴线里，收盘口径看不见它。
+
+    逐列扫描而不是逐格扫描：同一列上 ``T`` 大多连续多行不变，那时只需拿本行的 ``high``
+    与已知的最大值比一次，不必重扫整段。``T`` 一变（新的低点被确认）才重扫——`high` 逐行
+    推进，故重扫的总代价是 O(行数·列数)，不是 O(段长·行数)。实测全市场约 4 秒。
+    """
+    rows, columns = high.shape
+    top = np.full((rows, columns), -1, dtype=np.int64)
+    for column in range(columns):
+        current = -1
+        best = -1.0
+        best_at = -1
+        for row in range(rows):
+            trough = trough_pos[row, column]
+            if trough < 0.0:
+                current, best, best_at = -1, -1.0, -1
+                continue
+            trough = int(trough)
+            if trough != current:
+                current = trough
+                window = high[trough : row + 1, column]
+                if np.isfinite(window).any():
+                    best_at = trough + int(np.nanargmax(window))
+                    best = float(high[best_at, column])
+                else:
+                    best, best_at = -1.0, -1
+            else:
+                value = float(high[row, column])
+                if math.isfinite(value) and (best_at < 0 or value > best):
+                    best, best_at = value, row
+            top[row, column] = best_at
+    return top
+
+
+def _finite_stats(values: np.ndarray) -> tuple[float, float, int]:
+    """一维切片**忽略缺失**后的 ``(和, 最大值, 有效个数)``。
+
+    空集给 ``(0.0, nan, 0)``：**和给 0 而最大值给 nan** 是刻意的，不是随手写的。上涨段被顶部
+    那根切成两半之后要把两半**相加再相除**，故空的那一半必须贡献 0——若那里给 nan，一次加法
+    就会把整段的均值污染成 nan（这个坑踩过一次：``pullback_vs_advance`` 有 274 格因此变空）。
+    而空集**没有**最大值，给 0 会让 ``top_calm`` 的分母变成 0、进而让比值变成一个假的 0。
+
+    刻意不用 ``np.nanmean`` / ``np.nanmax``：那两个在空切片上会发 ``RuntimeWarning``，而缺失
+    是正常状态不是异常；且这里要把「和 / 个数」分开拿，两个整体统计量不是它俩的接口。
+    """
+    finite = np.isfinite(values)
+    count = int(finite.sum())
+    if count == 0:
+        return 0.0, math.nan, 0
+    kept = values[finite]
+    return float(kept.sum()), float(kept.max()), count
+
+
+def volume_pattern(
+    panel: Panel,
+    anchors: Swings,
+    *,
+    base_bars: int,
+    atr_n: int,
+) -> VolumePattern:
+    """度量新口径（ADR-0012）下的形态读数——**喂排序分数用，不当门**。
+
+    段边界（``T`` 起涨点、``P`` 收盘口径峰值、``顶`` 最高价所在那根、``S`` 观测日）::
+
+        起涨前基准 = [T − base_bars, T − 1]
+        上涨段     = [T, max(P, 顶)]
+        上涨段除顶 = [T, 顶 − 1] ∪ [顶 + 1, max(P, 顶)]
+        回调段     = [max(P, 顶) + 1, S]
+
+    参数:
+        panel: 行情面板，须含 ``high`` / ``open`` / ``close`` / ``volume``。
+        anchors: :func:`~mbt.signals.swings.swings` 的输出，须与 ``panel`` 出自**同一段
+            行情**（同一个价格序列、同一个切片）。不同源会把边界对到别的日子上，而那种错
+            不会报错。
+        base_bars: 起涨前基准的长度（如 ``10``）。九个样本的实际取值是 15，但 10 已足够
+            稳住基准——这一条从没成为瓶颈，故取这个值只是为了与 ADR-0010 的对照口径一致。
+        atr_n: ATR 的窗口（如 ``14``），只用于把「上影」按波动率折算成可跨标的比较的量。
+
+    返回:
+        :class:`VolumePattern`。
+
+    缺失的四种来源，一律**缺失**而非填充（产物是分数输入，缺值会被秩归一当作「最差」）：
+
+    1. 拐点未确认（``anchors`` 在该行为缺失）——没有段就没有形态；
+    2. 起涨前不足 ``base_bars`` 根——``surge_vs_base`` 无从算起（其余比值仍可算）；
+    3. 上涨段只有顶部那根（``max(P, 顶) == T``）——「除去顶部那根」是空集，
+       ``top_calm`` / ``pullback_vs_advance`` 都没有分母；
+    4. 回调段为空（``S == max(P, 顶)``）——``pullback_vs_advance`` 没有分子。
+
+    抛:
+        ValueError: ``base_bars`` / ``atr_n`` 不为正，``panel`` 缺字段，或它与 ``anchors``
+            的标的或交易日对不上。
+
+    .. note::
+
+        **为什么逐格算，而不像** :func:`volume_structure` **那样按摆动对分组。** 那里一个
+        ``(T, P)`` 会同时落在多个标的上，分组能省掉重复窗口。这里不行：``(T, P, 顶, R)``
+        这个四元组实测**每组平均只有 1.03 列**（``probe_monotonic.py``），等于没分组。
+
+        也**不能**用「摆动点只往前走」做单调队列：实测 ``trough_pos`` / ``peak_pos`` 在相邻
+        两行**都有效**处有 **44%** 是**下降**的——未确认的摆动点会随新数据**回头修正**。
+
+        真正省下功夫的是**遍历顺序**：按**列优先**走（同一列的行连续），于是 ``T`` / ``顶`` /
+        ``R`` 各自连续多行不变，三个「起止只由摆动点决定」的窗口只需记住上一次的结果，
+        不比一次就够了。回调段的右端是当前行，每天都是新的，那一项省不掉。
+
+        实测（2,701 行 × 4,752 列全市场）：本函数约 **59 秒**，同一批数据上旧口径的
+        :func:`volume_structure` 是 **315 秒**。逐格而不分组并没有拖慢它——三个窗口缓存
+        把「逐格」的大部分代价消掉了。这个代价是每次选股一次（秩归一要求全市场可比，
+        故不能只算候选格），相对整段回测是可接受的；真要更快只能上区间最大值稀疏表。
+    """
+    if base_bars < 1:
+        raise ValueError(f"base_bars 必须为正，收到 {base_bars!r}")
+    if atr_n < 1:
+        raise ValueError(f"atr_n 必须为正，收到 {atr_n!r}")
+
+    wanted = ("high", "open", "close", "volume")
+    absent = [name for name in wanted if name not in panel]
+    if absent:
+        raise ValueError(
+            f"形态读数需要面板含 {absent}，而它没有；面板字段为 {list(panel.field_names)}"
+        )
+
+    volumes = panel["volume"]
+    if not volumes.columns.equals(anchors.peak_age.columns):
+        raise ValueError("panel 与 anchors 的列（标的）必须一致，且顺序相同")
+    if not volumes.index.equals(anchors.peak_age.index):
+        raise ValueError("panel 与 anchors 的索引（交易日）必须一致")
+
+    high = panel["high"].to_numpy(dtype=float)
+    open_ = panel["open"].to_numpy(dtype=float)
+    close = panel["close"].to_numpy(dtype=float)
+    vol = volumes.to_numpy(dtype=float)
+    rows, columns = vol.shape
+
+    positions = np.arange(rows, dtype=float)[:, None]
+    peak_age = anchors.peak_age.to_numpy(dtype=float)
+    trough_age = anchors.trough_age.to_numpy(dtype=float)
+    peak_pos = np.where(np.isfinite(peak_age), positions - peak_age, -1.0)
+    trough_pos = np.where(np.isfinite(trough_age), positions - trough_age, -1.0)
+
+    top = _top_of_advance(high, trough_pos)
+
+    # 起涨点之后不足 base_bars 根的格子仍然进循环：那时只有 surge_vs_base 缺失，其余
+    # 三个比值照算。故「能不能算基准」不当成整格的门。
+    valid = (trough_pos >= 0.0) & (peak_pos >= trough_pos) & (top >= 0)
+    right = np.where(valid, np.maximum(peak_pos, top.astype(float)), -1.0)
+
+    atr_frame = atr(panel, atr_n).to_numpy(dtype=float)
+
+    surge = np.full((rows, columns), math.nan)
+    calm = np.full((rows, columns), math.nan)
+    pull = np.full((rows, columns), math.nan)
+
+    # 「顶部那根」上的取值全部靠花式索引一次取齐，故不占逐格循环的时间。
+    top_rows = top[valid]
+    top_cols = np.nonzero(valid)[1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        top_high = high[top_rows, top_cols]
+        body = np.maximum(open_[top_rows, top_cols], close[top_rows, top_cols])
+        top_atr = atr_frame[top_rows, top_cols]
+        top_shadow = np.full((rows, columns), math.nan)
+        # 影取**正**值（`high − max(开, 收)`），故「越小越好」——长上影是扣分项。别写成
+        # `max(开,收) − high`：那会得到一个恒非正的数，方向整个反过来。
+        top_shadow[valid] = np.where(top_atr > 0.0, (top_high - body) / top_atr, math.nan)
+        top_volume = np.full((rows, columns), math.nan)
+        top_volume[valid] = vol[top_rows, top_cols]
+    top_after = np.where(valid, top.astype(float) - peak_pos, math.nan)
+
+    # 列优先：`nonzero(valid.T)` 得到的行号在一列内升序，列号整体升序。
+    order_cols, order_rows = np.nonzero(valid.T)
+    bounds = np.searchsorted(order_cols, np.arange(columns + 1))
+
+    for column in range(columns):
+        first, last = int(bounds[column]), int(bounds[column + 1])
+        if first == last:
+            continue
+        base_key = left_key = right_key = None
+        base_mean = left_stats = right_stats = None
+        for position in range(first, last):
+            row = int(order_rows[position])
+            trough_of = int(trough_pos[row, column])
+            top_of = int(top[row, column])
+
+            if trough_of != base_key:
+                base_key = trough_of
+                if trough_of - base_bars >= 0:
+                    total, _, count = _finite_stats(vol[trough_of - base_bars : trough_of, column])
+                    base_mean = total / count if count else math.nan
+                else:
+                    base_mean = math.nan
+
+            if (trough_of, top_of) != left_key:
+                left_key = (trough_of, top_of)
+                left_stats = _finite_stats(vol[trough_of:top_of, column])
+
+            right_of = int(right[row, column])
+            if (top_of, right_of) != right_key:
+                right_key = (top_of, right_of)
+                right_stats = _finite_stats(vol[top_of + 1 : right_of + 1, column])
+
+            # 上涨段除顶的均量与单日最大量：左右两半分开归约再合并，避开每格一次数组拷贝。
+            # 空的那一半「和」是 0、「最大值」是 nan（见 `_finite_stats`），故均值可以直接相加，
+            # 最大值必须按哪一半为空分开取。
+            left_total, left_top, left_count = left_stats
+            right_total, right_top, right_count = right_stats
+            rest_count = left_count + right_count
+            if rest_count:
+                rest_mean = (left_total + right_total) / rest_count
+                if left_count == 0:
+                    rest_max = right_top
+                elif right_count == 0:
+                    rest_max = left_top
+                else:
+                    rest_max = left_top if left_top >= right_top else right_top
+            else:
+                rest_mean = rest_max = math.nan
+
+            pull_total, _, pull_count = _finite_stats(vol[right_of + 1 : row + 1, column])
+            pull_mean = pull_total / pull_count if pull_count else math.nan
+
+            top_value = top_volume[row, column]
+            # 上涨段的单日最大量**含顶部那根**（与旧口径的 `surge_ratio` 同一个统计量，
+            # 只是段右端从 `P` 变成了 `max(P, 顶)`）。顶部那根缺失时退回其余部分的最大值。
+            advance_max = rest_max
+            if math.isfinite(top_value) and (math.isnan(advance_max) or top_value > advance_max):
+                advance_max = top_value
+
+            if base_mean > 0.0:
+                surge[row, column] = advance_max / base_mean
+            if rest_max > 0.0:
+                calm[row, column] = top_value / rest_max
+            if rest_mean > 0.0:
+                pull[row, column] = pull_mean / rest_mean
+
+    def frame(values: np.ndarray) -> pd.DataFrame:
+        return pd.DataFrame(values, index=volumes.index, columns=volumes.columns, dtype=float)
+
+    return VolumePattern(
+        surge_vs_base=frame(surge),
+        top_calm=frame(calm),
+        pullback_vs_advance=frame(pull),
+        top_shadow_atr=frame(top_shadow),
+        top_after_peak=frame(top_after),
+    )
