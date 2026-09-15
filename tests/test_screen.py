@@ -734,3 +734,178 @@ def test_the_pool_mask_is_also_judged_on_the_creation_bar(make_market, zero_cost
 
     assert len(result.trades) == 1, "下单那根在池内，应当成交"
     assert result.trades.iloc[0]["price"] == pytest.approx(11.0)
+
+
+# --- 多因子合成：权重 + 按可交易池逐日秩归一 -----------------------------------
+
+
+def test_the_single_factor_path_is_left_exactly_as_it_was(panel):
+    """单项且不给归一 → 分数就是因子原值，**不是**百分位。
+
+    这条钉住向后兼容：既有的 ``factor=`` 调用点（含内置的两条规则）行为必须逐位不变，
+    否则「升格」会顺手把所有历史对照都作废。
+    """
+    working = panel({"a": {"sh600000": [10.0], "sz000001": [20.0], "sz000002": [30.0]}})
+
+    scores = Screen(factor=lambda p: p["a"]).apply(working).scores
+
+    assert scores.iloc[0].tolist() == [10.0, 20.0, 30.0]
+
+
+def test_the_composite_is_the_weighted_average_of_percentiles(panel):
+    """合成 = 各项百分位的等权平均。手算三只、当天池内全在。
+
+    ``a`` 升序名次/只数：10→1/3、20→2/3、30→1；``b``：5→1、1→1/3、2→2/3。
+    """
+    working = panel(
+        {
+            "a": {"sh600000": [10.0], "sz000001": [20.0], "sz000002": [30.0]},
+            "b": {"sh600000": [5.0], "sz000001": [1.0], "sz000002": [2.0]},
+        }
+    )
+    screen = Screen(factors=(lambda p: p["a"], lambda p: p["b"]), normalize="rank")
+
+    scores = screen.apply(working).scores.iloc[0]
+
+    assert scores["sh600000"] == pytest.approx((1 / 3 + 1) / 2)
+    assert scores["sz000001"] == pytest.approx((2 / 3 + 1 / 3) / 2)
+    assert scores["sz000002"] == pytest.approx((1 + 2 / 3) / 2)
+
+
+def test_the_ranking_pool_is_the_universe_and_pool_outsiders_get_nothing(panel):
+    """归一按**可交易池**排名：同一批原始值，池不同则分数不同；池外一律记 0。
+
+    这正是归一必须住在 ``Screen`` 里的原因——只有它在那一刻手上有股票池掩码。
+    """
+    working = panel(
+        {
+            "a": {"sh600000": [10.0], "sz000001": [20.0], "sz000002": [30.0], "sz000003": [40.0]},
+            "b": {"sh600000": [1.0], "sz000001": [3.0], "sz000002": [2.0], "sz000003": [4.0]},
+        }
+    )
+    screen = Screen(factors=(lambda p: p["a"], lambda p: p["b"]), normalize="rank")
+    day = working.fields["a"].index
+
+    # 不给池：四只一起排。a 的分位 0.25/0.5/0.75/1，b 的 0.25/0.75/0.5/1
+    loose = screen.apply(working).scores.iloc[0]
+    assert loose["sh600000"] == pytest.approx((0.25 + 0.25) / 2)
+
+    # 只留前两只在池内：它们的分位变成 0.5/1.0（池小了，名次相对上升），池外两只记 0
+    inside = pd.DataFrame(
+        {"sh600000": [True], "sz000001": [True], "sz000002": [False], "sz000003": [False]},
+        index=day,
+    )
+    tight = screen.apply(working, universe_mask=inside).scores.iloc[0]
+    assert tight["sh600000"] == pytest.approx((0.5 + 0.5) / 2)
+    assert tight["sz000001"] == pytest.approx((1.0 + 1.0) / 2)
+    assert tight["sz000002"] == 0.0
+    assert tight["sz000003"] == 0.0
+
+    assert tight["sh600000"] != pytest.approx(loose["sh600000"])
+
+
+def test_a_missing_component_only_costs_its_own_share(panel):
+    """只缺一项 → 那一项记 0（最差），**其余项照常**，故它不被排除、只是排在后面。"""
+    working = panel(
+        {
+            "a": {"sh600000": [10.0], "sz000001": [20.0], "sz000002": [float("nan")]},
+            "b": {"sh600000": [1.0], "sz000001": [3.0], "sz000002": [2.0]},
+        }
+    )
+    screen = Screen(factors=(lambda p: p["a"], lambda p: p["b"]), normalize="rank")
+
+    scores = screen.apply(working).scores.iloc[0]
+
+    # a 池内有效 2 只：10→1/2、20→1；缺的那只记 0
+    # b 池内有效 3 只：1→1/3、3→1、2→2/3
+    assert scores["sh600000"] == pytest.approx((0.5 + 1 / 3) / 2)
+    assert scores["sz000001"] == pytest.approx((1.0 + 1.0) / 2)
+    assert scores["sz000002"] == pytest.approx((0.0 + 2 / 3) / 2)
+    assert scores.notna().all()
+
+
+def test_a_symbol_missing_every_component_is_still_dropped(panel):
+    """三项**全缺** → 留缺失 → 被排除。与「因子缺失即排除」的既定纪律一致。"""
+    working = panel(
+        {
+            "a": {"sh600000": [10.0], "sz000001": [float("nan")]},
+            "b": {"sh600000": [1.0], "sz000001": [float("nan")]},
+        }
+    )
+    screen = Screen(factors=(lambda p: p["a"], lambda p: p["b"]), normalize="rank")
+
+    result = screen.apply(working)
+
+    assert result.scores.iloc[0]["sz000001"] != result.scores.iloc[0]["sz000001"]  # NaN
+    assert not result.selected.iloc[0]["sz000001"]
+
+
+def test_several_factors_without_normalization_are_refused(panel):
+    """多项却不给归一 → 报错。
+
+    「几项尺度不同的数直接相加」加出来的东西没有含义，而那**不会报错**——它会给出一个看着
+    正常的排序。故这里宁可拒绝。
+    """
+    screen = Screen(factors=(lambda p: p["a"], lambda p: p["b"]))
+
+    with pytest.raises(ValueError, match="必须给 normalize"):
+        screen.apply(panel({"a": {"sh600000": [1.0]}, "b": {"sh600000": [2.0]}}))
+
+
+def test_negative_weights_are_refused(panel):
+    """负权重 = 一个反转方向的开关，而本类不提供那种开关。"""
+    screen = Screen(
+        factors=(lambda p: p["a"], lambda p: p["b"]),
+        weights=(1.0, -1.0),
+        normalize="rank",
+    )
+
+    with pytest.raises(ValueError, match="权重必须为正"):
+        screen.apply(panel({"a": {"sh600000": [1.0]}, "b": {"sh600000": [2.0]}}))
+
+
+def test_weights_must_match_the_factor_count(panel):
+    """权重个数与因子个数对不上时报错，不猜。"""
+    screen = Screen(
+        factors=(lambda p: p["a"], lambda p: p["b"]),
+        weights=(1.0,),
+        normalize="rank",
+    )
+
+    with pytest.raises(ValueError, match="weights"):
+        screen.apply(panel({"a": {"sh600000": [1.0]}, "b": {"sh600000": [2.0]}}))
+
+
+def test_factor_and_factors_together_are_refused(panel):
+    """``factor`` 与 ``factors`` 只能给一个——两个都给时该以谁为准没有正确答案。"""
+    screen = Screen(factor=lambda p: p["a"], factors=(lambda p: p["b"],), normalize="rank")
+
+    with pytest.raises(ValueError, match="只能给一个"):
+        screen.apply(panel({"a": {"sh600000": [1.0]}, "b": {"sh600000": [2.0]}}))
+
+
+def test_an_unknown_normalization_is_refused(panel):
+    """不认识的归一方式要报错，不能静默忽略——静默忽略等于退回「直接相加」。"""
+    screen = Screen(factor=lambda p: p["a"], normalize="zscore")
+
+    with pytest.raises(ValueError, match="归一"):
+        screen.apply(panel({"a": {"sh600000": [1.0]}}))
+
+
+def test_the_composite_keeps_the_larger_is_better_contract(panel):
+    """归一不能顺手把方向翻掉：原始值越大，合成分数仍须越大。
+
+    这条单独立一个测试，因为「升序 rank」这一步很容易写反——写反了**不会报错**，
+    只会让每天的排序整齐地倒过来。
+    """
+    working = panel(
+        {
+            "a": {"sh600000": [1.0], "sz000001": [2.0], "sz000002": [3.0]},
+            "b": {"sh600000": [1.0], "sz000001": [2.0], "sz000002": [3.0]},
+        }
+    )
+    screen = Screen(factors=(lambda p: p["a"], lambda p: p["b"]), normalize="rank")
+
+    scores = screen.apply(working).scores.iloc[0]
+
+    assert scores["sh600000"] < scores["sz000001"] < scores["sz000002"]

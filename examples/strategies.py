@@ -230,7 +230,7 @@ class B1(bt.Strategy, EngineClock):
     **持有与卖出**——三条卖出规则全都依赖「已经持有」与「建仓时的价格」，是**路径依赖**的，
     而选股规则按定义不管持仓。
 
-    三条卖出规则（任一满足即动作）:
+    四条卖出规则（任一满足即动作；第四条默认关着）:
 
     ==========  ==========================================  ================
     规则        判据                                        动作
@@ -240,13 +240,35 @@ class B1(bt.Strategy, EngineClock):
     最高价破白线 ``high_above_white``：当日最高价 > 白线       清仓
     两日未站上   建仓后第 ``confirm_white_days`` 根收盘仍在    清仓
                 白线**下方**
+    持有封顶     建仓后第 ``max_hold_bars`` 个可交易日       清仓
+                （``None`` 时这条不存在，不看任何信号）
     ==========  ==========================================  ================
 
-    **成交时点**：订单在本根收盘下定、在**下一根开盘**成交，且 T+1 使当日买入不可当日卖出。
-    故上面三条的判据都读**当根**的收盘价／最高价，而成交价是**下一根的开盘价**。规则若被读成
-    「以当日收盘价卖出」，那是本引擎做不到的一项——本项目的撮合一律在次根开盘，没有「按当根
-    收盘成交」的口径（`mbt.backtest.costs` 的 `_execute` 只接受引擎给的成交价，而引擎按
-    `coc=False` 运行）。这处偏差的方向不定，故不假装它不存在。
+    **成交时点**：订单在本根收盘下定、在**下一根**成交，且 T+1 使当日买入不可当日卖出。
+    故上面三条的判据都读**当根**的收盘价／最高价。至于成交价取下一根的**哪个价**，由
+    ``exit_exec`` 定：
+
+    ==============  ==========================================================
+    ``exit_exec``   成交价
+    ==============  ==========================================================
+    ``"open"``（默认） 次根**开盘价**（``bt.Order.Market``，引擎的默认路径）
+    ``"close"``      次根**收盘价**（``bt.Order.Close``）
+    ==============  ==========================================================
+
+    ``"close"`` 这一档是 ADR-0012 ⑥ 的第三刀要求加的：把同一批入场的出口从「次根开盘」挪到
+    「次根收盘」，**卖日不动、只改成交时段**，实测值 +0.0416 pt/笔。它**不含任何未来信息**——
+    卖日是用前一根的收盘数据决定的，持到那个卖日的收盘才走，用的仍是已经不用的那根的数据。
+    但要记住它确实动了引擎的一条老口径（本类原来写着「本项目的撮合一律在次根开盘，没有按当根
+    收盘成交的口径」）：那一句现在只在 ``"open"`` 下成立，且**只对卖出放开**（买入侧仍一律次根
+    开盘，因为「收盘看到信号、次日开盘买入」是策略侧的真实时序，不该跟着一起变）。
+
+    **``max_hold_bars`` 是第四条卖出规则**（默认为 ``None``，即关着）：持有到建仓后第 N 个
+    **可交易日**就清仓，不看任何信号。落地方式与另三条一致——本根下单、次根成交，故它在
+    「本根是我第 ``N − 1`` 个可交易日」时下单，成交落在建仓后第 N 个交易日（开盘或收盘由
+    ``exit_exec`` 定）。``None`` 时这条规则整个不参与，行为与关掉它之前逐笔相同。
+
+    根数只在**当日可交易**时递增（与 ``confirm_white_days`` 同一套计数），故停牌不会让它提前
+    或推后：停牌期间这根不进账，复牌后才继续往上数。
 
     **买入侧的掩码按「下单那一根」判**（`AStockBroker._mask_says(at_creation=True)`），
     故「T 入选、T+1 已不入选」的订单**照样成交**。这一点在 B1 上不是细节：J 阈值收紧到 8 之后
@@ -268,6 +290,10 @@ class B1(bt.Strategy, EngineClock):
         stop_buffer: 前低止损的缓冲比例（跌破前低 × (1 − 它) 才触发）。默认 0.01。
         confirm_white_days: 建仓后第几根仍未站上白线就离场，数的是**交易日**。默认 2，
             即 T+2。根数只在**当日可交易**时才递增，故停牌不会把它提前或推后。
+        exit_exec: 卖单的成交价取次根的哪个价，``"open"``（默认）或 ``"close"``。
+            见上面「成交时点」一节——``"close"`` 是 ADR-0012 ⑥ 加的那一档。
+        max_hold_bars: 持有多久（**可交易日**）就无条件清仓；``None``（默认）表示不加这条规则。
+            填 2 即「成交落在建仓后第 2 个交易日」，与「本根下单、次根成交」一致。
 
     **前低取「峰值之后」的那一段**（调整期的前低），不是「峰值之前」的波段起点。两者
     位置差得很远：实测九个样本上，取波段起点给出的止损距中位 **−36.9%**（最松 −70.5%），
@@ -294,6 +320,8 @@ class B1(bt.Strategy, EngineClock):
         ("stop_days", 2),
         ("stop_buffer", 0.01),
         ("confirm_white_days", 2),
+        ("exit_exec", "open"),
+        ("max_hold_bars", None),
     )
 
     def __init__(self):
@@ -432,11 +460,15 @@ class B1(bt.Strategy, EngineClock):
     # --- 卖出 -----------------------------------------------------------------
 
     def _manage_exit(self, data, name, position, signals, today) -> None:
-        """三条卖出规则，任一满足即清仓。判据都读**当根**，成交落在**下一根开盘**。
+        """四条卖出规则，任一满足即清仓。判据都读**当根**，成交落在**下一根**
+        （取开盘还是收盘见 ``exit_exec``）。
 
         顺序：止损在最前——同一根上若既触发止损又触发离场，两者的动作相同（都是清仓），
         但先判止损能保证「止损优先」这件事在换规则时不被顺手改掉。``position`` 参数保留
         是为了与旧签名一致（曾经用它算「卖一半」的股数）。
+
+        持有封顶放在**最后**：它与另三条的动作完全相同（都是清仓），故顺序不改变任何一笔的
+        成交；放最后只是为了让「它是一条额外的兜底」这件事在代码里也看得出来。
         """
         _ = position
         close = data.close[0]
@@ -445,12 +477,12 @@ class B1(bt.Strategy, EngineClock):
         stop_level = self._stop_price.get(name)
         stop_hit = signal_value(signals, "stop_streak", today, name) > 0.5
         if stop_hit or (stop_level == stop_level and close < stop_level):
-            self.close(data=data)
+            self._close(data)
             return
 
-        # 2) 最高价破白线 → 清仓。建仓当根若已成立，卖单落在下一根开盘，正是「第二日开盘」。
+        # 2) 最高价破白线 → 清仓。建仓当根若已成立，卖单落在下一根，正是「第二日开盘」。
         if signal_value(signals, "high_above_white", today, name) > 0.5:
-            self.close(data=data)
+            self._close(data)
             return
 
         # 3) T+confirm_white_days 收盘仍在白线下方 → 清仓。
@@ -460,7 +492,28 @@ class B1(bt.Strategy, EngineClock):
             and (self.broker.tradability_mask.at[today, name])
         ):
             if signal_value(signals, "below_white", today, name) > 0.5:
-                self.close(data=data)
+                self._close(data)
+                return
+
+        # 4) 持有封顶（默认关着）：本根是第 ``max_hold_bars − 1`` 个可交易日时下单，成交落在
+        #    建仓后第 ``max_hold_bars`` 个可交易日。``>=`` 而不是 ``==``：停牌会让计数在某根上
+        #    直接跳过「恰好等于」的那个值，用 ``==`` 会永久漏掉这笔的封顶。
+        cap = self.p.max_hold_bars
+        if cap is not None and self._held_bars.get(name, 0) >= cap - 1:
+            self._close(data)
+
+    def _close(self, data) -> None:
+        """清仓，成交价按 ``exit_exec`` 取次根的收盘或开盘。
+
+        ``Order.Close`` 在本引擎里落到的正是**次根收盘**：订单在 ``T`` 根下定，撮合在
+        ``T+1`` 根的 ``_try_exec`` 里按 ``data.close[0]``（= ``close[T+1]``）成交。
+        这一点靠 ``tests/test_b1_strategy.py`` 的成交价用例钉住——它是本档唯一的依据，
+        backtrader 的语义一旦变了，这里必须先红。
+        """
+        if self.p.exit_exec == "close":
+            self.close(data=data, exectype=bt.Order.Close)
+        else:
+            self.close(data=data)
 
     def _anchored_prior_low(self, data, signals, today, name) -> float:
         """建仓时锚定「调整期的前低」= 峰值之后到建仓日之间的最低价。
@@ -592,13 +645,15 @@ def b1_screen(
     volume_base_bars=10,
     min_surge=2.0,
     max_pullback=0.5,
+    atr_n=14,
+    shadow_threshold=1.0,
     contained_days=10,
     pe_above=0.0,
     percentile_below=0.20,
     top_n=None,
 ) -> Screen:
     """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + 调整期形态 + 估值，
-    **按 J 值的超卖程度**排序。
+    **按形态分数**排序（ADR-0012）。
 
     它是 ``Screen``，故同一条件既能用于 ``mbt screen`` 选股，也能作为回测的入场闸门——
     不必写两遍（ADR-0001）。
@@ -616,17 +671,61 @@ def b1_screen(
     PE 百分位低         ``PE 百分位 < percentile_below``（默认 0.20）
     ==================  ================================================
 
-    排序因子是 :func:`~mbt.signals.factors.j_oversold`（``−J``，越大越超卖）。它回答
-    「今天谁的 J 更低」，而 J 的**门槛**由上一条过滤器管（``j_max``）——两者分工不同：
-    因子排序、过滤器取舍。
+    排序因子是**形态分数**：三项各自在**当日全市场（可交易池）**内转成百分位，再等权相加。
+
+    ========================  ==================================================
+    组件                       读法（都是**越小越好**，故先取负再进秩）
+    ========================  ==================================================
+    顶部无量                   ``− (vol(顶部那根) ÷ max(上涨段除去顶部那根))``
+    调整缩量                   ``− (mean(回调段) ÷ mean(上涨段除去顶部那根))``
+    长上影                     ``− max(0, 影 ÷ ATR − shadow_threshold)``
+    ========================  ==================================================
+
+    .. note::
+
+        **门仍走旧口径的「量能」，只把另三条降级成分**（ADR-0012）。那三句量能条件原先都是
+        门，② 的读数把它们分开了：`顶部无量` 在真实持有期尺度上的区分力是法定费用的 3.6 倍
+        （h=3 价差 +0.3137%、t=3.03，三个尺度同号），而 `放量` 在同一尺度上正好是零
+        （+0.0091%、t=0.09）。但按 ADR-0012 的元规则，「不赚钱」只能把它从判据**降级**、
+        不能据此删掉原话里的某条，故这道门本轮不动。
+
+        **这道门按旧口径算**（:func:`~mbt.signals.volume_contraction` 的两半，即放量**且**
+        缩量），也就是 ① 那三版对照里的 A 版。③ 接线时曾把它一并换成新口径的
+        ``surge_vs_base``、并去掉缩量那半条，④ 的全市场对照把那处连带改动量出来是
+        **单独 −7.53 pt**——量级是分数那一步收益（+3.01 pt）的三倍，方向相反；而它本来就
+        没有独立证据（② 说的是「放量的区分力是零」，不是「门的窗口该加宽」）。故退回旧口径。
+        这样本规则与 A 的差别**只剩排序因子一处**，④ 的对照才可归因。
+
+        **门为什么仍用「放量」而不是「顶部无量」**：① 与 ② 两条独立量法都指向「放量不挣
+        自己的饭钱」，而改门得先拿留出期复现的数字。这是一个有意保留的、与读数相抵的选择。
+
+    .. note::
+
+        **``shadow_threshold`` 是这道扣分唯一的旋钮，而力度 ``k`` 在这里没有作用。**
+        ADR-0012 把它写成 ``k × max(0, 影÷ATR − 1)`` 并标「力度 k 待定」——在**等权 +
+        逐日秩归一**下这个 k 不可辨识：``k > 0`` 只是给整个分量乘一个正常数，百分位完全不变。
+        故那条待办自动消解，剩下的只有门槛 ``shadow_threshold``（默认 1.0，由实测里
+        ``>1.0`` 只占 12.5% 定）。
+
+    .. warning::
+
+        **② 量的是** ``−影÷ATR``（未截的原始读数），而这里接的是**截过的扣分**。两者的秩在
+        门槛之下不同：截过之后约 87.5% 的候选格并列为 0、只由另两个分量分胜负。故 ② 那个
+        ``+0.2183%`` 不能直接读作本实现的预期——它是**这一项有方向性**的证据，不是这一个
+        函数形式的读数。④ 的对照会照出差别；若结果不理想，未截的原始形式是第一个该试的变体。
+
+    排序因子从 :func:`~mbt.signals.factors.j_oversold` 换下来之后，J 值**只剩门槛**
+    （``j_max``）这一个作用：因子排序、过滤器取舍，两者分工不同。``j_oversold`` 本身仍
+    留在信号层（公开、有测试），只是不再被这条规则使用——与
+    :func:`~mbt.signals.factors.yellow_proximity` 的处置相同。
 
     .. note::
 
         **「内含」与「横盘串」的定义见** :func:`~mbt.signals.filters.no_contained_run`：
         当天的**收盘价**落在**前一根**的 ``[最低价, 最高价]`` 之内。连续 ``contained_days``
         根及以上这样的 K 线意味着价格在原地震荡——既创不出新高、也砸不出新低，那说明这段
-        「回调」其实是横盘而不是回调。取 ``[峰值+1, 当根]`` 为范围（与「位置」「量能」同一段
-        边界）。
+        「回调」其实是横盘而不是回调。取 ``[峰值+1, 当根]`` 为范围（与「位置」「量能」同
+        一处边界）。
 
     .. note::
 
@@ -661,10 +760,11 @@ def b1_screen(
 
     .. warning::
 
-        **排序因子换成 J 之后，「盈亏比」就只剩过滤这一个作用了。** 而 ``top_n=None``
+        **排序因子换成形态分数之后，「盈亏比」就只剩过滤这一个作用了。** 而 ``top_n=None``
         （默认，「本金不限」）意味着每个合格标的都买一份——那时排序因子对买入**没有影响**，
         只在给了 ``top_n`` 时才决定「取哪 N 只」。这是两条独立的旋钮，不要指望改排序会
-        改变不限额下的结果。
+        改变不限额下的结果。**回测走的就是不限额那条路**，故 ④ 的对照必须先给 ``top_n``，
+        否则新旧两个因子会跑出逐笔完全相同的结果。
 
     .. warning::
 
@@ -674,22 +774,50 @@ def b1_screen(
 
     .. note::
 
-        :func:`~mbt.signals.swings.swings` 在这里被算了**两次**（「位置」与「量能」各一次，
-        外加两次过滤器调用各自的份）。盈亏比不再需要摆动点，故从四次降到两次。
+        :func:`~mbt.signals.swings.swings` 与 :func:`~mbt.signals.volume_pattern` 在这里各
+        只算**一次**：``Screen.apply`` 把**同一个**面板对象依次递给每条过滤器与每个因子
+        （``as_of`` 为空时它原样返回），故这两项可以按面板对象记住。这不是精致化——
+        ``volume_pattern`` 全市场约 59 秒而三个分量要用到它 3 次，``swings`` 约 33 秒而要用
+        到 3 次（「位置」「量能」「调整期横盘」）。重算几遍会把每次选股多拖几分钟，而结果
+        逐位相同。
+
+        （这道「量能」门走的是另一个函数 :func:`~mbt.signals.volume_contraction`，它内部
+        自算一遍 :func:`~mbt.signals.volume_structure`，**不复用**上面那份 ``volume_pattern``
+        ——两者口径不同、不可互换，见 ADR-0012。故门那一项的耗时是它自己的，实测全市场约
+        315 秒，比记一次 ``volume_pattern`` 贵得多；这是退回旧口径的代价之一。）
     """
     from mbt.data.valuation import PE, PE_PERCENTILE
     from mbt.signals import (
         above_yellow,
         j_below,
-        j_oversold,
         no_contained_run,
         pullback_after_advance,
         swings,
         volume_contraction,
+        volume_pattern,
         white_above_yellow,
     )
 
     windows = tuple(yellow_windows)
+
+    #: `Screen.apply` 递下来的面板在同一次调用里是**同一个对象**（见上面那条注记），故中间量
+    #: 按对象本身记住。缓存按 ``is`` 认而不是按 ``id``：``id`` 会在旧面板被回收后指到新对象上。
+    anchors_cache: dict[str, object] = {}
+    pattern_cache: dict[str, object] = {}
+
+    def anchors_of(panel):
+        if anchors_cache.get("panel") is not panel:
+            anchors_cache["panel"] = panel
+            anchors_cache["value"] = swings(panel["close"], retracement=retracement)
+        return anchors_cache["value"]
+
+    def pattern_of(panel):
+        if pattern_cache.get("panel") is not panel:
+            pattern_cache["panel"] = panel
+            pattern_cache["value"] = volume_pattern(
+                panel, anchors_of(panel), base_bars=volume_base_bars, atr_n=atr_n
+            )
+        return pattern_cache["value"]
 
     def trend(panel):
         return white_above_yellow(panel["close"], white_n, windows)
@@ -712,9 +840,12 @@ def b1_screen(
         return j_below(panel, j_max, kdj_n, kdj_m1, kdj_m2)
 
     def volume(panel):
+        # 门按**旧口径**（A 版）算：`volume_contraction` 的两半同时成立，即放量**且**缩量。
+        # ③ 曾换成新口径的 `surge_vs_base`（并去掉缩量那半条），④ 量出那处连带改动单独值
+        # −7.53 pt 且无独立证据，故退回。理由见函数 docstring 里那条注记。
         return volume_contraction(
             panel["volume"],
-            swings(panel["close"], retracement=retracement),
+            anchors_of(panel),
             edge_bars=volume_edge_bars,
             base_bars=volume_base_bars,
             min_surge=min_surge,
@@ -722,9 +853,7 @@ def b1_screen(
         )
 
     def no_flat_pullback(panel):
-        return no_contained_run(
-            panel, swings(panel["close"], retracement=retracement), days=contained_days
-        )
+        return no_contained_run(panel, anchors_of(panel), days=contained_days)
 
     def profitable(panel):
         return _valuation_field(panel, PE) > pe_above
@@ -732,8 +861,18 @@ def b1_screen(
     def cheap(panel):
         return _valuation_field(panel, PE_PERCENTILE) < percentile_below
 
-    def oversold(panel):
-        return j_oversold(panel, kdj_n, kdj_m1, kdj_m2)
+    # 三个分量都「越小越好」，而因子契约是「越大越靠前」，故一律**取负**。取负之后
+    # ``normalize="rank"`` 会把负值转成百分位，方向就统一了；不必各自手写换标度。
+    def top_calm(panel):
+        return -pattern_of(panel).top_calm
+
+    def pullback_shrink(panel):
+        return -pattern_of(panel).pullback_vs_advance
+
+    def top_shadow(panel):
+        # 「长上影扣分」是**门槛式**的：只有超过 ``shadow_threshold`` 的那部分才算扣分。
+        # ``np.maximum`` 会把缺失原样留下（不会把 NaN 变成 0）——缺失不是「没有上影」。
+        return -np.maximum(0.0, pattern_of(panel).top_shadow_atr - shadow_threshold)
 
     return Screen(
         filters=(
@@ -746,7 +885,9 @@ def b1_screen(
             profitable,
             cheap,
         ),
-        factor=oversold,
+        factors=(top_calm, pullback_shrink, top_shadow),
+        weights=(1.0, 1.0, 1.0),
+        normalize="rank",
         top_n=top_n,
     )
 

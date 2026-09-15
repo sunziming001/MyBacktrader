@@ -57,6 +57,26 @@ def volume_columns(frame):
     )
 
 
+def pattern_columns(panel):
+    """形态读数的四条并成一张表，好让判据**一次盖住全部四条**。
+
+    ``top_after_peak`` 不并进来：它不参与打分，且它的**缺失格局与其余四条不同**（上涨段
+    只有顶部那根时它仍有值，而那时 ``top_calm`` / ``pullback_vs_advance`` 都没有分母）。
+    并进来会让「四条的缺失必须同步」这个判据在两种格局之间反复，而不是钉住它。
+    """
+    anchors = signals.swings(panel["close"], retracement=0.05)
+    pattern = signals.volume_pattern(panel, anchors, base_bars=2, atr_n=3)
+    return pd.concat(
+        {
+            "surge_vs_base": pattern.surge_vs_base,
+            "top_calm": pattern.top_calm,
+            "pullback_vs_advance": pattern.pullback_vs_advance,
+            "top_shadow_atr": pattern.top_shadow_atr,
+        },
+        axis=1,
+    )
+
+
 #: 取**标的宽表**的信号（``DataFrame → DataFrame``）。
 SYMBOL_FRAME_SIGNALS = [
     ("sma", lambda frame: signals.sma(frame, n=3)),
@@ -128,12 +148,13 @@ PANEL_SIGNALS = [
         ),
     ),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
+    ("volume_pattern", pattern_columns),
 ]
 
 #: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /
-#: 三个量能比值），本身不产生数值序列，故没有可截断重算的「输出」——分别由上面的
-#: ``kdj`` / ``swings`` / ``volume_structure`` 条目一并覆盖。
-NON_SIGNAL_EXPORTS = {"KDJ", "Swings", "VolumeStructure"}
+#: 四+五条量能读数），本身不产生数值序列，故没有可截断重算的「输出」——分别由上面的
+#: ``kdj`` / ``swings`` / ``volume_structure`` / ``volume_pattern`` 条目一并覆盖。
+NON_SIGNAL_EXPORTS = {"KDJ", "Swings", "VolumePattern", "VolumeStructure"}
 
 #: 八根 K 线、两个标的，含一处停牌造成的缺失——缺失正是因果性最容易出错的地方。
 SYMBOL_FRAME_VALUES = {
@@ -152,12 +173,15 @@ PANEL_VALUES = {
         "sz000001": [19.5, 18.5, 17.5, 18.5, float("nan"), 20.5, 21.5, 22.5],
     },
     "close": SYMBOL_FRAME_VALUES,
+    "open": {
+        "sh600000": [10.2, 10.8, float("nan"), 13.2, 12.2, 14.2, 15.2, 14.2],
+        "sz000001": [20.2, 19.2, 18.2, 19.2, float("nan"), 21.2, 22.2, 23.2],
+    },
+    "volume": {
+        "sh600000": [1000.0, 1100.0, float("nan"), 1300.0, 900.0, 1500.0, 1600.0, 1200.0],
+        "sz000001": [2000.0, 1900.0, 1800.0, 1900.0, float("nan"), 2100.0, 2200.0, 2300.0],
+    },
 }
-
-#: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /
-#: 三个量能比值），本身不产生数值序列，故没有可截断重算的「输出」——分别由上面的
-#: ``kdj`` / ``swings`` / ``volume_structure`` 条目一并覆盖。
-NON_SIGNAL_EXPORTS = {"KDJ", "Swings", "VolumeStructure"}
 
 
 def test_every_public_signal_is_covered_here():

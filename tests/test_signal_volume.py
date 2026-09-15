@@ -9,7 +9,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from mbt.signals import Swings, volume_contraction, volume_structure
+from mbt.data import Panel
+from mbt.signals import Swings, atr, volume_contraction, volume_pattern, volume_structure
 
 # 价格：前 8 根平在 10，随后 10→9→8→9→10→11→12→10.5（回撤阈值 10%）。
 # 状态机：index 10 处 8 跌破 10×0.9 确认下跌腿；index 11 处 9 涨过 8×1.1=8.8 确认低点 8；
@@ -478,3 +479,354 @@ def test_volume_contraction_judges_the_spike_referenced_ratio(symbol_frame):
 
     assert bool(fires(0.10)) is True, "0.08 <= 0.10，看的是爆量口径"
     assert bool(fires(0.07)) is False, "0.08 > 0.07，收紧就该挡住——证明上一条不是恒真"
+
+
+# --- 新口径（ADR-0012）的形态读数 -------------------------------------------------------
+#
+# 这一组盯两件事，缺一不可：
+#
+# 1. **口径**——顶部是「最高价那根」而不是收盘口径峰值、分母是「上涨段除去顶部那根」、
+#    影取正值。这些只有**手算**能钉住，故第一组样本刻意做成整数、且让最高价那根落在
+#    收盘口径峰值**之前**一根（两个口径分叉的情形，正是新口径改的那一处）。
+# 2. **那三处省时间的手法**——列优先的「上一次窗口」缓存、顶部那根的行进 argmax、
+#    顶部取值的花式索引。这些手算钉不住（手算样本只有十根、一条列），故另写一份
+#    **朴素到不可能优化错**的实现，在各自相位的波浪行情上逐格对。
+
+# 最高价那根在 index 5（12.0），收盘口径峰值在 index 6——两个口径**分叉**。
+HAND_CLOSE = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 9.0, 8.0, 7.5]
+HAND_OPEN = [4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 8.5, 7.5, 7.0]
+HAND_HIGH = [5.2, 6.2, 7.2, 8.2, 9.2, 12.0, 11.5, 9.2, 8.5, 8.0]
+HAND_LOW = [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 8.0, 7.0, 6.5]
+HAND_VOLUME = [10.0, 20.0, 30.0, 40.0, 50.0, 100.0, 60.0, 30.0, 20.0, 10.0]
+
+
+def hand_pattern_panel(panel):
+    """十根**可手算**的样本，OHLC 合法且上下影各不等。"""
+    return panel(
+        {
+            "open": {"sh600000": HAND_OPEN},
+            "high": {"sh600000": HAND_HIGH},
+            "low": {"sh600000": HAND_LOW},
+            "close": {"sh600000": HAND_CLOSE},
+            "volume": {"sh600000": HAND_VOLUME},
+        }
+    )
+
+
+def hand_anchors(symbol_frame):
+    """手工敲定的拐点：``T = 3``、收盘口径峰值 ``P = 6``，峰值确认（第 6 根）之前一律缺失。
+
+    刻意手工构造而不是跑 ``swings``：这条测试要钉的是**读数的口径**，把摆动识别也拉进来
+    只会让失败时看不出是哪一层错了。价格列本函数不读，故留缺失。
+    """
+    blank = [float("nan")] * 6
+    return Swings(
+        peak_price=symbol_frame({"sh600000": [float("nan")] * 10}),
+        peak_age=symbol_frame({"sh600000": blank + [0.0, 1.0, 2.0, 3.0]}),
+        trough_price=symbol_frame({"sh600000": [float("nan")] * 10}),
+        trough_age=symbol_frame({"sh600000": blank + [3.0, 4.0, 5.0, 6.0]}),
+    )
+
+
+def test_the_pattern_readings_match_the_hand_computed_ratios(symbol_frame, panel):
+    """第 9 根上四条读数逐一手算锁定。
+
+    ``T = 3``、``P = 6``、顶部那根 = 5（最高价 12.0）、``R = max(P, 顶) = 6``、
+    ``S = 9``，``base_bars = 2``：
+
+    - 起涨前基准 ``[1,2]`` = 20、30 → 均值 25
+    - 上涨段 ``[3,6]`` = 40、50、100、60 → 最大 100
+    - 上涨段除去顶部那根 = 40、50、**60** → 最大 60、均值 50
+    - 回调段 ``[7,9]`` = 30、20、10 → 均值 20
+    - 顶部的影 = 12.0 − max(9.5, 10.0) = 2.0
+
+    故 ``surge = 100/25 = 4``、``top_calm = 100/60``、``pullback = 20/50 = 0.4``。
+    """
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+
+    got = volume_pattern(built, anchors, base_bars=2, atr_n=3)
+
+    symbol = "sh600000"
+    assert got.surge_vs_base[symbol].iloc[9] == pytest.approx(4.0)
+    assert got.top_calm[symbol].iloc[9] == pytest.approx(100.0 / 60.0)
+    assert got.pullback_vs_advance[symbol].iloc[9] == pytest.approx(0.4)
+    assert got.top_shadow_atr[symbol].iloc[9] == pytest.approx(2.0 / atr(built, 3)[symbol].iloc[5])
+
+
+def test_the_top_bar_is_the_highest_high_not_the_close_peak(symbol_frame, panel):
+    """「顶部」是**最高价**那根，不是收盘口径峰值——本样本里两者正好差一根。
+
+    收盘口径峰值在 index 6（收盘 11.0 是最高收盘），但最高价 12.0 在 index 5。新口径
+    取后者，且上涨段的右端取 ``max(P, 顶) ``故**不会缩短**；``top_after_peak`` 记下这个差
+    （``-1`` = 最高价那根在收盘峰值**之前**一根）。
+    """
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+
+    got = volume_pattern(built, anchors, base_bars=2, atr_n=3)
+
+    symbol = "sh600000"
+    assert got.top_after_peak[symbol].iloc[9] == pytest.approx(-1.0)
+    # 顶部那根的成交量是 100；若错把收盘峰值那根（60）当顶部，这个比值就变成 60/100。
+    assert got.top_calm[symbol].iloc[9] == pytest.approx(100.0 / 60.0)
+
+
+def test_the_shadow_is_positive_so_that_smaller_is_better(symbol_frame, panel):
+    """影取**正值**（``high − max(开, 收)``），故「越小越好」；写成反向会得到一个恒非正的数。
+
+    恒非正会让秩归一整个反过来：长上影会被当成「最好」。
+    """
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+
+    got = volume_pattern(built, anchors, base_bars=2, atr_n=3)
+
+    values = got.top_shadow_atr["sh600000"].dropna()
+    assert (values >= 0.0).all(), f"影必须非负，收到 {values.tolist()}"
+    assert values.iloc[-1] == pytest.approx(2.0 / atr(built, 3)["sh600000"].iloc[5])
+
+
+def test_the_pattern_readings_are_missing_before_the_peak_is_confirmed(symbol_frame, panel):
+    """峰值确认之前没有段，五条读数一律缺失——不因为「显然有个高点」就先报出来。"""
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+
+    got = volume_pattern(built, anchors, base_bars=2, atr_n=3)
+
+    # 回调段在第 6 根为空（`S == R`），故这一条从第 7 根起才有值。
+    for name in ("surge_vs_base", "top_calm", "top_shadow_atr", "top_after_peak"):
+        frame = getattr(got, name)["sh600000"]
+        assert frame.iloc[6:].notna().all(), f"{name} 确认之后应当有值"
+        assert frame.iloc[:6].isna().all(), f"{name} 确认之前不应当有值"
+    pullback = got.pullback_vs_advance["sh600000"]
+    assert pullback.iloc[7:].notna().all()
+    assert pullback.iloc[:7].isna().all()
+
+
+def test_the_pullback_segment_is_missing_on_the_bar_the_advance_ends(symbol_frame, panel):
+    """回调段为空（``S == R``）时只有 ``pullback_vs_advance`` 缺失，其余三条照算。
+
+    这条防的是「一段没有数据就把整格扔掉」的写法：那样第 6 根上``surge`` / ``top_calm``
+    也会跟着消失，而它们与回调段无关。
+    """
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+
+    got = volume_pattern(built, anchors, base_bars=2, atr_n=3)
+    symbol = "sh600000"
+
+    assert pd.isna(got.pullback_vs_advance[symbol].iloc[6]), "第 6 根回调段为空"
+    assert got.surge_vs_base[symbol].iloc[6] == pytest.approx(100.0 / 25.0)
+    assert got.top_calm[symbol].iloc[6] == pytest.approx(100.0 / 60.0)
+
+
+def test_the_base_window_running_off_the_start_only_costs_the_surge_ratio(symbol_frame, panel):
+    """起涨前不足 ``base_bars`` 根时，只有 ``surge_vs_base`` 缺失，其余三条照算。"""
+    built = hand_pattern_panel(panel)
+    # 把起涨点挪到 index 1（故 ``trough_age`` 从第 3 根起是 2、3、…），而 base_bars=2 要求
+    # 窗口到 [-1, 0]——跑到序列开头之外，基准算不出来。
+    blank = [float("nan")] * 3
+    ages = blank + [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    anchors = Swings(
+        peak_price=symbol_frame({"sh600000": [float("nan")] * 10}),
+        peak_age=symbol_frame({"sh600000": blank + [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}),
+        trough_price=symbol_frame({"sh600000": [float("nan")] * 10}),
+        trough_age=symbol_frame({"sh600000": ages}),
+    )
+
+    got = volume_pattern(built, anchors, base_bars=2, atr_n=3)
+    symbol = "sh600000"
+
+    assert pd.isna(got.surge_vs_base[symbol].iloc[3]), "起涨前不足 2 根，基准算不出来"
+    assert pd.notna(got.top_calm[symbol].iloc[3]), "顶部无量与基准窗口无关"
+
+
+def test_the_pattern_rejects_non_positive_windows(symbol_frame, panel):
+    """``base_bars`` / ``atr_n`` 非正应当报错，而不是算出一堆缺失让人以为「就是没值」。"""
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+
+    with pytest.raises(ValueError, match="base_bars"):
+        volume_pattern(built, anchors, base_bars=0, atr_n=3)
+    with pytest.raises(ValueError, match="atr_n"):
+        volume_pattern(built, anchors, base_bars=2, atr_n=0)
+
+
+def test_the_pattern_names_the_fields_it_is_missing(symbol_frame, panel):
+    """面板缺字段时点名缺的是哪个，而不是让它冒成一个 KeyError。"""
+    built = hand_pattern_panel(panel)
+    anchors = hand_anchors(symbol_frame)
+    thin = panel(
+        {
+            "open": {"sh600000": HAND_OPEN},
+            "close": {"sh600000": HAND_CLOSE},
+            "volume": {"sh600000": HAND_VOLUME},
+        }
+    )
+
+    with pytest.raises(ValueError, match="high"):
+        volume_pattern(thin, anchors, base_bars=2, atr_n=3)
+    assert pd.notna(volume_pattern(built, anchors, base_bars=2, atr_n=3).top_calm.iloc[9, 0])
+
+
+def test_the_pattern_rejects_anchors_from_a_different_index(symbol_frame, panel):
+    """拐点与行情不同日应当报错——对到别的日子上不会报错，只会静默算错。"""
+    built = hand_pattern_panel(panel)
+    idx = pd.to_datetime(["2024-01-03", "2024-01-02", "2024-01-04"])
+    bogus = Swings(
+        peak_price=pd.DataFrame({"sh600000": [1.0, 1.0, 1.0]}, index=idx),
+        peak_age=pd.DataFrame({"sh600000": [1.0, 1.0, 1.0]}, index=idx),
+        trough_price=pd.DataFrame({"sh600000": [1.0, 1.0, 1.0]}, index=idx),
+        trough_age=pd.DataFrame({"sh600000": [2.0, 2.0, 2.0]}, index=idx),
+    )
+
+    with pytest.raises(ValueError, match="列|索引"):
+        volume_pattern(built, bogus, base_bars=2, atr_n=3)
+
+
+def ohlcv_of(prices, volumes):
+    """把一条**收盘价**曲线撑成合法 OHLCV：开盘取上一根收盘，最高/最低在实体外留一段余量。
+
+    余量**不等**（随 i 变）是刻意的：若上下影恒定，最高价那根就会与实体最大那根重合，
+    而「顶部 = 最高价那根」与「收盘口径峰值」正是要能分开的两件事，样本必须让它们分叉。
+    """
+    import math
+
+    fields = {name: {} for name in ("open", "high", "low", "close", "volume")}
+    for symbol in prices.columns:
+        close = prices[symbol].tolist()
+        open_ = [close[0]] + close[:-1]
+        pad = [0.3 + 0.6 * math.sin(i / 2.0) ** 2 for i in range(len(close))]
+        fields["open"][symbol] = open_
+        fields["close"][symbol] = close
+        fields["high"][symbol] = [max(o, c) + p for o, c, p in zip(open_, close, pad, strict=True)]
+        fields["low"][symbol] = [
+            min(o, c) - p / 2.0 for o, c, p in zip(open_, close, pad, strict=True)
+        ]
+        fields["volume"][symbol] = volumes[symbol].tolist()
+    return fields
+
+
+def brute_force_pattern(built, anchors, *, base_bars, atr_n):
+    """**另写一遍**的朴素实现：逐格、逐窗口、不缓存、不花式索引。
+
+    它与 :func:`volume_pattern` 唯一的共同点是段边界（都取自 ``anchors``）与 ATR（都调库里的
+    :func:`atr`）——故两者一致才有意义。实现里那三处省时间的手法（列优先的「上一次窗口」
+    缓存、顶部那根的行进 argmax、顶部取值的花式索引）都会被它逮住。
+
+    刻意不写成「按位置扫一遍」：那样会和被测实现的思路撞车，撞车之后就审不出同一个错。
+    """
+    import math
+
+    import numpy as np
+
+    high = built["high"].to_numpy(dtype=float)
+    open_ = built["open"].to_numpy(dtype=float)
+    close = built["close"].to_numpy(dtype=float)
+    vol = built["volume"].to_numpy(dtype=float)
+    rows, columns = vol.shape
+    trough_age = anchors.trough_age.to_numpy(dtype=float)
+    peak_age = anchors.peak_age.to_numpy(dtype=float)
+    atr_frame = atr(built, atr_n).to_numpy(dtype=float)
+
+    names = ("surge_vs_base", "top_calm", "pullback_vs_advance", "top_shadow_atr", "top_after_peak")
+    out = {name: np.full((rows, columns), math.nan) for name in names}
+
+    for row in range(rows):
+        for column in range(columns):
+            age_trough = trough_age[row, column]
+            age_peak = peak_age[row, column]
+            if not (math.isfinite(age_trough) and math.isfinite(age_peak)):
+                continue
+            trough = int(row - age_trough)
+            peak = int(row - age_peak)
+            if trough < 0 or peak < trough:
+                continue
+            window = high[trough : row + 1, column]
+            if not np.isfinite(window).any():
+                continue
+            top = trough + int(np.nanargmax(window))
+            right = max(peak, top)
+
+            # 逐项都用最直白的窗口写法：显式构造「除去顶部那根」的那一段。
+            advance = vol[trough : right + 1, column]
+            rest = np.delete(advance, top - trough)
+            if trough - base_bars >= 0:
+                base = vol[trough - base_bars : trough, column]
+            else:
+                base = np.array([], dtype=float)
+            pull = vol[right + 1 : row + 1, column]
+
+            out["top_after_peak"][row, column] = float(top - peak)
+            base_mean = np.nanmean(base) if np.isfinite(base).any() else math.nan
+            if np.isfinite(base_mean) and base_mean > 0 and np.isfinite(advance).any():
+                out["surge_vs_base"][row, column] = np.nanmax(advance) / base_mean
+            rest_max = np.nanmax(rest) if np.isfinite(rest).any() else math.nan
+            if np.isfinite(rest_max) and rest_max > 0 and np.isfinite(vol[top, column]):
+                out["top_calm"][row, column] = vol[top, column] / rest_max
+            rest_mean = np.nanmean(rest) if np.isfinite(rest).any() else math.nan
+            pull_mean = np.nanmean(pull) if np.isfinite(pull).any() else math.nan
+            if np.isfinite(rest_mean) and rest_mean > 0 and np.isfinite(pull_mean):
+                out["pullback_vs_advance"][row, column] = pull_mean / rest_mean
+            atr_value = atr_frame[top, column]
+            if np.isfinite(atr_value) and atr_value > 0:
+                body = max(open_[top, column], close[top, column])
+                out["top_shadow_atr"][row, column] = (high[top, column] - body) / atr_value
+
+    return out
+
+
+def test_the_pattern_readings_match_a_brute_force_pass_over_every_cell(symbol_frame, panel):
+    """逐格朴素实现与库里那份优化过的实现必须处处相同。
+
+    「处处」不是客套：三处省时间的手法（列优先的窗口缓存、行进 argmax、花式索引）各自
+    只在**特定输入**下才会露馅——缓存要同一窗口连续多行不变、argmax 要顶部那根换列换段、
+    花式索引要 ``valid`` 为真却落在别的列上。各自相位的波浪行情同时给了这三类输入。
+    """
+    prices, volumes = wavy_panel(symbol_frame, symbols=4, bars=120)
+    built = panel(ohlcv_of(prices, volumes))
+    anchors = swings_of(prices, retracement=0.05)
+
+    got = volume_pattern(built, anchors, base_bars=5, atr_n=3)
+    want = brute_force_pattern(built, anchors, base_bars=5, atr_n=3)
+
+    filled = 0
+    for name in want:
+        mine = getattr(got, name)
+        pd.testing.assert_frame_equal(
+            mine,
+            pd.DataFrame(want[name], index=mine.index, columns=mine.columns),
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+            check_names=False,
+        )
+        filled += int(mine.notna().to_numpy().sum())
+
+    assert filled > 100, f"判据几乎空转：只比对了 {filled} 个有值的格子"
+
+
+def test_the_pattern_readings_never_depend_on_bars_after_the_evaluation_day(symbol_frame, panel):
+    """截断重算不变性：把输入截到第 k 根重算，前 k 根必须与全长结果逐值相同。
+
+    这条对**列优先的窗口缓存**尤其要紧：缓存键里少写一项（例如左侧窗口只按 ``T`` 记，
+    而忘了 ``顶`` 也跟着变），前 k 根的值就会取决于「第 k 根之后有没有出现过新的摆动点」——
+    那正是这类「记住上一次结果」的手法最容易漏掉未来的地方。逐列扫描的顶部 argmax 同理。
+    """
+    prices, volumes = wavy_panel(symbol_frame, symbols=3, bars=90)
+    built = panel(ohlcv_of(prices, volumes))
+    full = volume_pattern(built, swings_of(prices, retracement=0.05), base_bars=5, atr_n=3)
+
+    checked = 0
+    for k in range(1, len(prices) + 1):
+        truncated = Panel({name: built[name].iloc[:k] for name in built.field_names})
+        got = volume_pattern(
+            truncated, swings_of(prices.iloc[:k], retracement=0.05), base_bars=5, atr_n=3
+        )
+        for name in full._fields:
+            want = getattr(full, name).iloc[:k]
+            pd.testing.assert_frame_equal(getattr(got, name), want, check_exact=True)
+            checked += int(want.notna().to_numpy().sum())
+
+    assert checked > 100, f"判据几乎空转：只比对了 {checked} 个有值的格子"

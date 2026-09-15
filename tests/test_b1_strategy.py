@@ -35,19 +35,35 @@ def _strategy():
 
 
 def run(
-    make_market, make_prices, zero_cost_rules, overrides, closes=None, bars=10, symbol="sh600000"
+    make_market,
+    make_prices,
+    zero_cost_rules,
+    overrides,
+    closes=None,
+    bars=10,
+    symbol="sh600000",
+    opens=None,
+    params=None,
 ):
     """跑一次回测，返回 ``(result, index)``。
 
     信号默认全零（任何卖出规则都不触发），再由 ``overrides`` 点亮其中一条。
     价格默认恒为 10.0：这样前低止损位是 9.9、永远不会被触发，于是用例里所有卖出都只可能来自
     被点亮的那条规则——「副作用只来自它」因此是真的被隔离了。
+
+    ``opens`` 给出时把开盘价改成另一串（``make_prices`` 默认让 o == h == l == c，那样开盘价与
+    收盘价无从分辨，而「成交价取次根开盘还是收盘」正是要分辨的那件事）。``params`` 直接转给
+    策略，用来点亮 ``exit_exec`` / ``max_hold_bars`` 这类**不来自信号**的开关。
     """
     prices = make_prices(closes if closes is not None else [10.0] * bars, volume=1000)
+    if opens is not None:
+        prices = prices.copy()
+        prices["open"] = list(opens)
+        prices["high"] = [max(o, c) + 0.2 for o, c in zip(opens, prices["close"], strict=True)]
+        prices["low"] = [min(o, c) - 0.2 for o, c in zip(opens, prices["close"], strict=True)]
     index = prices.index
     fields = {name: [0.0] * len(index) for name in FIELDS}
     fields.update(overrides)
-
     signals = {
         name: pd.DataFrame({symbol: values}, index=index, dtype=float)
         for name, values in fields.items()
@@ -61,6 +77,7 @@ def run(
         universe_rules=UniverseRules(min_trading_days=0),
         screen=OPEN_GATE,
         signals=signals,
+        **(params or {}),
     )
     return result, index
 
@@ -251,3 +268,134 @@ def test_the_signal_fields_the_strategy_reads_are_exactly_these_four(
     result, _ = run(make_market, make_prices, zero_cost_rules, {}, bars=6)
 
     assert len(_buys(result)) >= 1
+    assert result.trades.columns.is_unique
+
+
+# --- 成交时点：出口取次根开盘还是收盘 -----------------------------------------
+#
+# ADR-0012 ⑥ 的 M1（「同一卖日、只改成交时段」）全部押在这一档上，故它必须被钉住。
+# 做法：把每根 K 线的开盘与收盘拉开 0.5，且让每根的价都不同——于是「成交价对应哪一根、
+# 取的是开盘还是收盘」可以从价钱本身读出来，不必去猜。
+
+#: 每根收盘 10.0 ~ 10.9、开盘一律比收盘低 0.5。故 index[3] 这根是 开盘 9.8 / 收盘 10.3。
+RISING_CLOSES = [10.0 + 0.1 * i for i in range(10)]
+RISING_OPENS = [value - 0.5 for value in RISING_CLOSES]
+
+#: 第 3 根（下标 2）点亮「最高价破白线」→ 卖单下在这一根，成交落在**次根**（下标 3）。
+WHITE_ON_BAR_TWO = {"high_above_white": [0, 0, 1, 0, 0, 0, 0, 0, 0, 0]}
+
+
+def test_the_default_exit_fills_at_the_next_bar_open(make_market, make_prices, zero_cost_rules):
+    """默认（``exit_exec="open"``）卖在**次根开盘**——这是引擎一直以来的口径，先把它钉住。"""
+    result, index = run(
+        make_market,
+        make_prices,
+        zero_cost_rules,
+        WHITE_ON_BAR_TWO,
+        closes=RISING_CLOSES,
+        opens=RISING_OPENS,
+    )
+
+    sells = _sells(result)
+    assert len(sells) == 1, f"应当恰好一笔卖出，实得 {len(sells)}"
+    assert sells.iloc[0]["date"] == index[3], "成交应落在下单次根"
+    assert sells.iloc[0]["price"] == pytest.approx(
+        RISING_OPENS[3]
+    ), "默认档是次根**开盘**价；若这里变成了收盘价，说明引擎的默认撮合口径被改了"
+
+
+def test_a_close_exit_fills_at_the_same_bar_close(make_market, make_prices, zero_cost_rules):
+    """``exit_exec="close"`` 卖在**同一根的收盘**——卖日不动、只换成交时段（ADR-0012 ⑥ 的 M1）。
+
+    两条断言缺一不可：**日期不变**证明卖日没被挪动；**价钱变成收盘**证明换的是成交时段。
+    只断言价钱的话，「卖晚一根」也能凑出同一个数。
+    """
+    result, index = run(
+        make_market,
+        make_prices,
+        zero_cost_rules,
+        WHITE_ON_BAR_TWO,
+        closes=RISING_CLOSES,
+        opens=RISING_OPENS,
+        params={"exit_exec": "close"},
+    )
+
+    sells = _sells(result)
+    assert len(sells) == 1, f"应当恰好一笔卖出，实得 {len(sells)}"
+    assert sells.iloc[0]["date"] == index[3], "卖日不该被改动——换的只是成交时段"
+    assert sells.iloc[0]["price"] == pytest.approx(
+        RISING_CLOSES[3]
+    ), "close 档应当取次根**收盘**价，而不是开盘价"
+
+
+def test_a_close_exit_leaves_the_buy_at_the_open(make_market, make_prices, zero_cost_rules):
+    """``exit_exec="close"`` **只对卖出放开**：买入仍落在次根开盘。
+
+    否则「收盘看到信号、次日开盘买入」这条时序会被一起改掉，而那会让入场价凭空变成收盘价，
+    测出来的就不再是「只换出口」这一件事。
+    """
+    result, index = run(
+        make_market,
+        make_prices,
+        zero_cost_rules,
+        WHITE_ON_BAR_TWO,
+        closes=RISING_CLOSES,
+        opens=RISING_OPENS,
+        params={"exit_exec": "close"},
+    )
+
+    buys = _buys(result)
+    assert len(buys) >= 1
+    assert buys.iloc[0]["date"] == index[1], "买入仍应落在下单次根"
+    assert buys.iloc[0]["price"] == pytest.approx(RISING_OPENS[1]), "买入仍应取次根开盘价"
+
+
+# --- 持有封顶（第四条卖出规则）------------------------------------------------
+
+
+def test_the_hold_is_capped_at_the_configured_bar(make_market, make_prices, zero_cost_rules):
+    """``max_hold_bars=2``：全零信号下也会在第 2 个可交易日成交清仓。
+
+    信号全零是关键——另三条规则都不动，故这一笔卖出**只可能**来自封顶。
+    """
+    result, index = run(
+        make_market,
+        make_prices,
+        zero_cost_rules,
+        {},
+        closes=RISING_CLOSES,
+        opens=RISING_OPENS,
+        params={"max_hold_bars": 2},
+    )
+
+    sells = _sells(result)
+    assert len(sells) >= 1, "封顶应当在没有任何信号的情况下也清仓"
+    assert (
+        sells.iloc[0]["date"] == index[3]
+    ), "第 2 个可交易日成交：建仓成交在下标 1，故封顶的卖单在下标 2 下、下标 3 成交"
+
+
+def test_a_longer_cap_pushes_the_exit_one_bar_later(make_market, make_prices, zero_cost_rules):
+    """``max_hold_bars=3`` 比 2 晚一根——封顶的口径是「第 N 个可交易日成交」，不是「N 根之后」。"""
+    result, index = run(
+        make_market,
+        make_prices,
+        zero_cost_rules,
+        {},
+        closes=RISING_CLOSES,
+        opens=RISING_OPENS,
+        params={"max_hold_bars": 3},
+    )
+
+    sells = _sells(result)
+    assert len(sells) >= 1
+    assert sells.iloc[0]["date"] == index[4]
+
+
+def test_the_cap_is_off_by_default(make_market, make_prices, zero_cost_rules, no_sells_baseline):
+    """默认 ``None``：这条规则整个不参与，全零信号下一笔都不卖。
+
+    ``no_sells_baseline`` 那条 fixture 跑的就是默认参数，这里只用它显式声明一次依赖关系，
+    免得以后有人把默认值改成某个数而这条契约悄悄失效。
+    """
+    assert len(_sells(no_sells_baseline)) == 0

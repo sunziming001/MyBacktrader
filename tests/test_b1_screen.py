@@ -1,4 +1,4 @@
-"""``b1_screen`` 的 B1 专属改动：过滤器集合与 **J 超卖排序因子**。
+"""``b1_screen`` 的 B1 专属改动：过滤器集合与**形态分数排序因子**（ADR-0012）。
 
 **为什么要另造一段合成行情。** 要证明「某一条过滤器真的在筛人」，必须先有一段**其余条都过**
 的行情，再看落点被哪一条砍掉。真实行情当不了这个底板——套件里没有行情（``realmdata`` 那一组
@@ -36,7 +36,7 @@ import pytest
 
 from examples.strategies import B1, b1_screen
 from mbt.data import Panel
-from mbt.signals import j_oversold, reward_risk_ratio, yellow_line
+from mbt.signals import j_oversold, reward_risk_ratio, swings, volume_pattern, yellow_line
 
 WINDOWS = (14, 28, 57, 114)
 
@@ -187,19 +187,72 @@ def test_the_screen_no_longer_accepts_a_reward_risk_threshold():
     assert "min_reward_risk" not in inspect.signature(b1_screen).parameters
 
 
-def test_the_ranking_factor_is_j_oversold_not_the_reward_risk_ratio(b1_setup):
-    """排序因子的**逐格取值**就是 :func:`j_oversold`（``−J``），且不是盈亏比。
+def test_the_ranking_factor_is_the_three_part_pattern_score(b1_setup):
+    """排序接的是 ADR-0012 那个**三项等权形态分数**，而不是 :func:`j_oversold`。
 
-    这里比的是数值而不是名次：名次要靠两只标的才谈得上，而因子的横向可比性已经由
-    ``tests/test_signal_factors.py`` 单独钉过。取值相同即「同一个量」，比名次更严。
+    比的是**逐格原始读数**而不是名次：三项各自的输出必须与独立算出的
+    :func:`~mbt.signals.volume_pattern` 读数（取负，上影再截门槛）逐值相同。名次怎么算、
+    权重怎么加由 ``tests/test_screen.py`` 单独钉过，这里只管**接线**。
     """
-    expected = j_oversold(b1_setup, 9, 3, 3).to_numpy()
+    screen = b1_screen()
 
-    got = b1_screen().factor(b1_setup).to_numpy()
-    assert np.allclose(got, expected, equal_nan=True), "排序因子不是 −J"
+    assert screen.factor is None, "单因子那条路不该再被用"
+    assert len(screen.factors) == 3, "形态分数是三项"
+    assert screen.weights == (1.0, 1.0, 1.0), "三项等权"
+    assert screen.normalize == "rank", "合成前要逐日秩归一"
+
+    readings = volume_pattern(
+        b1_setup, swings(b1_setup["close"], retracement=0.08), base_bars=10, atr_n=14
+    )
+    top_calm, pullback_shrink, top_shadow = screen.factors
+
+    assert np.allclose(
+        top_calm(b1_setup).to_numpy(), -readings.top_calm.to_numpy(), equal_nan=True
+    ), "第一项不是「−顶部无量」"
+    assert np.allclose(
+        pullback_shrink(b1_setup).to_numpy(),
+        -readings.pullback_vs_advance.to_numpy(),
+        equal_nan=True,
+    ), "第二项不是「−调整缩量」"
+    assert np.allclose(
+        top_shadow(b1_setup).to_numpy(),
+        -np.maximum(0.0, readings.top_shadow_atr.to_numpy() - 1.0),
+        equal_nan=True,
+    ), "第三项不是「−max(0, 影÷ATR − 1)」"
+
+    assert not np.allclose(
+        top_calm(b1_setup).to_numpy(), j_oversold(b1_setup, 9, 3, 3).to_numpy(), equal_nan=True
+    ), "排序因子不该还是 −J"
 
     ratio = reward_risk_ratio(b1_setup["close"], white_n=10, windows=WINDOWS).to_numpy()
-    assert not np.allclose(got, ratio, equal_nan=True), "排序因子不该是盈亏比"
+    assert not np.allclose(
+        top_calm(b1_setup).to_numpy(), ratio, equal_nan=True
+    ), "排序因子不该是盈亏比"
+
+
+def test_the_shadow_component_is_a_penalty_so_short_shadows_score_the_same(b1_setup):
+    """上影那一项是**门槛式扣分**：不超过门槛的候选一律记 0，故它们在成分上并列。
+
+    这条盯的是 ADR-0012 写的 ``max(0, 影÷ATR − 1)``——不是未截的 ``影÷ATR``。两者在本
+    夹具上都会出现（夹具的 ``high = close × 1.005``，故影很小、绝大多数低于门槛）。截过之后
+    「影 0.1 倍」与「影 0.9 倍」得到同一个值，而未截形态下它们不同——这正是这条能判别实现
+    的地方。
+    """
+    screen = b1_screen()
+    top_shadow = screen.factors[2]
+
+    got = top_shadow(b1_setup)
+    readings = volume_pattern(
+        b1_setup, swings(b1_setup["close"], retracement=0.08), base_bars=10, atr_n=14
+    )
+
+    # 掩码要**同时**要求「有值」：缺失处 `影 < 1.0` 也是 False。而且必须**挑出**这些格子
+    # 来比，不能用 `got.where(below)`——那会把掩码之外的格子留成 NaN，而 `NaN == 0` 为假，
+    # 于是断言会因为缺失（而不是因为没截断）变红。
+    shadow = readings.top_shadow_atr
+    below = (shadow.notna() & (shadow < 1.0)).to_numpy()
+    assert below.any(), "夹具里应当有低于门槛的上影——否则这条测不到截断"
+    assert (got.to_numpy()[below] == 0.0).all(), "门槛之下必须记 0，而不是 −影÷ATR"
 
 
 def test_the_screen_and_the_strategy_share_the_two_lines():
@@ -362,9 +415,15 @@ def test_the_contained_run_filter_is_wired_and_can_bite(b1_setup):
 
 
 def test_the_volume_filter_judges_the_pullback_against_the_spike_not_the_top(b1_setup):
-    """量能那条的**参照物**是「上涨段单日最大量」，不是「顶部段」。
+    """门是**旧口径的两半**：``surge_ratio >= 2`` **且** ``pullback_ratio <= max_pullback``，
+    后者比的是「回调段 ÷ 上涨段**单日最大量**」，不是「顶部段均量」。
 
-    为什么需要这条：夹具原来的上涨段末尾是**平的 6000**，故「顶部段均量」与「上涨段最大量」
+    **这条在 ③ 接线时被删过、由 ④ 的对照退回来**（ADR-0012）：③ 把这道门整条换成了新口径的
+    ``surge_vs_base``、并去掉缩量那半条，于是「回调再热闹也能入选」。④ 的全市场对照把那处
+    连带改动量出来是**单独 −7.53 pt**——量级是分数那一步收益（+3.01 pt）的三倍、方向相反，
+    且它本来就没有独立证据。故退回旧口径，本条随之恢复。
+
+    为什么需要它：夹具原来的上涨段末尾是**平的 6000**，故「顶部段均量」与「上涨段最大量」
     相等，两个口径给出同一个数——换参照物时全套测试没红。这里把量改成**爆量在中段、顶部反而
     安静**，两口径才分家：
 
@@ -378,8 +437,8 @@ def test_the_volume_filter_judges_the_pullback_against_the_spike_not_the_top(b1_
     相对**顶部段均量**     1200 / 1940.9       0.618       不放行
     ====================  ==================  ==========  ==============
 
-    故默认参数下**仍应入选**（判据看的是前者）。这条断言是**双向**的：收紧门槛到 0.10 之后
-    必须变空，否则它就退化成一条恒真的断言。
+    故默认参数下**仍应入选**（判据看的是前者）。两半各配一条**双向**断言——收紧哪一半都必须
+    变空，否则这一条就退化成「门没在判」而不是「门在放行」。
 
     **顶部口径为什么不在用**：它实现过、也跑过全市场对照，结果为**更差**——逐笔 8,601 → 3,145、
     收益率均值 +0.164% → +0.116%、均值/标准误 3.90 → 1.68，而被它排掉的 5,969 笔反而更好
@@ -403,9 +462,26 @@ def test_the_volume_filter_judges_the_pullback_against_the_spike_not_the_top(b1_
     fields["volume"] = pd.DataFrame({"sh600000": volume}, index=b1_setup["close"].index)
     flat = Panel(fields)
 
-    assert (
-        selected_bars(b1_screen(), flat) != []
-    ), "相对上涨最大量是 0.15 <= 0.5，该入选——若为空说明判据改看顶部段了"
+    kept = selected_bars(b1_screen(), flat)
+    assert list(kept) == list(PASSING_BARS), (
+        f"相对上涨最大量是 0.15 <= 0.5、放量 8.0 >= 2.0，两半都过，落点应为 {PASSING_BARS}，"
+        f"实际 {kept}——若为空说明判据改看顶部段了"
+    )
     assert (
         selected_bars(b1_screen(max_pullback=0.10), flat) == []
-    ), "把门槛收到 0.10 应当挡住 0.15——否则这条过滤器没在起作用"
+    ), "把缩量那半收到 0.10 应当挡住 0.15——否则缩量那半不在门里（③ 删过它）"
+    assert (
+        selected_bars(b1_screen(min_surge=9.0), flat) == []
+    ), "把放量那半收到 9.0 应当挡住 8.0——否则门根本没在判"
+
+
+def test_the_volume_gate_still_accepts_both_knobs():
+    """门的两个旋钮都还在签名里：``volume_edge_bars`` 与 ``max_pullback``。
+
+    ③ 接线时这两个参数被删掉过（门换成只看放量的新口径），④ 的对照把那处连带改动量出来是
+    单独 −7.53 pt，故退回旧口径、两个旋钮一并回来。这条盯着它们别再被删掉——**留着没人读的
+    参数**固然不好（``min_reward_risk`` 的处置），但**门自己读**它们，删掉就等于把门换了。
+    """
+    params = inspect.signature(b1_screen).parameters
+    assert "volume_edge_bars" in params, "门的「上涨段取几根」旋钮被删了——门被换过"
+    assert "max_pullback" in params, "缩量那半的旋钮被删了——门被换成只看放量的新口径了"
