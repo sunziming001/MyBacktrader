@@ -30,6 +30,7 @@ import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from mbt.data.panel import Panel
@@ -113,6 +114,13 @@ def drawdown_fields(markets, *, lookback: int = DRAWDOWN_LOOKBACK) -> dict[str, 
 FrameTransform = Callable[[Panel], pd.DataFrame]
 
 
+#: 归一方式。``"rank"``：逐日把每一项在**可交易池**内转成百分位（越大越靠前的分位）。
+#:
+#: 只有这一种，因为合成分数要解决的就一件事——把**尺度不同、方向已统一**的几项变成可相加的
+#: 东西。百分位是最不挑分布的那种做法（不假设正态、不被单根极值主导）。
+NORMALIZATIONS = ("rank",)
+
+
 @dataclass(frozen=True)
 class Screen:
     """一条选股规则：过滤器 + 排序 + 取前 N。
@@ -120,12 +128,29 @@ class Screen:
     三个部件**都可独立配置**（AC 1）：
 
     - ``filters``：若干个过滤信号，以 **AND** 组合。空元组表示「不过滤」。
-    - ``factor``：排序因子，按信号层契约**越大越靠前**。``None`` 表示不排序。
+    - ``factor`` / ``factors``：排序因子，按信号层契约**越大越靠前**。``None`` / 空元组表示不排序。
     - ``top_n``：只取前 N 名。``None`` 表示不截断。
+
+    **多因子（``factors`` + ``weights`` + ``normalize``）**：给多个因子时，本类先把它们
+    **合成一个分数**再排序，故 ``ScreenResult.scores`` 始终是**一张**宽表，下游
+    （``_keep_top``、``candidates()``）无需知道它由几项拼成。
+
+    - ``weights``：各项的权重，**必须为正**。``None`` 表示等权。刻意不允许负权重——那等于
+      给了一个反转方向的开关，而「要反向就在因子层写一个新因子」是本类的既定立场（见下）。
+    - ``normalize``：``"rank"`` 时，每一项先**逐日**在**可交易池**内转成百分位，再按权重
+      取加权平均。**多因子必须给归一**——几项尺度不同的数直接相加，加出来的东西没有含义，
+      而那不会报错。
+    - 归一按**可交易池**（``universe_mask``）算，不是按「当天通过过滤的那几格」。池外的高分
+      不该把池内的分位往下压；这也是归一放在**本类**而不是写成闭包因子的原因之一：
+      只有本类在那一刻手上有股票池掩码。
+
+    **缺失**：某项缺失时该项的百分位记 0（最差），故一个缺项的标的**不会**被排除，只是排在
+    后面；三项**全缺**才留下缺失（于是被排除，与下面的既定纪律一致）。
 
     **不提供反转方向的开关**：因子一律「越大越靠前」，这是信号层的既定契约（``distance_to_high``
     特意定义成「接近程度」而非「回撤幅度」，就是为了让所有因子同向）。给一个反转开关会让那条
-    约定形同虚设，于是每个因子又得各自交代方向。要反向就在因子层写一个新因子。
+    约定形同虚设，于是每个因子又得各自交代方向。要反向就在因子层写一个新因子——本类只提供
+    权重，且权重为正，就是这条立场的执行。
 
     **不管持仓**：规则回答「今天买哪些」，不回答「买多少」，也不知道你已经持有什么——
     「重复的要不要跳过」归策略与引擎（``max_positions``、sizer）。持仓是路径依赖的运行时
@@ -134,6 +159,9 @@ class Screen:
 
     filters: tuple[FrameTransform, ...] = ()
     factor: FrameTransform | None = None
+    factors: tuple[FrameTransform, ...] = ()
+    weights: tuple[float, ...] | None = None
+    normalize: str | None = None
     top_n: int | None = None
 
     def apply(
@@ -175,7 +203,7 @@ class Screen:
                 这些都在**这里**校验而非构造时，因为 dataclass 是公开可直接构造的，而它的
                 合法性取决于运行时拿到的面板。
         """
-        if self.top_n is not None and self.factor is None:
+        if self.top_n is not None and self.factor is None and not self.factors:
             raise ValueError(
                 "给了 top_n 就必须有排序因子：没有排序就无从谈「前 N 名」。"
                 "要按代码顺序取前 N 请显式给一个因子，不要指望默认顺序。"
@@ -183,12 +211,21 @@ class Screen:
         if self.top_n is not None and self.top_n < 1:
             raise ValueError(f"top_n 至少为 1，收到 {self.top_n}")
 
+        parts = self._score_parts()
+
         working = _truncate(panel, as_of)
         index, columns = _shape_of(working)
 
         if universe_mask is not None and as_of is not None:
             # 掩码要跟着面板一起截，否则形状必然对不上——面板截了、掩码没截。
             universe_mask = universe_mask.loc[: _timestamp(as_of, "评估日")]
+        # **先归一掩码**，因为归一要用它当排名池（见类文档）。挪到这里而不是留在最后：
+        # 同一个掩码被用两次（排名池、与选股结果取交），两处必须是同一份对齐过的对象。
+        universe = (
+            _align(universe_mask, index, columns, "股票池掩码")
+            if universe_mask is not None
+            else None
+        )
 
         selected = pd.DataFrame(True, index=index, columns=columns)
         for i, one_filter in enumerate(self.filters):
@@ -206,25 +243,89 @@ class Screen:
             selected &= out
 
         scores = pd.DataFrame()
-        if self.factor is not None:
-            if progress is not None:
-                progress.stage(f"排序因子：{_part_name(self.factor)}")
-            scores = _validate(self.factor(working), index, columns, "排序因子")
-            if scores.dtypes.map(lambda dtype: dtype.kind != "f").any():
-                raise ValueError(
-                    "排序因子返回的不是浮点数——因子要能横向比较大小，布尔答不了「谁更靠前」。"
+        if parts:
+            raws = []
+            for position, (one_factor, _) in enumerate(parts, start=1):
+                if progress is not None:
+                    suffix = "" if len(parts) == 1 else f" {position}/{len(parts)}"
+                    progress.stage(f"排序因子{suffix}：{_part_name(one_factor)}")
+                out = _validate(
+                    one_factor(working), index, columns, f"第 {position} 个排序因子"
                 )
+                if out.dtypes.map(lambda dtype: dtype.kind != "f").any():
+                    raise ValueError(
+                        "排序因子返回的不是浮点数——因子要能横向比较大小，布尔答不了"
+                        "「谁更靠前」。"
+                    )
+                raws.append(out)
+
+            scores = _combine(raws, self.weights, self.normalize, universe)
             # 因子缺失即排除：排序未知的标的不参与取前 N，也不该因为「不知道」而被当成合格。
-            # 与过滤器「缺失取 False」同一精神。
+            # 与过滤器「缺失取 False」同一精神。（合成分数在**全部**项都缺失时才留缺失，
+            # 只缺一项的按最差分位参与排名，见类文档。）
             selected &= scores.notna()
 
-        if universe_mask is not None:
-            selected &= _align(universe_mask, index, columns, "股票池掩码")
+        if universe is not None:
+            selected &= universe
 
         if self.top_n is not None:
             selected = _keep_top(selected, scores, self.top_n)
 
         return ScreenResult(selected=selected, scores=scores)
+
+    def _score_parts(self) -> tuple[tuple[FrameTransform, float], ...]:
+        """把 ``factor`` / ``factors`` 两种写法归一成「(因子, 权重)」序列，并校验组合。"""
+        if self.factor is not None and self.factors:
+            raise ValueError(
+                "factor 与 factors 只能给一个：前者是单项的简写，后者是多因子。"
+                "两个都给时该以谁为准没有正确答案，故不猜。"
+            )
+
+        if self.factor is not None:
+            parts = ((self.factor, 1.0),)
+        else:
+            parts = tuple((one, 1.0) for one in self.factors)
+
+        if not parts:
+            if self.weights or self.normalize:
+                raise ValueError(
+                    "给了 weights / normalize 却没有给因子：没有可加权的对象。"
+                )
+            return ()
+
+        if self.weights is None:
+            parts = tuple((one, 1.0 / len(parts)) for one, _ in parts)
+        else:
+            if len(self.weights) != len(parts):
+                raise ValueError(
+                    f"weights 有 {len(self.weights)} 个而因子有 {len(parts)} 个——"
+                    f"对不上时每一项该拿哪个权重没有正确答案，故不猜。"
+                )
+            for weight in self.weights:
+                if not isinstance(weight, int | float) or weight != weight:
+                    raise ValueError(f"权重必须是数字，收到 {weight!r}")
+                if weight <= 0:
+                    raise ValueError(
+                        f"权重必须为正，收到 {weight!r}——负权重等于一个反转方向的开关，"
+                        f"而「要反向就在因子层写一个新因子」是本类的既定立场。"
+                    )
+            total = float(sum(self.weights))
+            parts = tuple(
+                (one, float(weight) / total)
+                for (one, _), weight in zip(parts, self.weights, strict=True)
+            )
+
+        if self.normalize is not None and self.normalize not in NORMALIZATIONS:
+            raise ValueError(
+                f"不认识的归一方式 {self.normalize!r}，只有 {NORMALIZATIONS}——"
+                f"静默忽略它会让「几项直接相加」这种没有含义的算法悄悄通过。"
+            )
+        if len(parts) > 1 and self.normalize is None:
+            raise ValueError(
+                "多个因子必须给 normalize：几项尺度不同的数直接相加，加出来的东西没有含义，"
+                "而那不会报错。"
+            )
+        return parts
 
 
 @dataclass(frozen=True)
@@ -417,6 +518,60 @@ def valuation_screen(
         factor=cheapness,
         top_n=top_n,
     )
+
+
+def _combine(
+    raws: list[pd.DataFrame],
+    weights: tuple[float, ...] | None,
+    normalize: str | None,
+    universe: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """把若干个因子合成**一个**分数。
+
+    单项且未给归一 → 原样返回（故旧的 ``factor=`` 路径行为逐位不变）。
+
+    Multiple → 逐项先归一再加权平均（权重已由 :meth:`Screen._score_parts` 归一成和为 1）。
+    **归一按行（日）算，且只在 ``universe`` 为真的列之间排名**：
+    池外的高分不该把池内的分位往下压。没有 ``universe`` 时（调用方没给股票池）才退化成
+    「整张面板一起排」——那是唯一可用的池，但它与「可交易池」不是一回事，故在类文档里写明。
+    """
+    if len(raws) == 1 and normalize is None:
+        return raws[0]
+
+    parts = [_rank_percentile(one, universe) for one in raws]
+
+    if weights is None:
+        share = 1.0 / len(parts)
+        shares = [share] * len(parts)
+    else:
+        total = float(sum(weights))
+        shares = [float(weight) / total for weight in weights]
+
+    combined = parts[0] * shares[0]
+    for one, share in zip(parts[1:], shares[1:], strict=True):
+        combined = combined + one * share
+
+    # 全部项都缺 → 留缺失（于是被排除）。只缺一项的，那一项记 0（最差），照常参与排名。
+    everything_missing = raws[0].isna()
+    for one in raws[1:]:
+        everything_missing &= one.isna()
+    return combined.where(~everything_missing)
+
+
+def _rank_percentile(frame: pd.DataFrame, universe: pd.DataFrame | None) -> pd.DataFrame:
+    """逐日在池内把因子转成百分位（越大越靠前，落在 (0, 1]）；缺失记 0。
+
+    用**升序** ``rank`` 再除以当天的有效个数：升序名次越大 ⇒ 因子值越大 ⇒ 分位越接近 1，
+    于是「越大越靠前」这条契约在归一之后仍然成立（归一不能顺手把方向翻掉）。
+    """
+    pool = frame if universe is None else frame.where(universe)
+    ranks = pool.rank(axis=1, ascending=True)
+    counts = pool.notna().sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        percentiles = ranks.div(counts.replace(0, np.nan), axis=0)
+    # 缺失（含当天池内一个有效值都没有）记 0 = 最差。故意不用「中性值」：中性会让「不知道」
+    # 与「看得清但一般」等价，而缺失是不知道，按 ADR-0005 的纪律不该给乐观答案。
+    return percentiles.fillna(0.0)
 
 
 def _truncate(panel: Panel, as_of) -> Panel:
