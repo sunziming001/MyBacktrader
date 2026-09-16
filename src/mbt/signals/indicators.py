@@ -40,7 +40,8 @@ def _smooth_frame(prices: pd.DataFrame, alpha: float) -> pd.DataFrame:
     在最后一两个 ULP 上不同：实测最大相对差 **4.7e-16**（白线）、**3.6e-16**（单层 EMA），
     而 B1 的 ``trend`` 门（白线 > 黄线）在 285,768 格上**零翻转**、``low_j`` 门亦零翻转
     （见 ``.scratch/smooth_dump_or_compare.py``）。这是**接受**的：递推给的是同一序列，
-    差在浮点舍入，而判据是「比大小」不是「逐位比对」。
+    差在浮点舍入，而判据是「比大小」不是「逐位比对」——**接受它的必要条件**是判据零翻转，
+    该取舍见 ``docs/adr/0015-recursive-indicators-vectorize-with-ulp-drift.md``。
 
     .. note::
 
