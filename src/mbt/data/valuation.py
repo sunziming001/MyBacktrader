@@ -282,10 +282,14 @@ def build_valuation(
     if window < 1:
         raise ValueError(f"窗口至少为 1，收到 {window}")
 
-    shares = _point_in_time_frame(close, financials, "total_shares")
-    ttm = _point_in_time_frame(close, financials, "profit_ttm")
-    growth = _point_in_time_frame(close, financials, "growth_ytd")
-    equity = _point_in_time_frame(close, financials, "equity")
+    # **一次**把四个字段铺出来（装载一次、每标的取记录一次），理由见 `_point_in_time_fields`。
+    point_in_time = _point_in_time_fields(
+        close, financials, ("total_shares", "profit_ttm", "growth_ytd", "equity")
+    )
+    shares = point_in_time["total_shares"]
+    ttm = point_in_time["profit_ttm"]
+    growth = point_in_time["growth_ytd"]
+    equity = point_in_time["equity"]
 
     pe = price_earnings_ratio(close, shares, ttm)
     return Valuation(
@@ -303,17 +307,76 @@ def _point_in_time_frame(close: pd.DataFrame, financials, field: str) -> pd.Data
 
     公告之前的交易日是**缺失**（那时还不知道），而不是 0——给 0 会让 PE 变成无穷大或 0，
     属于凭空造数。
+
+    这是 :func:`_point_in_time_fields` 的单字段薄封装，留给「只要一个字段」的调用方。
     """
-    out = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
-    for symbol in close.columns:
-        steps = sorted(
-            (record.announcement_date, record.values[field])
-            for record in financials.records(symbol)
-            if record.usable
+    return _point_in_time_fields(close, financials, (field,))[field]
+
+
+def _point_in_time_fields(close: pd.DataFrame, financials, fields) -> dict[str, pd.DataFrame]:
+    """把**多个**财务字段一次铺成与 ``close`` 同形的逐日序列。
+
+    存在的理由只有一条，但它是分钟量级的：**一遍顶四遍**。原先是四个字段各调一次
+    :func:`_point_in_time_frame`，于是「装载（含目录指纹）+ 取标的记录 + 铺到交易日」这一整套
+    对每个字段各跑一遍。实测（2026-09-17，401 标的 × 7,125 交易日）本函数所在的
+    ``build_valuation`` 里：
+
+    ==========================================  =======  ======
+    子步骤                                        用时     占比
+    ==========================================  =======  ======
+    目录指纹（``_load`` 里的 glob + 147 个 stat）   5.86s     40%
+    ``records()``（含上面的指纹）                   3.35s     23%
+    ``_point_in_time``（真正在铺数据）              3.48s     24%
+    ``build_valuation`` 整体                       14.74s   100%
+    ==========================================  =======  ======
+
+    三个都只该发生**一次**。故这里：装载一次（``financials.tables()``）、每个标的取一次记录
+    （``records(symbol, tables=...)``）、再对多个字段各铺一次。
+
+    参数:
+        close: **date × 标的** 的收盘价标的宽表（只用来定形状与索引，值不参与）。
+        financials: 提供 ``records(symbol, *, tables=)`` 与 ``tables()`` 的对象
+            （如 :class:`~mbt.data.fundamental.CwDataSource`）。
+        fields: 要铺的字段名。
+
+    返回:
+        ``{字段: DataFrame}``，各帧与 ``close`` 的索引、列完全一致。
+    """
+    if not isinstance(close.index, pd.DatetimeIndex):
+        raise MarketDataError(
+            f"收盘价的索引必须是 DatetimeIndex，收到 {type(close.index).__name__}"
         )
-        if steps:
-            out[symbol] = _point_in_time(steps, close.index)
-    return out
+    if not close.index.is_monotonic_increasing:
+        raise MarketDataError("收盘价的索引必须升序——按公告日点取依赖有序索引")
+
+    wanted = tuple(fields)
+    rows, width = close.shape
+    out = {field: np.full((rows, width), np.nan) for field in wanted}
+
+    # **本模块对 ``financials`` 的依赖仍是「一个方法」**：``records(symbol)``。``tables()`` 是
+    # 可选的加速口——真实数据源（``CwDataSource``）有它，于是装载与目录指纹只算一次；而只在
+    # 测试里存在的极小鸭子类型（见 ``tests/test_valuation.py`` 的 ``FakeFinancials``）没有它，
+    # 照旧走逐标的 ``records(symbol)``。不为了省时间把依赖面撑大。
+    tables = financials.tables() if hasattr(financials, "tables") else None
+    for position, symbol in enumerate(close.columns):
+        records = (
+            financials.records(symbol, tables=tables)
+            if tables is not None
+            else financials.records(symbol)
+        )
+        for field in wanted:
+            steps = sorted(
+                (record.announcement_date, record.values[field])
+                for record in records
+                if record.usable
+            )
+            if steps:
+                out[field][:, position] = _point_in_time(steps, close.index)
+
+    return {
+        field: pd.DataFrame(values, index=close.index, columns=close.columns, dtype=float)
+        for field, values in out.items()
+    }
 
 
 def _point_in_time(steps: list[tuple[dt.date, float]], index: pd.DatetimeIndex) -> pd.Series:
