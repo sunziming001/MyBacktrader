@@ -81,6 +81,8 @@ def load_universe_data(
     skip_errors: bool = True,
     start=None,
     end=None,
+    listing_dates=None,
+    quality_bars=None,
     progress=None,
 ) -> UniverseLoad:
     """逐个标的走正门取数，把失败者与失败原因一并交出。
@@ -97,6 +99,14 @@ def load_universe_data(
             「越界检查做在哪一段」。这是**必须传对**的一项：不传就等于在整段历史上校验，
             而历史上任何一处说不清的跳空都会让整只标的被拒收——哪怕它落在你的回测之外
             （实测 5.7% 的标的是这个原因，其中九成的坏日子在 2015 之前，票据 #45）。
+        listing_dates: ``{符号: 上市日}``，透给 ``load_market_data`` 用于**豁免制度空窗**
+            （ADR-0013）：注册制下上市后前 5 个交易日不设涨跌幅，那几天的越界是制度使然。
+            实测全市场被拒的标的里 86% 的越界落在第 2~5 根，正是这一类。
+            **不给（默认）则一处都不豁免**——严格口径，改动前的行为。
+        quality_bars: **质检（稀释判定 + 越界检查）只覆盖窗口末端 N 根**（ADR-0014），
+            透给 ``load_market_data``。选股没有回测区间（``start`` 无从算起），只剩这一个
+            办法把十几年前的越界与除权判定排除在外——全市场实测因此多拒了 1,028 只（17.4%）。
+            **不给（默认）则检查覆盖整个 ``[start, end]``**，与改动前一致。
         progress: 进度上报的接收端（:class:`~mbt.progress.ProgressReporter`）。``None``
             （默认）时不输出。逐标的取数在**全市场规模下要几分钟**，而这几分钟里此前一行
             输出都没有——于是「在正常地慢」与「卡死了」从外部看一模一样（见
@@ -130,6 +140,8 @@ def load_universe_data(
                     rules=rules,
                     start=start,
                     end=end,
+                    listing_date=None if listing_dates is None else listing_dates.get(symbol),
+                    quality_bars=quality_bars,
                 )
             )
         except MarketDataError as exc:

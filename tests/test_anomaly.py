@@ -304,3 +304,112 @@ def test_limit_price_uses_decimal_half_up():
 def test_round_to_cent_is_decimal_half_up():
     assert round_to_cent(13.725) == 13.73
     assert round_to_cent(13.715) == 13.72
+
+
+# --- 上市初期不设涨跌幅的那几个交易日（ADR-0013） ---------------------------------
+
+
+@pytest.fixture
+def listing_rules(tmp_path_factory):
+    """沪主板 10% ＋ 2023-04-10 起「上市后前 5 个交易日不设涨跌幅」的自足规则表。"""
+    path = tmp_path_factory.mktemp("listing") / "rules.toml"
+    path.write_text(
+        """
+schema_version = 1
+
+[[price_limit]]
+board = "沪主板"
+effective_from = 2015-01-01
+limit = 0.10
+
+[[new_listing_no_limit]]
+board = "沪主板"
+effective_from = 2023-04-10
+days = 5
+""",
+        encoding="utf-8",
+    )
+    return RuleTable.load(path)
+
+
+#: 2024-11-07（周四）上市，到 11-14 共 6 个交易日。第 2 根与第 6 根越出 ±10% 的带。
+NEW_LISTING_BARS = {
+    "2024-11-07": (10.0, 10.5, 9.8, 10.0),  # 第 1 个交易日，收盘 10.00
+    "2024-11-08": (10.2, 14.0, 10.1, 13.0),  # 第 2 个交易日：最高 14.00 ≫ 11.00
+    "2024-11-11": (13.0, 13.6, 12.6, 13.2),  # 第 3 个交易日，带内
+    "2024-11-12": (13.2, 13.9, 12.9, 13.5),  # 第 4 个交易日，带内
+    "2024-11-13": (13.5, 14.2, 13.2, 13.8),  # 第 5 个交易日，带内
+    "2024-11-14": (13.8, 16.0, 13.7, 15.5),  # 第 6 个交易日：最高 16.00 ≫ 15.18
+}
+
+
+def test_listing_date_exempts_only_the_first_five_trading_days(listing_rules):
+    """给了上市日，则**上市后前 5 个交易日**的越界不算异常，第 6 个交易日照旧算。
+
+    这条同时钉住两件事：
+
+    1. 豁免**真的在起作用**（不给上市日时有 2 处异常，给了只剩 1 处）；
+    2. 豁免**没有越界**（第 6 个交易日仍被报出——它已经在 ±10% 的制度之下）。
+    """
+    frame = bars(NEW_LISTING_BARS)
+    listing = dt.date(2024, 11, 7)
+
+    without = find_anomalies(frame, SYMBOL, listing_rules)
+    assert [a.date.isoformat() for a in without] == ["2024-11-08", "2024-11-14"]
+
+    with_listing = find_anomalies(frame, SYMBOL, listing_rules, listing_date=listing)
+    assert [a.date.isoformat() for a in with_listing] == [
+        "2024-11-14"
+    ], "前 5 个交易日该被豁免，第 6 个不该"
+
+
+def test_the_window_counts_trading_days_not_calendar_days(listing_rules):
+    """数的是**交易日**，不是日历日。
+
+    上市日 2024-11-07，若按日历日算「5 天」会到 11-12；按交易日算到 **11-13**。
+    故第 5 个交易日（11-13）必须被豁免——它是这两者的判别点。
+    """
+    frame = bars(NEW_LISTING_BARS)
+    found = find_anomalies(frame, SYMBOL, listing_rules, listing_date=dt.date(2024, 11, 7))
+    dates = [a.date.isoformat() for a in found]
+    assert "2024-11-13" not in dates, "11-13 是第 5 个交易日，日历口径会把它算在窗外"
+    assert "2024-11-14" in dates
+
+
+def test_a_listing_before_the_regime_date_gets_no_exemption(listing_rules):
+    """上市日早于制度起始日（2023-04-10）的老股**不享豁免**——窗口的键是上市日。
+
+    K 线日期可以晚于制度起始日（那是它后来的走势），但只要**上市**在那之前，
+    它当年就没有这条制度。这一条防的是「拿 K 线日期去查表」那种实现。
+    """
+    frame = bars(NEW_LISTING_BARS)
+    found = find_anomalies(frame, SYMBOL, listing_rules, listing_date=dt.date(2023, 4, 9))
+    assert [a.date.isoformat() for a in found] == ["2024-11-08", "2024-11-14"]
+
+
+def test_require_no_anomalies_honours_the_listing_date(listing_rules):
+    """报错那条路（``require_no_anomalies``）也要认上市日，否则豁免只对查询接口有效。
+
+    这正是本改动的目的：**让整只标的能被加载**，而不是让它的异常列表短一点。
+    """
+    frame = bars(NEW_LISTING_BARS)
+
+    with pytest.raises(MarketDataError):
+        require_no_anomalies(frame, SYMBOL, listing_rules)
+
+    # 给了上市日：只剩第 6 个交易日那一处，仍会报错——但报的是**真实**的那一处
+    with pytest.raises(MarketDataError) as info:
+        require_no_anomalies(frame, SYMBOL, listing_rules, listing_date=dt.date(2024, 11, 7))
+    assert "2024-11-14" in str(info.value)
+    assert "2024-11-08" not in str(info.value), "被豁免的那一天不该出现在报错里"
+
+
+def test_an_absent_listing_bar_anchors_the_window_on_the_first_available_bar(listing_rules):
+    """上市日不在序列里（本地历史被裁过）时，窗口锚在**第一个可用交易日**。
+
+    取舍：宁可少豁免几天，也不去猜「被裁掉的那几天算不算」。这里上市日给了 2024-11-04
+    （序列从 11-07 起），故窗口覆盖 11-07 ~ 11-13 这 5 根。
+    """
+    frame = bars(NEW_LISTING_BARS)
+    found = find_anomalies(frame, SYMBOL, listing_rules, listing_date=dt.date(2024, 11, 4))
+    assert [a.date.isoformat() for a in found] == ["2024-11-14"]

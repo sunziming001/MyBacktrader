@@ -243,3 +243,169 @@ def test_a_bad_bar_inside_the_window_is_still_rejected(tmp_path, gbbq_file):
             rules=LIMIT_RULES,
             start="2024-01-03",
         )
+
+
+# --- quality_bars：越界检查只看窗口末端 N 根（ADR-0014）--------------------------
+
+
+def _spike_then_calm(root, *, tail=3):
+    """造一只「开头一根无法解释的十倍跳空、其后平稳」的标的，返回 ``root``。
+
+    跳空在 **2024-01-03**（第 2 根），其后 ``tail`` 根平稳——故「最后 N 根」不含跳空，
+    而「全部历史」含。这正是 ``sh600547`` 的形态（越界在十几年前，选股只看最近）。
+    """
+    target = root / "sh" / "lday"
+    target.mkdir(parents=True)
+    records = [
+        (20240102, 1000, 1000, 1000, 1000, 0.0, 1000),
+        (20240103, 10000, 10000, 10000, 10000, 0.0, 1000),
+    ]
+    day = 4
+    for _ in range(tail):
+        records.append((20240100 + day, 10000, 10000, 10000, 10000, 0.0, 1000))
+        day += 1
+    target.joinpath("sh600000.day").write_bytes(_day_file(records))
+    return root
+
+
+def test_quality_bars_narrows_the_check_to_the_tail(tmp_path, gbbq_file):
+    """``quality_bars`` 把越界检查收窄到最后 N 根，于是**远古那根跳空不再拒收整只标的**。
+
+    构造：2024-01-03 一根十倍跳空（无事件可解释），其后 3 根平稳。不给 ``quality_bars``
+    时必须报错（ADR-0005 的纪律）；给 ``quality_bars=2`` 时检查的是最后 2 根（另往前借一根
+    作限价带基数，见 ``market._window_of`` 同一手法），跳空不在其中，标的就可用——而返回的
+    ``prices`` 仍是**完整历史**（切不切由调用方定）。
+
+    真实世界的对应物是 ``sh600547``：2006-03-31 的除权判定让它被拒，而它在 2026-09-15
+    过得了全部 8 道 B1 门。全市场实测这一类多拒了 990 只（16.8%）。
+    """
+    root = _spike_then_calm(tmp_path / "vipdoc")
+
+    with pytest.raises(MarketDataError):
+        load_market_data("sh600000", tdx_root=root, gbbq_path=gbbq_file, rules=LIMIT_RULES)
+
+    market = load_market_data(
+        "sh600000",
+        tdx_root=root,
+        gbbq_path=gbbq_file,
+        rules=LIMIT_RULES,
+        quality_bars=2,
+    )
+
+    assert len(market.prices) == 5, "返回的仍是**完整历史**，切片由调用方负责"
+    assert market.prices.index[0].date() == dt.date(2024, 1, 2)
+
+
+def test_quality_bars_still_rejects_a_bad_bar_inside_the_tail(tmp_path, gbbq_file):
+    """反过来：跳空**落在那 N 根之内**时照样报错——它不是放水开关。
+
+    同一只标的，``quality_bars=4`` 时「最近 4 根」是 [01-03 … 01-06]，跳空那根**在其中**
+    （它前面还有一根作基数），必须报错。这条与上一条成对：上一条证明收窄生效，这一条证明
+    收窄只按位置、不看别的。
+    """
+    root = _spike_then_calm(tmp_path / "vipdoc")
+
+    with pytest.raises(MarketDataError):
+        load_market_data(
+            "sh600000",
+            tdx_root=root,
+            gbbq_path=gbbq_file,
+            rules=LIMIT_RULES,
+            quality_bars=4,
+        )
+
+
+def test_quality_bars_anchors_on_the_end_not_the_data_end(tmp_path, gbbq_file):
+    """给了 ``end`` 时，那 N 根是**相对 ``end``** 的末端，不是相对数据末端。
+
+    这一条是选股能用的关键：``mbt screen`` 已经把 ``end=--as-of`` 传给取数，于是
+    ``quality_bars`` 自动变成「评估日往前 N 根」，不需要它去反推日期。
+
+    构造：跳空在 01-03，数据到 01-06 共 5 根。``end="2024-01-04"`` + ``quality_bars=2``
+    时窗口是 [01-03, 01-04]，跳空**在**其中 → 报错；而同一组参数去掉 ``end``
+    时窗口是 [01-05, 01-06] → 通过。两者只差 ``end``。
+    """
+    root = _spike_then_calm(tmp_path / "vipdoc")
+
+    with pytest.raises(MarketDataError):
+        load_market_data(
+            "sh600000",
+            tdx_root=root,
+            gbbq_path=gbbq_file,
+            rules=LIMIT_RULES,
+            end="2024-01-04",
+            quality_bars=2,
+        )
+
+    market = load_market_data(
+        "sh600000",
+        tdx_root=root,
+        gbbq_path=gbbq_file,
+        rules=LIMIT_RULES,
+        quality_bars=2,
+    )
+    assert len(market.prices) == 5
+
+
+def test_quality_bars_must_be_positive_or_none(tmp_path, gbbq_file):
+    """``0`` 与负数不是「更宽」而是无意义：``0`` 会让窗口空掉，负数会从头部切。
+
+    调用方要「不限制」就传 ``None``（CLI 那边把 ``--anomaly-bars 0`` 换成 ``None``）。
+    """
+    root = _spike_then_calm(tmp_path / "vipdoc")
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="至少为 1"):
+            load_market_data(
+                "sh600000",
+                tdx_root=root,
+                gbbq_path=gbbq_file,
+                rules=LIMIT_RULES,
+                quality_bars=bad,
+            )
+
+
+def test_quality_bars_also_narrows_the_dilution_judgment(tmp_path, gbbq_file):
+    """收窄的是**整段质检窗口**，故稀释判定也一起被收窄——这才是 ``sh600547`` 的成因。
+
+    先做「只收窄越界检查」是错的：实测 ``sh600547`` **仍被拒**，因为拦它的是
+    :func:`~mbt.data.dilution.resolve_dilution` 的稀释判定（消息是「除权事件判不动」），
+    而那一处吃的是同一个 ``window``。故本测试盯住那条路径。
+
+    构造用夹具里**真实存在**的事件：``sh600000`` 于 **2006-05-12** 每 10 股送 3 股
+    （稀释 0.30 ≥ 阈值 0.25）。前收 10.00 时两个假说各给一个带：
+
+    - 未稀释：带 [9.00, 11.00]
+    - 已稀释：参考价 10.00 ÷ 1.30 = 7.69，带 [6.92, 8.46]
+
+    当日收 8.50——**两个带都落不进**，故判定无从做出。不传 ``quality_bars`` 时它报错
+    （这正是 ``sh600547`` 收到的消息）；传 ``quality_bars=3`` 时窗口收窄到最近 4 根
+    （2026 年那几根），那条 2006 的事件落在序列之外、**不再判定**，标的就可用。
+    """
+    root = _write(
+        tmp_path,
+        "sh600000",
+        [
+            (20060511, 1000, 1000, 1000, 1000, 1.0, 1000),
+            (20060512, 850, 850, 850, 850, 1.0, 1000),  # 事件日，8.50 两个带都落不进
+            (20260909, 1000, 1000, 1000, 1000, 1.0, 1000),
+            (20260910, 1000, 1000, 1000, 1000, 1.0, 1000),
+            (20260911, 1000, 1000, 1000, 1000, 1.0, 1000),
+            (20260914, 1000, 1000, 1000, 1000, 1.0, 1000),
+            (20260915, 1000, 1000, 1000, 1000, 1.0, 1000),
+        ],
+    )
+
+    with pytest.raises(MarketDataError, match="两个假说的带都落不进"):
+        load_market_data("sh600000", tdx_root=root, gbbq_path=gbbq_file, rules=LIMIT_RULES)
+
+    market = load_market_data(
+        "sh600000",
+        tdx_root=root,
+        gbbq_path=gbbq_file,
+        rules=LIMIT_RULES,
+        quality_bars=3,
+    )
+
+    assert len(market.prices) == 7, "返回的仍是**完整历史**"
+    assert dt.date(2006, 5, 12) in market.prices.index.date

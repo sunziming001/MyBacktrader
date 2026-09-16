@@ -83,3 +83,75 @@ def test_transfer_fee_reports_whether_it_is_charged(synthetic_rules):
 def test_missing_rule_file_raises(tmp_path):
     with pytest.raises(RuleTableError, match="规则表"):
         RuleTable.load(tmp_path / "not-there.toml")
+
+
+# --- 上市初期不设涨跌幅的天数（price_limit.new_listing） --------------------------
+
+
+@pytest.fixture
+def listing_rules(tmp_path):
+    """含「新股上市初期不设涨跌幅」三档的自足规则表。
+
+    数值与出处见 ``docs/research/a-share-trading-rules.md`` 1.3：
+    科创板 2019-07-22、创业板 2020-08-24、沪深主板 2023-04-10（全面注册制首批新股上市日）
+    起，上市后**前 5 个交易日不设涨跌幅**；北交所 2021-11-15 起为上市**首日**。
+    """
+    path = tmp_path / "listing.toml"
+    path.write_text(
+        """
+schema_version = 1
+
+[[price_limit]]
+board = "沪主板"
+effective_from = 2015-01-01
+limit = 0.10
+
+[[new_listing_no_limit]]
+board = "科创板"
+effective_from = 2019-07-22
+days = 5
+
+[[new_listing_no_limit]]
+board = "沪主板"
+effective_from = 2023-04-10
+days = 5
+
+[[new_listing_no_limit]]
+board = "北交所"
+effective_from = 2021-11-15
+days = 1
+""",
+        encoding="utf-8",
+    )
+    return RuleTable.load(path)
+
+
+def test_new_listing_window_is_keyed_on_the_listing_date_not_the_bar_date(listing_rules):
+    """查表的键是**上市日**，不是成交日——这是它与本表其它参数的根本差别。
+
+    同一个板块、同一个成交日，上市日不同则窗口不同：2023-04-10 上市的有 5 天，
+    而 2023-04-09 上市的（仍是老制度）是 0 天。
+    """
+    assert listing_rules.new_listing_no_limit_days("沪主板", date(2023, 4, 10)) == 5
+    assert listing_rules.new_listing_no_limit_days("沪主板", date(2023, 4, 9)) == 0
+    assert listing_rules.new_listing_no_limit_days("沪主板", date(2026, 1, 5)) == 5
+
+
+def test_new_listing_window_does_not_leak_across_boards(listing_rules):
+    """板块之间互不串味：科创板 2019-07-22 起的窗口不该被沪主板或北交所的日期影响。"""
+    assert listing_rules.new_listing_no_limit_days("科创板", date(2019, 7, 22)) == 5
+    assert listing_rules.new_listing_no_limit_days("科创板", date(2019, 7, 21)) == 0
+    assert listing_rules.new_listing_no_limit_days("北交所", date(2021, 11, 15)) == 1
+
+
+def test_new_listing_window_returns_zero_rather_than_raising(listing_rules):
+    """**查不到适用条目时返回 0，而不是报错**——这是与 ``price_limit`` 等处的**有意差别**。
+
+    别处「查不到」意味着「我们不知道那天的制度」，故报错（ADR-0005）。这里「查不到」
+    本身就是答案：**该上市日没有这条制度**，故不豁免。把「不知道」与「没有」混成同一种
+    处置，会让早年的新股全部无法加载。
+    """
+    # 该板块整段没有条目
+    assert listing_rules.new_listing_no_limit_days("创业板", date(2026, 1, 5)) == 0
+    # 有该板块，但上市日早于最早的条目
+    assert listing_rules.new_listing_no_limit_days("沪主板", date(2001, 6, 1)) == 0

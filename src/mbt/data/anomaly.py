@@ -52,6 +52,8 @@ import datetime as dt
 from bisect import bisect_right
 from dataclasses import dataclass
 
+import pandas as pd
+
 from ..rules import PRICE_TOLERANCE, RuleTable, limit_band, round_to_cent
 from .adjust import AdjustmentEvent, combined_reference_price
 from .errors import MarketDataError
@@ -105,7 +107,9 @@ class Anomaly:
         )
 
 
-def find_anomalies(prices, symbol: str, rules: RuleTable, events=()) -> list[Anomaly]:
+def find_anomalies(
+    prices, symbol: str, rules: RuleTable, events=(), *, listing_date=None
+) -> list[Anomaly]:
     """找出价格表中所有**越出当日涨跌停带**且**无公司行为可解释**的 K 线。
 
     参数:
@@ -114,6 +118,21 @@ def find_anomalies(prices, symbol: str, rules: RuleTable, events=()) -> list[Ano
         rules: 规则表。
         events: 该标的的除权除息事件（如 ``GbbqDataSource.events(symbol)``）。
             **应传全量**——本函数自行按区间取用，传入时不必也不能预筛。
+        listing_date: 该标的的**上市日**（如 ``SecurityMasterDataSource`` 给的）。
+            给了它，则「上市初期不设涨跌幅」的那几个交易日里的越界**不算异常**——
+            那些日子本来就没有涨跌幅限制，报出来是制度空窗造成的误报（ADR-0013）。
+            不给（默认）则一处都不豁免，退回到改动前的严格口径。
+
+    .. note::
+
+        **窗口锚在「上市后第一个有 K 线的交易日」**，数的是**交易日**而非日历日。
+        上市日通常就是序列首日（本地 TDX 历史从上市起），此时两者相同；若本地历史被裁过
+        （上市日不在序列里），窗口锚在第一个可用交易日——那是**更少**的豁免，因为无法
+        判断被裁掉的那几天算不算。
+
+        本函数**不检查序列首根**（它没有前收盘价，算不出带），故「上市首日不设涨跌幅」
+        这一情形本就不会被报出；需要显式豁免的是**第 2 根及之后**——注册制下那是
+        「前 5 个交易日」的其余几天（实测：全市场被拒标的里 86% 的越界落在第 2~5 根）。
 
     返回:
         按日期升序的异常列表；无异常则为空列表。
@@ -134,10 +153,15 @@ def find_anomalies(prices, symbol: str, rules: RuleTable, events=()) -> list[Ano
     low = prices["low"].to_numpy(dtype="float64")
     close = prices["close"].to_numpy(dtype="float64")
 
+    exempt_through = _no_limit_through(index, symbol, rules, listing_date)
+
     found = []
     for i in range(1, len(index)):
         on = index[i].date()
         prev_date = index[i - 1].date()
+
+        if exempt_through is not None and on <= exempt_through:
+            continue
 
         # 限幅基数是「前收盘价经区间内权息事件折算后的参考价」。首个事件之前无成交，
         # 故跨日的多条事件必须**链式**折算（每一步的基数都不同），同日多条才可求和。
@@ -165,17 +189,44 @@ def find_anomalies(prices, symbol: str, rules: RuleTable, events=()) -> list[Ano
     return found
 
 
+def _no_limit_through(index, symbol, rules, listing_date):
+    """上市初期不设涨跌幅的**最后一个交易日**；没有豁免时返回 ``None``。
+
+    窗口长度由规则表按（板块, 上市日）给（见 :meth:`RuleTable.new_listing_no_limit_days`），
+    但**数的是交易日**：起算点是序列里第一个日期 ≥ 上市日的那一根，往后数 ``days`` 根。
+
+    为什么不起算点直接用序列首根：上市日才是制度适用的时点。序列首根通常是上市日，
+    但本地历史可能被裁过（``--start`` 或数据本来就没有），那时直接数首根会多豁免几天。
+    """
+    if listing_date is None:
+        return None
+    days = rules.new_listing_no_limit_days(rules.board_of(symbol), listing_date)
+    if days <= 0:
+        return None
+    starts_at = index.searchsorted(pd.Timestamp(listing_date), side="left")
+    last = starts_at + days - 1
+    if last >= len(index):
+        # 窗口还没走完（新股，本地只有上市后几根）——豁免到现有末端。
+        return index[-1].date()
+    return index[last].date()
+
+
 #: 报错信息里最多列出几条异常——余下只报数量，避免价格表整体错位时刷屏。
 _MAX_REPORTED = 5
 
 
-def require_no_anomalies(prices, symbol: str, rules: RuleTable, events=()) -> None:
+def require_no_anomalies(
+    prices, symbol: str, rules: RuleTable, events=(), *, listing_date=None
+) -> None:
     """价格表若含无法解释的越界跳空则**报错**，否则返回 ``None``。
 
     这是缺口纪律（ADR-0005）在本层的落点：坏数据必须让回测停下来，而不是静默算出一
     个看似合理的收益。回测因此不再「沉默接受」坏数据。
+
+    ``listing_date`` 的语义见 :func:`find_anomalies`——它豁免的是**制度空窗**，
+    不是坏数据；不认识的上市日（``None``）则一处都不豁免。
     """
-    anomalies = find_anomalies(prices, symbol, rules, events)
+    anomalies = find_anomalies(prices, symbol, rules, events, listing_date=listing_date)
     if not anomalies:
         return
     lines = [f"  - {a.describe()}" for a in anomalies[:_MAX_REPORTED]]
