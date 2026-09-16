@@ -830,3 +830,59 @@ def test_the_pattern_readings_never_depend_on_bars_after_the_evaluation_day(symb
             checked += int(want.notna().to_numpy().sum())
 
     assert checked > 100, f"判据几乎空转：只比对了 {checked} 个有值的格子"
+
+
+# --- 窗口内部的缺失：必须「跳过」，不能当 0 ------------------------------------
+
+
+def _pattern_with_pullback_volumes(symbol_frame, panel, pullback_volumes):
+    """把回调段那三根（index 7/8/9）的成交量换成给定值，其余照手算夹具。"""
+    volumes = list(HAND_VOLUME)
+    volumes[7:10] = pullback_volumes
+    built = panel(
+        {
+            "open": {"sh600000": HAND_OPEN},
+            "high": {"sh600000": HAND_HIGH},
+            "low": {"sh600000": HAND_LOW},
+            "close": {"sh600000": HAND_CLOSE},
+            "volume": {"sh600000": volumes},
+        }
+    )
+    return volume_pattern(built, hand_anchors(symbol_frame), base_bars=2, atr_n=3)
+
+
+def test_a_missing_bar_inside_the_pullback_window_is_skipped_not_counted_as_zero(
+    symbol_frame, panel
+):
+    """回调窗口**中间**缺一根时，均值按剩下的有限值算——不是把缺失当 0 计入。
+
+    手算：回调段 ``[7,9]`` 原为 30、**20**、10（均值 20）。把中间那根换成缺失之后：
+
+    - **跳过**（正确）：``(30 + 10) / 2 = 20``
+    - 当 0 计入（错误）：``(30 + 0 + 10) / 3 = 13.33``
+
+    两种处置给出不同的数，故这条断言能判别。它与 :func:`~mbt.signals.volume._finite_stats`
+    的语义一致（只统计有限值），也与本项目「缺失不是 0」的一贯口径一致。
+
+    为什么要单独钉：回调段是唯一**每格都要重算**的窗口（右端就是当前行），也是最容易被
+    换成别的求和方式的一处；换的时候「缺失怎么算」极易跟着变味。
+    """
+    got = _pattern_with_pullback_volumes(symbol_frame, panel, [30.0, float("nan"), 10.0])
+
+    assert got.pullback_vs_advance["sh600000"].iloc[9] == pytest.approx(20.0 / 50.0)
+
+
+def test_a_pullback_window_that_is_entirely_missing_gives_missing_not_zero(symbol_frame, panel):
+    """回调窗口**整段**缺失时给缺失，不给 0——给 0 会让「没有数据」看起来像「极度缩量」。
+
+    这条与上一条成对：上一条钉「部分缺失按有限值算」，这一条钉「一个有限值都没有时不编数」。
+    其余三条读数与回调段无关，故照常有值。
+    """
+    got = _pattern_with_pullback_volumes(
+        symbol_frame, panel, [float("nan"), float("nan"), float("nan")]
+    )
+
+    symbol = "sh600000"
+    assert pd.isna(got.pullback_vs_advance[symbol].iloc[9]), "整段缺失不该给 0"
+    assert got.top_calm[symbol].iloc[9] == pytest.approx(100.0 / 60.0)
+    assert got.surge_vs_base[symbol].iloc[9] == pytest.approx(4.0)

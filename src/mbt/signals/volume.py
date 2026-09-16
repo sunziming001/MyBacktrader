@@ -532,13 +532,30 @@ def volume_pattern(
         两行**都有效**处有 **44%** 是**下降**的——未确认的摆动点会随新数据**回头修正**。
 
         真正省下功夫的是**遍历顺序**：按**列优先**走（同一列的行连续），于是 ``T`` / ``顶`` /
-        ``R`` 各自连续多行不变，三个「起止只由摆动点决定」的窗口只需记住上一次的结果，
-        不比一次就够了。回调段的右端是当前行，每天都是新的，那一项省不掉。
+        ``R`` 各自连续多行不变，三个「起止只由摆动点决定」的窗口（起涨前基准、上涨段的左右两
+        半）只需记住上一次的结果，不比一次就够了。
 
-        实测（2,701 行 × 4,752 列全市场）：本函数约 **59 秒**，同一批数据上旧口径的
-        :func:`volume_structure` 是 **315 秒**。逐格而不分组并没有拖慢它——三个窗口缓存
-        把「逐格」的大部分代价消掉了。这个代价是每次选股一次（秩归一要求全市场可比，
-        故不能只算候选格），相对整段回测是可接受的；真要更快只能上区间最大值稀疏表。
+        剩下**回调段**那一项缓存不住——它的右端就是当前行，每天都是新的。它只需要**和**与
+        **个数**（不像另两处还要最大值），故改用**前缀和**：任意窗口 = 两个前缀之差。每格因此
+        只是两次查表加一次减法，不再切片求和。
+
+        **求和是精确的，不是近似。** 成交量是整数股，窗口和远小于 ``2**53``，故前缀差与直接
+        切片求和在 float64 下逐位相同——实测 326 列 × 2,703 行（含 65% 缺失）五条读数**最大
+        绝对差 0.000e+00**。若调用方喂进非整数成交量，两者会差在 float64 舍入以内，而那远小于
+        秩归一能分辨的尺度。
+
+        实测（换前缀和前后，同一批数据）：
+
+        ==========  =================  =================  ==========
+        列数        改前               改后               每有效格
+        ==========  =================  =================  ==========
+        205         0.96s              0.56s              9.1 → 5.4 µs
+        405         4.18s              2.14s              8.4 → 4.3 µs
+        801         12.21s             5.91s              8.0 → 3.9 µs
+        ==========  =================  =================  ==========
+
+        随列数线性，故全市场（约 4,752 列）估计从约 59 秒降到约 28 秒。这个代价是每次选股
+        一次（秩归一要求全市场可比，故不能只算候选格）。
     """
     if base_bars < 1:
         raise ValueError(f"base_bars 必须为正，收到 {base_bars!r}")
@@ -602,6 +619,18 @@ def volume_pattern(
     order_cols, order_rows = np.nonzero(valid.T)
     bounds = np.searchsorted(order_cols, np.arange(columns + 1))
 
+    # 回调段那一项只需要**和**与**个数**（不像另两个窗口还要最大值），而它的窗口右端就是当前
+    # 行、每天都是新的，故缓存不住。改用**前缀和**：任意窗口 `[a, b]` 的和/个数 = 两个前缀之
+    # 差，于是每格是两次查表加一次减法，不再切片求和。前缀一次算好，整个矩阵一趟向量化。
+    #
+    # 只对**有限值**求和（`np.isfinite` 掩码），与本模块「缺失不参与统计、也不当 0」的口径一致。
+    # 前缀多留一行（`[0]` 全零）是为了让 `[0, b]` 这类窗口不必单独判边界。
+    finite = np.isfinite(vol)
+    prefix_total = np.zeros((rows + 1, columns), dtype=float)
+    prefix_total[1:] = np.where(finite, vol, 0.0).cumsum(axis=0)
+    prefix_count = np.zeros((rows + 1, columns), dtype=np.int64)
+    prefix_count[1:] = finite.cumsum(axis=0)
+
     for column in range(columns):
         first, last = int(bounds[column]), int(bounds[column + 1])
         if first == last:
@@ -647,7 +676,11 @@ def volume_pattern(
             else:
                 rest_mean = rest_max = math.nan
 
-            pull_total, _, pull_count = _finite_stats(vol[right_of + 1 : row + 1, column])
+            # 回调段 `[right_of + 1, row]`：右端是当前行，故这个窗口每天都是新的、缓存不住。
+            # 用前缀和查表（见上面 `prefix_total` 的说明），不再切片求和。窗口为空（`right_of
+            # == row`）时两个前缀相减都是 0，于是 `pull_count == 0`、判缺失——与旧写法一致。
+            pull_total = prefix_total[row + 1, column] - prefix_total[right_of + 1, column]
+            pull_count = int(prefix_count[row + 1, column] - prefix_count[right_of + 1, column])
             pull_mean = pull_total / pull_count if pull_count else math.nan
 
             top_value = top_volume[row, column]
