@@ -51,6 +51,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Protocol, TextIO
 
 #: 默认的上报间隔（秒）。5 秒够密（能看出推进）又够疏（不打乱输出节奏）。
@@ -91,7 +92,15 @@ class ProgressReporter(Protocol):
         """
 
     def finish(self) -> None:
-        """本次运行结束——把最后一个阶段的用时结算出来。"""
+        """本次运行结束——把最后一个阶段的用时结算出来，并打一份耗时汇总。"""
+
+    def timing(self, name: str, seconds: float, *, note: str = "") -> None:
+        """记一段**一次性**工作的用时（如某个中间量的**首次**计算）。
+
+        与 :meth:`stage` 分开，是因为两者会**重叠**：阶段说的是「现在在哪一步」，而一次性计时
+        说的是「这一步里有一笔只发生一次的活儿，它有多贵」。混成一个序列会让人以为应当相加，
+        而那样会重复计算。理由详见 :meth:`ConsoleProgress.timing`。
+        """
 
 
 class ConsoleProgress:
@@ -141,6 +150,10 @@ class ConsoleProgress:
         self._started = 0.0
         self._done = 0
         self._last: float | None = None
+        #: 两条**分开**的账：阶段是顺序的、互不重叠；一次性计时落在某个阶段**内部**。
+        #: 混成一条会让人以为应当相加，而那样会重复计算（见 :meth:`timing`）。
+        self._stage_ledger: list[tuple[str, float]] = []
+        self._timing_ledger: list[tuple[str, float]] = []
 
     # --- 接口 ---------------------------------------------------------------
 
@@ -172,6 +185,29 @@ class ConsoleProgress:
 
     def finish(self) -> None:
         self._close()
+        self._summary()
+
+    def timing(self, name: str, seconds: float, *, note: str = "") -> None:
+        """记一段**一次性**工作的用时，并立即输出一行。
+
+        为什么要有它——**阶段账会说谎，而且是有方向地说谎**：同一个中间量（如 ``swings``）只算
+        一次、按面板缓存，之后每个部件复用；于是它的代价被记在**第一个碰到它的那个阶段**头上。
+        实测里 ``position`` 那个过滤器报 121s，其中 64.8s 是 ``swings`` 的首算；而 ``top_calm``
+        那个因子报的 88~101s 就是整次 ``volume_pattern``——它后面两个因子因为「同一次调用」而
+        几乎免费。只读阶段账会得出「position 很贵、pullback_shrink 不要钱」这类错误结论。
+
+        故这一类不与阶段相加（它落在某个阶段**内部**），只在汇总里单列，把阶段账里混在一起的
+        两笔分开。
+
+        参数:
+            name: 这段工作的名字。带上「为什么会有这一笔」更有用，例如
+                ``"swings（按面板缓存，首个用到它的部件付这一次）"``。
+            seconds: 用时（秒）。
+            note: 补一句说明。
+        """
+        self._timing_ledger.append((name, seconds))
+        suffix = f"（{note}）" if note else ""
+        self._write(f"计时：{name} 用时 {seconds:.1f}s{suffix}")
 
     # --- 内部 ---------------------------------------------------------------
 
@@ -198,12 +234,59 @@ class ConsoleProgress:
         elapsed = self._now() - self._started
         counted = f"，{self._done:,} {self._unit}" if self._done else ""
         self._write(f"阶段：{self._name} 结束，用时 {elapsed:.1f}s{counted}")
+        self._stage_ledger.append((self._name, elapsed))
         self._name = None
+
+    def _summary(self) -> None:
+        """打一份耗时汇总——**两条账分开列**，因为它们的和会重复计算。
+
+        为什么要汇总：一次全市场选股的阶段有十几个，单看那个序列很难回答「时间到底花在哪」；
+        而阶段之间的**方差**又很大（实测同一份代码的同一阶段在两次运行间能差 3 倍，系机器状态
+        所致）。汇总把每个阶段排一次序，并单列那几笔「只发生一次、却被记在某个阶段里」的活儿。
+        """
+        if not self._stage_ledger and not self._timing_ledger:
+            return
+
+        self._write("")
+        self._write("===== 耗时汇总 =====")
+        if self._stage_ledger:
+            total = sum(seconds for _, seconds in self._stage_ledger)
+            self._write(f"  阶段（互不重叠，合计 {total:.1f}s）：")
+            for name, seconds in sorted(self._stage_ledger, key=lambda kv: -kv[1]):
+                share = seconds / total * 100 if total else 0.0
+                self._write(f"    {seconds:9.1f}s  {share:5.1f}%  {name}")
+        if self._timing_ledger:
+            self._write("  一次性计时（落在上面某个阶段**内部**，故不与阶段相加）：")
+            for name, seconds in sorted(self._timing_ledger, key=lambda kv: -kv[1]):
+                self._write(f"    {seconds:9.1f}s         {name}")
+        self._write("")
 
     def _write(self, line: str) -> None:
         # **必须 flush**：stdout 重定向到文件时是块缓冲，不 flush 就只能在结束时一次看到全部
         # ——那正是这个模块要消除的「静默」。
         print(line, file=self.stream, flush=True)
+
+
+@contextmanager
+def timed(progress, name: str, *, note: str = ""):
+    """计时一段**一次性**工作并上报；:class:`ConsoleProgress` 会把它打进耗时汇总。
+
+    用法::
+
+        with timed(progress, "swings（按面板缓存，首个用到它的部件付这一次）"):
+            value = swings(...)
+
+    ``progress`` 为 ``None``、或它没有 ``timing`` 方法（测试里那种鸭子类型的假上报端）时
+    **退化为空操作**——理由与 :func:`_safe_clock` 同一条：观察手段不得给被观察的对象添麻烦，
+    更不得把它弄挂。反过来也不该静默失败，故 :class:`ConsoleProgress` 一定带 ``timing``。
+    """
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        reporter = getattr(progress, "timing", None)
+        if reporter is not None:
+            reporter(name, time.monotonic() - started, note=note)
 
 
 def _safe_clock(clock: Callable[[], object] | None) -> object | None:

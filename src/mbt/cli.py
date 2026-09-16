@@ -534,7 +534,10 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
     # **B1 到这里就够了。** 它另外两条量能过滤要的 `swings` 与 `volume_pattern` 是规则
     # 内部自算并记忆在面板对象上的（见 `mbt.screen.b1_screen`），不是外部喂进来的信号。
     if name == "b1":
-        return b1_screen(top_n=top_n), clip_fields(
+        # 把 progress 递进规则：它内部那两处**按面板缓存的一次性计算**（`swings`、
+        # `volume_pattern`）要单独记时，否则它们的代价会被算进第一个碰到它们的那个阶段里
+        # （见 `mbt.progress.timed`）。
+        return b1_screen(top_n=top_n, progress=progress), clip_fields(
             signals,
             loaded.markets,
             # 选股命令没有 --start/--end（评估日由 --as-of 承担），故用 getattr 兜底。

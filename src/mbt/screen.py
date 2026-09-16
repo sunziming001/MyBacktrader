@@ -635,6 +635,7 @@ def b1_screen(
     pe_above=0.0,
     percentile_below=0.20,
     top_n=None,
+    progress=None,
 ) -> Screen:
     """**B1 策略**的选股规则：趋势 + 价格在慢线上 + 位置 + J 值 + 量能 + 调整期形态 + 估值，
     **按形态分数**排序（ADR-0012）。
@@ -771,6 +772,7 @@ def b1_screen(
         315 秒，比记一次 ``volume_pattern`` 贵得多；这是退回旧口径的代价之一。）
     """
     from mbt.data.valuation import PE, PE_PERCENTILE
+    from mbt.progress import timed
     from mbt.signals import (
         above_yellow,
         j_below,
@@ -792,15 +794,19 @@ def b1_screen(
     def anchors_of(panel):
         if anchors_cache.get("panel") is not panel:
             anchors_cache["panel"] = panel
-            anchors_cache["value"] = swings(panel["close"], retracement=retracement)
+            # 首算（后面每个部件都复用）单独记时——它落在**第一个**用到它的阶段里，
+            # 不单列的话那一阶段的账会把它的代价算成自己的（见 `mbt.progress.timed`）。
+            with timed(progress, "swings（按面板缓存，首个用到它的部件付这一次）"):
+                anchors_cache["value"] = swings(panel["close"], retracement=retracement)
         return anchors_cache["value"]
 
     def pattern_of(panel):
         if pattern_cache.get("panel") is not panel:
             pattern_cache["panel"] = panel
-            pattern_cache["value"] = volume_pattern(
-                panel, anchors_of(panel), base_bars=volume_base_bars, atr_n=atr_n
-            )
+            with timed(progress, "volume_pattern（按面板缓存，三个因子共用这一次）"):
+                pattern_cache["value"] = volume_pattern(
+                    panel, anchors_of(panel), base_bars=volume_base_bars, atr_n=atr_n
+                )
         return pattern_cache["value"]
 
     def trend(panel):
