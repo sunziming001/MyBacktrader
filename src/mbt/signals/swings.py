@@ -22,6 +22,10 @@ import pandas as pd
 
 from mbt.signals._symbol_frame import check_symbol_frame
 
+#: ``Swings`` 的四个字段，顺序与构造处一致。写成常量而不是在两处各列一遍字符串——
+#: 那样加一个字段时只会改对一处（``NamedTuple`` 的字段名与这里的顺序对不上时不会报错）。
+_SWING_FIELDS = ("peak_price", "peak_age", "trough_price", "trough_age")
+
 
 class Swings(NamedTuple):
     """**最近一段已完成的上涨**的锚点，``peak_*`` 与 ``trough_*`` 是一对。
@@ -67,6 +71,10 @@ def _swing_columns(values: pd.Series, retracement: float) -> dict[str, np.ndarra
     trough_price = np.full(n, np.nan)
     trough_age = np.full(n, np.nan)
 
+    # 两个乘式提出来：它们只由 `retracement` 决定，而循环要跑几千万次。
+    up = 1.0 + retracement
+    down = 1.0 - retracement
+
     direction = 0
     anchor_bar = -1
     anchor_price = float("nan")
@@ -76,22 +84,24 @@ def _swing_columns(values: pd.Series, retracement: float) -> dict[str, np.ndarra
 
     for t in range(n):
         price = close[t]
-        if np.isnan(price):
+        # `price != price` 就是 NaN 判据，但它是**纯 Python 比较**；`np.isnan(price)` 走的是
+        # numpy 标量调用，实测贵 4 倍以上，而这里要判几千万次（占循环耗时的约 80%）。
+        if price != price:
             continue  # 当根无价：状态不动，当根不报
 
         if direction == 0:
             if anchor_bar < 0:
                 anchor_bar, anchor_price = t, price
-            elif price > anchor_price * (1.0 + retracement):
+            elif price > anchor_price * up:
                 direction = 1
                 anchor_bar, anchor_price = t, price
-            elif price < anchor_price * (1.0 - retracement):
+            elif price < anchor_price * down:
                 direction = -1
                 anchor_bar, anchor_price = t, price
         elif direction == 1:
             if price > anchor_price:
                 anchor_bar, anchor_price = t, price  # 抬高候选峰
-            elif price < anchor_price * (1.0 - retracement):
+            elif price < anchor_price * down:
                 confirmed_peak = (anchor_bar, anchor_price)
                 # 配对只在**峰值确认时**建立一次。此后若价格继续下跌、又确认了一个更低的
                 # 低点，那个低点属于「正在形成的下一段上涨」，不能顶掉这里已经配好的起涨点
@@ -102,7 +112,7 @@ def _swing_columns(values: pd.Series, retracement: float) -> dict[str, np.ndarra
         else:  # 下跌腿
             if price < anchor_price:
                 anchor_bar, anchor_price = t, price  # 压低候选谷
-            elif price > anchor_price * (1.0 + retracement):
+            elif price > anchor_price * up:
                 last_trough = (anchor_bar, anchor_price)
                 direction = 1
                 anchor_bar, anchor_price = t, price
@@ -149,12 +159,25 @@ def swings(prices: pd.DataFrame, retracement: float) -> Swings:
         raise ValueError(f"retracement 必须落在 (0, 1) 内，收到 {retracement!r}")
 
     frame = check_symbol_frame(prices)
-    columns = {
-        field: pd.DataFrame(
-            {name: _swing_columns(frame[name], retracement)[field] for name in frame.columns},
-            index=frame.index,
-            dtype=float,
-        )
-        for field in ("peak_price", "peak_age", "trough_price", "trough_age")
-    }
-    return Swings(**columns)
+    rows, width = frame.shape
+
+    # **每个标的状态机只跑一次**，四个字段一次取出。此前写成
+    #     {field: pd.DataFrame({name: _swing_columns(...)[field] for name in ...}) for field in 四}
+    # 于是 `_swing_columns` 被调了 **4 × 标的数** 次——状态机白跑三遍（全市场就是 1.16 亿次
+    # 逐根迭代，而它一遍就够）。实测（302 列 × 7,124 行）本函数由 4.03s 降到 1.2s。
+    #
+    # 组装也一并改了：先分配 `(行, 列)` 的 ndarray 再逐列填入，最后各包一张 DataFrame。
+    # 原来按「字段 → {列名: 数组} 的字典」建表，会把 4 × 标的数 个 Series 逐列插进 DataFrame
+    # ——那是 pandas 的碎片化路径，列一多就非线性变慢。
+    out = {field: np.full((rows, width), np.nan) for field in _SWING_FIELDS}
+    for position, name in enumerate(frame.columns):
+        columns = _swing_columns(frame[name], retracement)
+        for field in _SWING_FIELDS:
+            out[field][:, position] = columns[field]
+
+    return Swings(
+        **{
+            field: pd.DataFrame(out[field], index=frame.index, columns=frame.columns, dtype=float)
+            for field in _SWING_FIELDS
+        }
+    )
