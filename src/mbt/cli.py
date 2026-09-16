@@ -61,6 +61,17 @@ DEFAULT_START = "2015-08-01"
 #: 跳过率超过它即判失败——「几乎全跳过」不该被脚本当成成功。
 MAX_FAILURE_RATE = 0.30
 
+#: 选股时**质检**（稀释判定 + 越界检查）覆盖的**根数**（自评估日往前），见 ADR-0014。
+#:
+#: 取 1300 的理由：它必须盖过**任何规则的回看**，否则被检查的区间比用到的数据还短，检查就
+#: 漏了。最深的一处是估值那条 ``pe_percentile`` 的窗口 ``DEFAULT_WINDOW = 1000`` 根
+#: （``mbt.data.valuation``），故取 1000 加约三成余量。
+#:
+#: 为什么不干脆用「回测区间」那套 ``start``：选股的评估日在取数时**还没定出来**——``--as-of``
+#: 可省，默认取「最近一个齐全的交易日」，而那要读数据才知道。于是 ``start`` 无从算起，
+#: 检查只能覆盖全部历史，全市场实测因此多拒了 1,028 只（17.4%，ADR-0014）。
+DEFAULT_QUALITY_BARS = 1300
+
 
 #: ``--top-n all`` 的取值：**不截断**（每个合格标的都留，即规则自己的默认）。
 #:
@@ -226,6 +237,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="纳入的板块，逗号分隔（默认四个全收：主板,创业板,科创板,北交所）",
     )
     screen.add_argument(
+        "--quality-bars",
+        type=int,
+        default=DEFAULT_QUALITY_BARS,
+        metavar="N",
+        help=f"质检（稀释判定 + 越界检查）只覆盖评估日往前 N 根（默认 {DEFAULT_QUALITY_BARS}，"
+        "见 ADR-0014）。它必须盖过任何规则的回看，否则检查比用到的数据还短；给 0 表示不限制"
+        "（检查全部历史，即修复前的行为，会让十几年前的越界把标的拒之门外）",
+    )
+    screen.add_argument(
         "--screen",
         choices=("momentum", "undervalued_growth", "valuation", "b1"),
         default="momentum",
@@ -281,6 +301,8 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     progress = _progress(args, stdout)
 
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
+    exemption_dates, exemption_note = _listing_dates_for_anomalies(args, symbols)
+    print(f"  {exemption_note}", file=stdout)
     loaded = load_universe_data(
         symbols,
         tdx_root=args.tdx_root,
@@ -291,6 +313,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 是这个原因，票据 #45）。
         start=args.start,
         end=args.end,
+        listing_dates=exemption_dates,
         progress=progress,
     )
 
@@ -511,7 +534,10 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
     # **B1 到这里就够了。** 它另外两条量能过滤要的 `swings` 与 `volume_pattern` 是规则
     # 内部自算并记忆在面板对象上的（见 `mbt.screen.b1_screen`），不是外部喂进来的信号。
     if name == "b1":
-        return b1_screen(top_n=top_n), clip_fields(
+        # 把 progress 递进规则：它内部那两处**按面板缓存的一次性计算**（`swings`、
+        # `volume_pattern`）要单独记时，否则它们的代价会被算进第一个碰到它们的那个阶段里
+        # （见 `mbt.progress.timed`）。
+        return b1_screen(top_n=top_n, progress=progress), clip_fields(
             signals,
             loaded.markets,
             # 选股命令没有 --start/--end（评估日由 --as-of 承担），故用 getattr 兜底。
@@ -600,13 +626,20 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     print(f"取数：{len(symbols)} 个股票候选（已剔除指数、基金、可转债）", file=stdout)
     progress = _progress(args, stdout)
+    exemption_dates, exemption_note = _listing_dates_for_anomalies(args, symbols)
+    print(f"  {exemption_note}", file=stdout)
     loaded = load_universe_data(
         symbols,
         tdx_root=args.tdx_root,
         gbbq_path=args.gbbq,
         rules=None,
-        # 选股只看评估日及之前，故越界校验也只做到那一天（理由见 backtest 那条注释）。
+        # 选股只看评估日及之前，故越界校验也只做到那一天（理由见 backtest 那条注释）；
+        # 下界由 `--quality-bars` 给——选股没有回测区间，`start` 无从算起（ADR-0014）。
+        # `0` 由用户显式写成「不限制」，在库里用 `None` 表示，故这里换一道。
+        # `getattr` 兜底：有测试手工搭 args 桩（与上面 `start` 同一处置）。
+        quality_bars=getattr(args, "quality_bars", None) or None,
         end=args.as_of,
+        listing_dates=exemption_dates,
         progress=progress,
     )
     _report_loading(loaded, stdout, stderr)
@@ -966,6 +999,44 @@ def _snapshot_paths(loaded, args) -> list[Path]:
 
 
 # --- 输出 ---------------------------------------------------------------------
+
+
+def _listing_dates_for_anomalies(args, symbols):
+    """质检豁免用的 ``{符号: 上市日}``（ADR-0013）。**与 ``--master`` 解耦**。
+
+    为什么解耦：``--master`` 会**换掉整个股票池**（次新股门槛改用真实上市日），而这里要的
+    只是「这家公司哪天上市」用于豁免制度空窗（注册制下前 5 个交易日不设涨跌幅）。两件事
+    共用一个开关，会让「只是想知道上市日」被迫接受「池子也换了」——而 ``b1_daily.bat``
+    刻意不传 ``--master`` 正是为了守住 ADR-0012 那批结论的口径。
+
+    取值顺序：
+
+    1. 给了 ``--master`` → 用它（同一份数据，没必要查两处）；
+    2. 否则看 ``--gbbq`` 的**同级目录**里的 ``base.dbf``——TDX 把权息与证券主表都放在
+       ``T0002\\hq_cache``，故那个路径由 ``--gbbq`` 本身推得，不必再引入一个环境变量；
+    3. 两者都没有 → 返回 ``None``，即**一处都不豁免**（严格口径，改动前的行为），
+       并把这件事印出来——它会让跳过率偏高，不说就成了谜。
+
+    返回 ``(映射, 说明)``；说明供调用方打印。
+    """
+    if args.master:
+        return (
+            load_listing_dates(args.master, symbols=symbols),
+            f"质检豁免：用 --master 的上市日（{args.master}）",
+        )
+
+    sibling = Path(args.gbbq).parent / "base.dbf"
+    if sibling.is_file():
+        return (
+            load_listing_dates(sibling, symbols=symbols),
+            f"质检豁免：用 --gbbq 同级的 {sibling.name} 取上市日",
+        )
+
+    return (
+        None,
+        "质检豁免：没有上市日（既没给 --master，也没在 --gbbq 同级找到 base.dbf）"
+        "——上市初期的越界将按坏数据拒绝，跳过率会偏高",
+    )
 
 
 def _report_loading(loaded, stdout, stderr) -> None:

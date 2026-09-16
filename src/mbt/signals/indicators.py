@@ -25,25 +25,42 @@ def sma(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     return check_symbol_frame(prices).rolling(n, min_periods=n).mean()
 
 
-def _recursive_smooth_series(values: pd.Series, alpha: float) -> pd.Series:
-    """对**单列**做分段递推平滑：``Y₁ = X₁``，其后 ``Y = α·X + (1 − α)·Y_prev``。
+def _smooth_frame(prices: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    """对整张标的宽表做**分段递推平滑**：段首 ``Y = X``，其后 ``Y = α·X + (1 − α)·Y_prev``。
 
     缺失把序列切成若干段，每段以该段**第一个可用值**播种；缺失处一律是缺失。
 
-    这里逐段调用 ``ewm`` 而不是整列调用一次，理由与 :func:`_wilder_smooth` 相同，且已实测：
-    整列 ``ewm(adjust=False)`` 遇到缺失会**沿用前值**——``[1, 2, NaN, 4, 5]`` 在 ``span=2``
-    下的输出是 ``[1, 1.667, 1.667, 3.667, 4.556]``，第 3 位不是缺失而是上一根的值。那等于把
-    停牌日伪造成一个**有**指标值的交易日（ADR-0005）。
-    """
-    valid = values.notna()
-    if not valid.any():
-        return values
+    **为什么按行推进，不按列。** 递推只能沿时间走，但**列之间互不相干**，故按行推进时每一行
+    可以一次算完全部标的（numpy 向量），Python 层的迭代因此从「列数 × 行数」降到「行数」。
+    原先按列做（``DataFrame.apply``）时，5,451 个标的各要一次 pandas 重活（``notna`` /
+    ``cumsum`` / ``groupby`` / ``ewm``），实测单层 EMA 在白线（双层）上就是分钟量级。
+    实测白线（467 列 × 7,206 行）：**3.64s → 0.18s（20×）**。
 
-    run_id = (~valid).cumsum()
-    out = pd.Series(np.nan, index=values.index, dtype=float)
-    for _, run in values[valid].groupby(run_id[valid]):
-        out.loc[run.index] = run.ewm(alpha=alpha, adjust=False).mean()
-    return out
+    **数值上不是逐位相同，但等价到末位。** ``α·x + (1−α)·y`` 与 pandas ``ewm`` 的内部写法
+    在最后一两个 ULP 上不同：实测最大相对差 **4.7e-16**（白线）、**3.6e-16**（单层 EMA），
+    而 B1 的 ``trend`` 门（白线 > 黄线）在 285,768 格上**零翻转**、``low_j`` 门亦零翻转
+    （见 ``.scratch/smooth_dump_or_compare.py``）。这是**接受**的：递推给的是同一序列，
+    差在浮点舍入，而判据是「比大小」不是「逐位比对」——**接受它的必要条件**是判据零翻转，
+    该取舍见 ``docs/adr/0015-recursive-indicators-vectorize-with-ulp-drift.md``。
+
+    .. note::
+
+        不能整列调一次 ``ewm(adjust=False)``：它遇到缺失会**沿用前值**——``[1, 2, NaN, 4, 5]``
+        在 ``span=2`` 下给出 ``[1, 1.667, 1.667, 3.667, 4.556]``，第 3 位不是缺失而是上一根的
+        值。那等于把停牌日伪造成一个**有**指标值的交易日（ADR-0005）。故段必须分开。
+    """
+    frame = check_symbol_frame(prices)
+    values = frame.to_numpy(dtype=float)
+    rows, width = values.shape
+    out = np.full((rows, width), np.nan)
+    # `prev` 为 NaN 表示「当前处在段首」（段首或刚跨过一个缺口）。
+    prev = np.full(width, np.nan)
+    for t in range(rows):
+        row = values[t]
+        seeded = np.where(np.isnan(prev), row, alpha * row + (1.0 - alpha) * prev)
+        prev = np.where(np.isnan(row), np.nan, seeded)
+        out[t] = prev
+    return pd.DataFrame(out, index=frame.index, columns=frame.columns, dtype=float)
 
 
 def ema(prices: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -65,7 +82,7 @@ def ema(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     等于假装停牌期间也有收盘价（ADR-0005）。行情软件上没有缺口行，故只在**无缺口**的序列上
     两种口径一致——也就是说「字面复刻图上的线」这件事，在有空缺的标的身上并不成立。
     """
-    return check_symbol_frame(prices).apply(_recursive_smooth_series, alpha=2.0 / (n + 1))
+    return _smooth_frame(prices, 2.0 / (n + 1))
 
 
 def rolling_max(prices: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -153,8 +170,8 @@ def kdj(panel: Panel, n: int, m1: int, m2: int) -> KDJ:
       在约 m1×5 根内把差别衰减掉。
     - **分母为 0**：窗口内最高价等于最低价（一字板、长期停牌复牌）时 RSV 无定义。此处判
       缺失而**不是**沿用前值——与图上「平盘时 KDJ 保持前值」的观感不同，取的是「不猜」。
-    - **数据缺口**：缺失把序列切成若干段，每段以第一个可用值播种，缺口处保持缺失
-      （与 :func:`_recursive_smooth_series` 同一纪律）。
+    - **数据缺口**：    缺失把序列切成若干段，每段以第一个可用值播种，缺口处保持缺失
+    （与 :func:`_smooth_frame` 同一纪律）。
     """
     high = check_symbol_frame(panel["high"])
     low = check_symbol_frame(panel["low"])
@@ -168,8 +185,8 @@ def kdj(panel: Panel, n: int, m1: int, m2: int) -> KDJ:
     rsv = (close - lowest) / span * 100.0
     rsv = rsv.where(span > 0)
 
-    k = rsv.apply(_recursive_smooth_series, alpha=1.0 / m1)
-    d = k.apply(_recursive_smooth_series, alpha=1.0 / m2)
+    k = _smooth_frame(rsv, 1.0 / m1)
+    d = _smooth_frame(k, 1.0 / m2)
     return KDJ(k=k, d=d, j=3.0 * k - 2.0 * d)
 
 

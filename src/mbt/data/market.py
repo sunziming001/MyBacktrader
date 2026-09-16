@@ -95,6 +95,8 @@ def load_market_data(
     rules: RuleTable | str | Path | None = None,
     start=None,
     end=None,
+    listing_date=None,
+    quality_bars=None,
 ) -> MarketData:
     """读取一个股票的原始行情与权息事件，**并在返回前做越界检查**。
 
@@ -122,6 +124,32 @@ def load_market_data(
         返回的 ``prices`` 仍是**完整历史**（不是切过的），故调用方照常自行切片；
         判定记录与事件集则只覆盖区间内的事件。
 
+        ``listing_date`` 用于**豁免制度空窗**（ADR-0013）：注册制下上市后前 5 个交易日
+        不设涨跌幅，那几天的「越界」是制度使然，不是坏数据。实测全市场被拒标的里 86%
+        的越界落在第 2~5 根，全是这一类误报。不给则一处都不豁免（改动前的严格口径）。
+
+        ``quality_bars`` 把**质检窗口**从末端再收窄 N 根（ADR-0014），覆盖两处检查：
+        :func:`~mbt.data.dilution.resolve_dilution` 的稀释判定与 ``require_no_anomalies``
+        的越界检查。给它的理由与 ``start``/``end`` 是同一条，只是后者不够用：**选股没有
+        回测区间**。``mbt screen`` 要的是「评估日往前若干根」的那段行情（各规则最深回看
+        1000 根，见 :data:`~mbt.cli.DEFAULT_QUALITY_BARS`），而它的评估日在取数时**还没
+        定出来**（``--as-of`` 可省，默认取「最近一个齐全的交易日」，那要读数据才知道）。
+        于是 ``start`` 无从算起，检查只能覆盖全部历史——全市场实测因此**多拒了 1,028 只
+        （17.4%）**，它们的越界全在十几年前（870/990 在 2006 年及之前，多为股改复牌或
+        那时的除权判定）。``sh600547`` 就是其中之一：它被 **2006-03-31 的一处除权判定**
+        挡住，而它在 2026-09-15 过得了全部 8 道 B1 门。
+
+        取了 ``end`` 时，这 N 根是**相对 ``end`` 的末端**（即「评估日往前 N 根」）；不取
+        ``end`` 时相对数据的末端。故 ``mbt screen`` 已有的 ``end=--as-of`` 会把窗口上界
+        定住，这一项只需补下界。
+
+        .. warning::
+
+            **它会把窗口之外的权息事件降级为「不判定」**：``resolve_dilution`` 对落在序列
+            之外的事件记为 ``OUTSIDE_SERIES`` 并**原样保留**，故那些事件的稀释成分不再被
+            置零。对选股无影响（选股用的是窗口内的行情），但**回测不要用这一项**——回测有
+            ``--start``，本来就该用它把窗口定准。
+
     返回:
         含原始价与权息事件的 :class:`MarketData`。
 
@@ -143,14 +171,27 @@ def load_market_data(
             {symbol: [(period.start, period.end) for period in st_periods]}
         )
 
-    # 校验只做在**回测区间**内，理由见上面的 docstring。
+    # 质检窗口可以比复权窗口**更窄**（ADR-0014）：`quality_bars` 只收窄被检查的那一段。
+    # 选股没有回测区间，只剩这一个办法把「十几年前的越界与除权判定」排除在判定之外。
+    #
+    # 收窄的是**整段窗口**，故两处检查同时受益：`resolve_dilution` 的稀释判定与
+    # `require_no_anomalies` 的越界检查。`sh600547` 栽在前者（2006-03-31 的除权判不动），
+    # 而真正多拒 1,028 只的是两者之和。
+    #
+    # 取 `quality_bars + 1` 根而不是 `quality_bars` 根：与 `_window_of` 同一个理由——涨跌停带
+    # 与稀释判定都要用**前一根**算，窗口首根若没有基数，它上面的跳空就判不出来。多要一根
+    # 作基数之后，「最后 N 根」里的每一根都真的被查过。
+    if quality_bars is not None and quality_bars < 1:
+        raise ValueError(f"quality_bars 至少为 1（或 None 表示不限制），收到 {quality_bars!r}")
     window = _window_of(prices, start, end)
+    if quality_bars is not None:
+        window = window.iloc[-(quality_bars + 1) :]
 
     # 判定一次，**复权与质检吃同一份**结果。否则会出现「复权已经不算它了，质检却还在按它
     # 报异常」这种自相矛盾（与 ADR-0002 里「涨跌停带必须与撮合共用同一个带」同类）。
     events, verdicts = resolve_dilution(window, raw_events, symbol, table)
 
-    require_no_anomalies(window, symbol, table, events)
+    require_no_anomalies(window, symbol, table, events, listing_date=listing_date)
 
     return MarketData(
         symbol=symbol,

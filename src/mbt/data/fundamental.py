@@ -144,19 +144,32 @@ class CwDataSource:
         """目录里全部**非空**报告期，升序。"""
         return tuple(sorted({period for period, _ in _load(self._root)}))
 
-    def records(self, symbol: str) -> tuple[FinancialRecord, ...]:
+    def records(self, symbol: str, *, tables=None) -> tuple[FinancialRecord, ...]:
         """标的的**全部报告期**记录，按报告期升序（含尚未公告的）。
 
         它给的是「这个标的历年都报了什么」，**不保证时点正确**——按评估日取数请用
         :meth:`as_of`。两个入口分开，是为了让「我知道自己在取哪一期」变得显式。
+
+        ``tables`` 允许调用方把 :meth:`tables` 的结果传进来**复用一次装载**。这不是微优化：
+        装载前要算**目录指纹**（``glob`` 加 147 个 ``.dat`` 的 ``stat``），实测单次约 8.4 ms，
+        而批量调用方会问几千个标的 —— 全市场按「每标的 × 每字段」各算一次指纹就是**分钟量级**，
+        且与数据量无关（纯目录开销）。为 None 时照旧自己装载一次，行为不变。
         """
         code = _core_code(symbol)
         out = []
-        for _, table in _load(self._root):
+        for _, table in _load(self._root) if tables is None else tables:
             row = table.get(code)
             if row is not None:
                 out.append(row)
         return tuple(sorted(out, key=lambda record: record.report_period))
+
+    def tables(self):
+        """目录下全部报告期表，**一次**装载（含一次指纹计算）。
+
+        供批量调用方复用：见 :meth:`records` 的 ``tables`` 参数。返回的对象是模块级缓存
+        （``_load_cached``）持有的同一份，**不要改它**。
+        """
+        return _load(self._root)
 
     def as_of(self, symbol: str, on: dt.date | dt.datetime | str) -> FinancialRecord | None:
         """评估日**已公告**的最近一期；没有则 ``None``。

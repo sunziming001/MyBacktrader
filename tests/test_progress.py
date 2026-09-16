@@ -23,7 +23,7 @@ import pytest
 
 from mbt.backtest import run_portfolio_backtest
 from mbt.data import load_universe_data
-from mbt.progress import ConsoleProgress
+from mbt.progress import ConsoleProgress, timed
 from mbt.screen import Screen
 from mbt.universe import UniverseRules
 
@@ -413,3 +413,91 @@ def test_the_loader_counts_every_candidate_including_the_skipped_ones(fixture_ro
     assert done == len(loaded.markets) + len(loaded.skipped) == 3
     assert recorder.names == ["取数"]
     assert recorder.stages[0][2] == "只", "取数量的是标的，量词不该是「根」"
+
+
+# --- 一次性计时：阶段内部的单独一笔，不与阶段相加 ----------------------------
+
+
+def test_a_timing_line_is_printed_and_lands_in_the_summary():
+    """``timing`` 立即打一行，并在汇总里单列。
+
+    为什么要这一类：同一个中间量（如 ``swings``）只算一次、按面板缓存，代价会被记进**第一个
+    碰到它的那个阶段**。实测 ``position`` 那个过滤器报 121s，其中 64.8s 是 ``swings`` 的首算；
+    而 ``top_calm`` 报的 88~101s 就是整次 ``volume_pattern``，它后面两个因子因为「同一次调用」
+    而几乎免费。只读阶段账会得出「position 很贵、pullback_shrink 不要钱」这类错误结论。
+    """
+    progress = make_progress()
+    progress.stage("过滤器 3/8：position")
+    progress.timing("swings（按面板缓存）", 64.8)
+    progress.finish()
+
+    printed = lines(progress)
+    assert any(line == "计时：swings（按面板缓存） 用时 64.8s" for line in printed), printed
+    summary = printed[printed.index("===== 耗时汇总 =====") :]
+    assert any("swings（按面板缓存）" in line for line in summary), summary
+
+
+def test_the_summary_keeps_stages_and_timings_in_separate_blocks():
+    """汇总**分两块**列，且明说一次性计时不与阶段相加。
+
+    它们是**重叠**的两笔账（计时落在某个阶段内部），故不能合成一块。这一条盯住的就是那个
+    「不能相加」在输出里说清楚了——不写清楚，读的人会把两块的数字加起来，于是把同一段时间
+    算两遍。
+    """
+    progress = make_progress()
+    progress.stage("过滤器 1/8：trend")
+    progress.timing("swings（首算）", 3.0)
+    progress.stage("过滤器 2/8：volume")
+    progress.finish()
+
+    printed = lines(progress)
+    summary = printed[printed.index("===== 耗时汇总 =====") :]
+    joined = "\n".join(summary)
+
+    assert "阶段（互不重叠" in joined, summary
+    assert "一次性计时（落在上面某个阶段**内部**，故不与阶段相加）" in joined, summary
+
+    # 两块各自排自己的序：阶段那块里不该出现计时的名字，反之亦然。
+    stage_block, timing_block = joined.split("一次性计时")
+    assert "swings" not in stage_block, stage_block
+    assert "过滤器" not in timing_block, timing_block
+
+
+def test_the_timed_context_manager_reports_through_any_reporter_that_has_timing():
+    """``timed`` 走**鸭子类型**：只要上报端有 ``timing`` 就调它，不要求继承什么。"""
+
+    class OnlyTiming:
+        def __init__(self):
+            self.entries = []
+
+        def timing(self, name, seconds, *, note=""):
+            self.entries.append((name, seconds, note))
+
+    reporter = OnlyTiming()
+    with timed(reporter, "某中间量的首算", note="按面板缓存"):
+        pass
+
+    ((name, seconds, note),) = reporter.entries
+    assert name == "某中间量的首算"
+    assert note == "按面板缓存"
+    assert seconds >= 0.0
+
+
+def test_the_timed_context_manager_is_a_noop_without_a_timing_hook():
+    """``progress`` 为 ``None``、或它没有 ``timing``（测试里那些老假上报端）时**退化为止空**。
+
+    理由与「取时点失败不弄挂回测」同一条：观察手段不得给被观察的对象添麻烦。另外被计时的那段
+    代码自己抛错时，异常必须**照常抛出**——计时只是 `finally` 里的记账，不该吞掉它。
+    """
+    with timed(None, "没有上报端"):  # 不抛
+        pass
+
+    class OnlyStage:
+        """只有 stage/tick/finish 的旧式假上报端。"""
+
+    with timed(OnlyStage(), "没有 timing 方法"):  # 不抛
+        pass
+
+    with pytest.raises(ValueError, match="被计时块里的错"):
+        with timed(None, "块里抛错"):
+            raise ValueError("被计时块里的错")

@@ -46,6 +46,16 @@ class _Series:
             )
         return self._values[i]
 
+    def at_or(self, on: dt.date, default):
+        """同 :meth:`at`，但**没有适用条目时返回 ``default``** 而不报错。
+
+        用于「查不到本身就是一个答案」的参数——例如新股上市初期的不设涨跌幅天数：
+        「该上市日没有这条制度」是事实，不是我们不知道（ADR-0013）。别处仍应走
+        :meth:`at`，那里的「查不到」意味着规则表不覆盖那段历史，必须报出来。
+        """
+        i = bisect_right(self._starts, on) - 1
+        return default if i < 0 else self._values[i]
+
 
 class RuleTable:
     """交易制度规则表。
@@ -102,6 +112,14 @@ class RuleTable:
         }
 
         self._stamp_duty = _Series(raw.get("stamp_duty", []), "sell_rate", "印花税")
+
+        #: 上市初期不设涨跌幅的天数。**键是板块**，而查表时传的是**上市日**（ADR-0013）。
+        _no_limit = {}
+        for entry in raw.get("new_listing_no_limit", []):
+            _no_limit.setdefault(entry["board"], []).append(entry)
+        self._new_listing_no_limit = {
+            k: _Series(v, "days", f"{k} 的新股上市初期不设涨跌幅天数") for k, v in _no_limit.items()
+        }
 
         # ST 期间：登记了才认。
         self._st_periods: dict[str, list[tuple[dt.date, dt.date | None]]] = {}
@@ -194,6 +212,24 @@ class RuleTable:
     def price_limit(self, board: str, on: dt.date) -> float:
         """某板块在成交日的**涨跌幅限制**（如 0.10 表示 10%），不含 ST 覆盖。"""
         return self._series(self._price_limit, board, on, f"板块 {board!r}")
+
+    def new_listing_no_limit_days(self, board: str, listing_date: dt.date) -> int:
+        """某板块在**该上市日**适用的「上市初期不设涨跌幅」交易日数；无适用条目则 ``0``。
+
+        与 :meth:`price_limit` 有两处根本差别，都是刻意的（ADR-0013）：
+
+        1. **查表的键是上市日，不是成交日。** 想知道「某根 K 线那天有没有涨跌幅限制」，
+           要看的是这家公司**什么时候上市**——制度按上市时点适用，之后不再变。拿 K 线
+           日期去查会把「2024 年上市的老制度股」错判成注册制新股。
+        2. **查不到不报错，返回 0。** 别处「查不到」意味着「我们不知道那天的制度」，
+           故报错（ADR-0005）。这里「查不到」本身就是答案：该上市日没有这条制度，
+           故不豁免。把「不知道」与「没有」混为一种处置，会让 2023 年前上市的老股
+           全部无法加载。
+        """
+        series = self._new_listing_no_limit.get(board)
+        if series is None:
+            return 0
+        return int(series.at_or(listing_date, 0))
 
     def stamp_duty_rate(self, on: dt.date) -> float:
         """成交日的**印花税**卖出费率。印花税仅卖出方缴纳。"""
