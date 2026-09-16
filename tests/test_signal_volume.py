@@ -886,3 +886,79 @@ def test_a_pullback_window_that_is_entirely_missing_gives_missing_not_zero(symbo
     assert pd.isna(got.pullback_vs_advance[symbol].iloc[9]), "整段缺失不该给 0"
     assert got.top_calm[symbol].iloc[9] == pytest.approx(100.0 / 60.0)
     assert got.surge_vs_base[symbol].iloc[9] == pytest.approx(4.0)
+
+
+def pullback_anchors(symbol_frame):
+    """把手算夹具的峰值挪到 index 5，使**回调段有 4 根**（``[6, 9]``）。
+
+    原 ``hand_anchors`` 的峰值在 index 6，故回调段只有 ``[7, 9]`` 三根、且第 9 根时只剩一根。
+    要测「窗口**内部**有缺失」，窗口得够长。
+
+    手算依据（``HAND_VOLUME``，``edge_bars=2``、``base_bars=2``）：
+    ``T = 3``、``P = 5``、顶部那根 = 5、``R = max(P, 顶) = 5``，于是
+
+    - 上涨段 ``[3, 5]`` = 40、50、100 → 最大 **100**（``pullback_ratio`` 的分母）
+    - 回调段 ``[6, 9]`` = 60、30、20、10 → 均值 **30**
+    - 故 ``pullback_ratio`` = 30 / 100 = **0.30**
+    """
+    blank = [float("nan")] * 5
+    return Swings(
+        peak_price=symbol_frame({"sh600000": [float("nan")] * 10}),
+        peak_age=symbol_frame({"sh600000": blank + [0.0, 1.0, 2.0, 3.0, 4.0]}),
+        trough_price=symbol_frame({"sh600000": [float("nan")] * 10}),
+        trough_age=symbol_frame({"sh600000": blank + [2.0, 3.0, 4.0, 5.0, 6.0]}),
+    )
+
+
+def test_a_missing_bar_inside_the_structure_pullback_window_is_skipped_not_counted_as_zero(
+    symbol_frame,
+):
+    """`volume_structure` 的回调窗口**内部**缺一根时，均值按剩下的有限值算。
+
+    取回调段第一根（60）为缺失，两种处置给出不同的数：
+
+    - **跳过**（正确）：``(30 + 20 + 10) / 3 = 20`` → ``20 / 100 = 0.20``
+    - 当 0 计入（错误）：``(0 + 30 + 20 + 10) / 4 = 15`` → 0.15
+    - 若把缺失当分母不算、分子算 0：``90 / 4 = 22.5`` → 0.225
+
+    三种处置互不相同，故这条断言能判别实现走了哪一条。
+    """
+    volumes = list(HAND_VOLUME)
+    volumes[6] = float("nan")  # 回调段第一根（60）
+    got = volume_structure(
+        symbol_frame({"sh600000": volumes}),
+        pullback_anchors(symbol_frame),
+        edge_bars=2,
+        base_bars=2,
+    )
+
+    assert got.pullback_ratio["sh600000"].iloc[9] == pytest.approx(20.0 / 100.0)
+
+
+def test_the_complete_window_still_gives_the_hand_computed_ratio(symbol_frame):
+    """上一条的对照：不插缺失时仍是手算的 0.30——证明上一条的 0.20 来自缺失，不是别处的改动。"""
+    got = volume_structure(
+        symbol_frame({"sh600000": list(HAND_VOLUME)}),
+        pullback_anchors(symbol_frame),
+        edge_bars=2,
+        base_bars=2,
+    )
+
+    assert got.pullback_ratio["sh600000"].iloc[9] == pytest.approx(0.30)
+
+
+def test_a_structure_pullback_window_that_is_entirely_missing_gives_missing_not_zero(
+    symbol_frame,
+):
+    """`volume_structure` 的窗口**整段**缺失时给缺失，不给 0。"""
+    volumes = list(HAND_VOLUME)
+    for index in range(6, 10):
+        volumes[index] = float("nan")
+    got = volume_structure(
+        symbol_frame({"sh600000": volumes}),
+        pullback_anchors(symbol_frame),
+        edge_bars=2,
+        base_bars=2,
+    )
+
+    assert pd.isna(got.pullback_ratio["sh600000"].iloc[9]), "整段缺失不该给 0"

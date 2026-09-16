@@ -248,6 +248,17 @@ def _volume_structure(
     pullback_ratio = np.full((rows, columns), np.nan)
     pullback_vs_top_ratio = np.full((rows, columns), np.nan)
 
+    # 回调段 `[peak+1, row]` 的**左端在一段内固定**（peak 不变），故「和 / 计数 / 最大值」都能
+    # **增量维护**：右端随行推进时只把新进来的那几根并入，不必每行重切整窗调
+    # `np.nanmean` + `np.nanmax`。逐列记一份状态；peak 变了（新峰值被确认，或未确认的拐点被
+    # 回头修正）就整段重算——那正是旧行为，只是不再每行都发生。
+    #
+    # 同机交替 A/B（326 列 × 2,703 行、含 65% 缺失、各 2 次）：**6.17 / 6.16s → 2.89 / 2.99s**，
+    # 约 **2.1×**。求和仍按**有限值**累加（缺失跳过、不当 0），与 `_window_aggregates` 同一
+    # 语义；成交量为整数股时两种求和的浮点结果**逐位相同**（``.scratch/vs_dump_or_compare.py``
+    # 对拍：284,304 个有值格、最大绝对差 0）。
+    pull_state: dict[int, list] = {}
+
     for row in range(rows):
         peak_pos = np.where(np.isfinite(peak_age[row]), row - peak_age[row], -1.0)
         trough_pos = np.where(np.isfinite(trough_age[row]), row - trough_age[row], -1.0)
@@ -295,9 +306,25 @@ def _volume_structure(
             edge[positions], _ = _cached_aggregates(
                 vol, cache, int(peak) - edge_bars + 1, int(peak), cols
             )
-            # 回调段 `[peak+1, row]`：它的右端**就是当前行**，故这个窗口每天都是新的，
-            # 缓存不会命中，只会把键越堆越多——只能直接算，不缓存。
-            pull[positions], _ = _window_aggregates(vol, int(peak) + 1, row, cols)
+            # 回调段 `[peak+1, row]`：右端是当前行，故这个窗口**左端固定、右端延伸**——增量维护
+            # （见上面 `pull_state` 的说明），不再每行切片求和求最大值。
+            for position, column in zip(positions, cols, strict=True):
+                column = int(column)
+                state = pull_state.get(column)
+                if state is None or state[0] != int(peak):
+                    # 新的一段：从 peak 开始记（`upto = peak` 表示「窗口从 peak+1 起」）。
+                    state = [int(peak), 0.0, 0, math.nan, int(peak)]
+                    pull_state[column] = state
+                total, count, top_value, upto = state[1], state[2], state[3], state[4]
+                for i in range(upto + 1, row + 1):
+                    value = vol[i, column]
+                    if value == value:  # 非缺失（NaN != NaN）
+                        total += value
+                        count += 1
+                        if top_value != top_value or value > top_value:
+                            top_value = value
+                state[1], state[2], state[3], state[4] = total, count, top_value, row
+                pull[position] = total / count if count else math.nan
 
         with np.errstate(invalid="ignore", divide="ignore"):
             surge[row, index] = np.where(base > 0.0, adv_top / base, np.nan)
