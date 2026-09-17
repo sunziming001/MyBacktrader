@@ -156,6 +156,22 @@ class GponeDataSource:
         """
         return symbol[:2] in _FILE_BY_MARKET
 
+    def files(self) -> tuple[Path, ...]:
+        """本数据源**确实存在**的那几份文件——供产物里的「数据快照」记录。
+
+        只列存在的：缺的那份（本机是 ``gpbjone.dat``）本来就没参与这次读数，把它记进去会让
+        「这次读了哪些文件」这句话变成假的。
+
+        残留一处**无害的过报**要写明：池子里只有沪市标的时，深市那份也会被列上，而它其实
+        一个字节都没读。方向是保守的——摘要（:func:`mbt.report.data_snapshot`）是用来侦测
+        「文件被回补或修正」的，多列一个存在的文件只会让它更敏感，不会漏报。
+        """
+        return tuple(
+            self._root / name
+            for name in sorted(set(_FILE_BY_MARKET.values()))
+            if (self._root / name).is_file()
+        )
+
     def path_for(self, symbol: str) -> Path:
         """符号对应的文件。北交所、或前缀不认识时抛 :class:`MarketDataError`。"""
         market = symbol[:2]

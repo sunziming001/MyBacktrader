@@ -23,6 +23,7 @@ from mbt.data.forward import (
     FIELD_FISCAL_YEAR,
     FIELD_NET_PROFIT_T,
     FIELD_PE_EXPECTED,
+    PegRestatement,
     chosen_valuation,
     forward_available,
 )
@@ -359,8 +360,11 @@ def test_a_market_without_a_file_cannot_answer_the_question(gpone):
 
 # --- 六、把选择落到表上 -----------------------------------------------------
 
+#: 这三只各代表一种情形：有预期（茅台）、在文件里但没有预期（sh600006）、文件读不到（sz000001）。
+_PEG_COLUMNS = ("sh600519", "sh600006", "sz000001")
 
-def _frame(values_by_symbol, columns=("sh600519", "sh600006", "sz000001")):
+
+def _frame(values_by_symbol, columns=_PEG_COLUMNS):
     """把 ``{标的: [四天的 PE]}`` 摊成日期 × 标的的表；列序**显式**给出，便于断言。"""
     import pandas as pd
 
@@ -518,3 +522,270 @@ def test_a_close_frame_that_does_not_line_up_is_rejected(gpone):
 
     with pytest.raises(ValueError, match="标的"):
         chosen_valuation(close, trailing, gpone=gpone, as_of=_day(gpone))
+
+
+# --- 七、PEG 的重述：原式第三条守卫把谁摘掉（票据 #50 修订） -----------------
+
+
+def _peg_frame(values_by_symbol, columns=("sh600519", "sh600006", "sz000001")):
+    """历史 PEG 表。数值本身不重要（评估日那一行会被覆盖或被抹掉），只要形状对齐。"""
+    import pandas as pd
+
+    index = pd.bdate_range("2026-09-14", periods=4)
+    return pd.DataFrame(values_by_symbol, index=index)[list(columns)]
+
+
+def _strategies_for(gpone, *, base_net_profit_yuan=70_223_125_000.0):
+    """一份最小财务替身：只有茅台有年报，且基期取到「增长恰好 20%」。"""
+    return FakeFinancials(sh600519=[annual(2025, net_profit_yuan=base_net_profit_yuan)])
+
+
+def test_pe_growth_ratio_needs_a_positive_pe_and_a_growth_away_from_zero():
+    """``PEG := IF(选用PE>0 AND ABS(选用增)>0.1, 选用PE/选用增, 缺失)``——两道守卫各测一次。
+
+    增长近 0 时 PEG 是个巨大的数，那不是「贵」，是**没有意义**：故取缺失，不取那个大数。
+    """
+    import math
+
+    from mbt.data import pe_growth_ratio
+
+    assert pe_growth_ratio(15.0, 20.0) == pytest.approx(0.75)
+    assert pe_growth_ratio(15.0, -6.0) == pytest.approx(-2.5)
+
+    assert math.isnan(pe_growth_ratio(0.0, 20.0)), "PE 为 0 不算 PEG"
+    assert math.isnan(pe_growth_ratio(-3.0, 20.0)), "PE 为负不算 PEG"
+    assert math.isnan(pe_growth_ratio(15.0, 0.0)), "增长为 0 时 PEG 无意义"
+    assert math.isnan(pe_growth_ratio(15.0, 0.1)), "门槛是严格大于 0.1，等于不算"
+
+
+def test_growth_expected_treats_a_missing_base_as_zero():
+    """拿不到基期年报（``None``）与基期为负走同一支：取 0，不是炸掉、也不是缺失。
+
+    0 的后果是下游 ``|增|>0.1`` 那道门必不过 → PEG 缺失。这条链是刻意的：算不出增长率时，
+    要的是「PEG 没有」，而不是「PEG 无穷大」。
+    """
+    from mbt.data import growth_expected
+
+    assert growth_expected(12000.0, None) == 0.0
+    assert growth_expected(12000.0, 10000.0) == pytest.approx(20.0)
+
+
+def test_snapshot_admits_the_day_the_file_was_written_onward(gpone):
+    """写入日当天即可用，早一天不可用——这是 ``forward_available`` 的前一半，单独也要钉住。
+
+    它与「用前瞻」分开是必须的：原式的 ``财年T>0`` 守卫也要先过这道闸门，否则「没有一致预期
+    → PEG 缺失」会落到评估日早于写入日的那些行上（回测的评估日全在过去）。
+    """
+    import datetime as dt
+
+    from mbt.data import snapshot_admissible
+
+    written = gpone.updated_on("sh600519")
+
+    assert snapshot_admissible("sh600519", gpone=gpone, as_of=written) is True
+    assert (
+        snapshot_admissible("sh600519", gpone=gpone, as_of=written - dt.timedelta(days=1)) is False
+    )
+
+
+def test_the_chosen_peg_is_the_forward_pe_over_the_forward_growth(gpone):
+    """走前瞻的标的，评估日的 PEG 是 ``PE前瞻 ÷ 增预期``——两者都换成了预测口径。
+
+    手算：``PE前瞻 = 1010.58 ÷ 67.372 = 15``；基期取 「净利T ÷ 1.2」使 ``增预期 = 20%``；
+    故 ``PEG = 15 ÷ 20 = 0.75``。前三天一行不动。
+    """
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in ("sh600519", "sh600006", "sz000001")})
+    close = _frame({symbol: [1010.58] * 4 for symbol in trailing_pe.columns})
+    trailing_peg = _peg_frame({symbol: [3.0] * 4 for symbol in trailing_pe.columns})
+    as_of = _day(gpone)
+
+    chosen = chosen_valuation(
+        close,
+        trailing_pe,
+        gpone=gpone,
+        as_of=as_of,
+        restate_peg=PegRestatement(trailing_peg=trailing_peg, financials=_strategies_for(gpone)),
+    )
+
+    assert chosen.peg is not None
+    assert chosen.peg.loc[as_of, "sh600519"] == pytest.approx(0.75, rel=1e-6)
+    assert chosen.peg["sh600519"].tolist()[:3] == [3.0, 3.0, 3.0], "评估日之前的行不许动"
+
+
+def test_a_symbol_without_a_consensus_loses_its_peg(gpone):
+    """``sh600006`` 没有一致预期（财年T = 0）→ 原式第三条守卫不成立 → **评估日的 PEG 缺失**。
+
+    这是本轮最狠的一处：``valuation`` 那份 PEG 只守两道门，原式多一道 ``财年T>0``，于是
+    池子里一大片标的从 PEG 这道门被整片摘掉。必须记进 ``peg_missing``，否则读产物的人只会
+    看到候选变少而不知道为什么。
+    """
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in ("sh600519", "sh600006", "sz000001")})
+    close = _frame({symbol: [10.0] * 4 for symbol in trailing_pe.columns})
+    trailing_peg = _peg_frame({symbol: [3.0] * 4 for symbol in trailing_pe.columns})
+    as_of = _day(gpone)
+
+    chosen = chosen_valuation(
+        close,
+        trailing_pe,
+        gpone=gpone,
+        as_of=as_of,
+        restate_peg=PegRestatement(trailing_peg=trailing_peg, financials=_strategies_for(gpone)),
+    )
+
+    assert chosen.peg is not None
+    assert chosen.peg.loc[as_of, "sh600006"] != chosen.peg.loc[as_of, "sh600006"], "该是 NaN"
+    assert chosen.peg_missing == ("sh600006",), "摘掉了谁必须点名"
+    assert chosen.peg["sh600006"].tolist()[:3] == [3.0, 3.0, 3.0], "只动评估日那一行"
+
+
+def test_peg_missing_counts_every_guard_not_just_the_consensus_one(gpone):
+    """``peg_missing`` 数的是**结果**，不是某一条守卫。
+
+    第一版只在 ``财年T<=0`` 那个分支顺手记一笔，于是前瞻支里被另外两条守卫挡下的标的静默
+    漏报——实测报出 141，真值 157。这里造一只**有**一致预期、但预测与基期持平的票：它过了
+    ``用前瞻``，却过不了 ``|选用增|>0.1``，评估日的 PEG 同样该算作「没有」。
+    """
+    from mbt.data import growth_expected
+
+    net_profit_t = gpone.value("sh600519", FIELD_NET_PROFIT_T) or 0.0
+    flat = _strategies_for(gpone, base_net_profit_yuan=net_profit_t * 10_000)
+    assert growth_expected(net_profit_t, net_profit_t) == 0.0, "基期与预测持平，增预期为 0"
+
+    columns = ("sh600519", "sh600006")
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in columns}, columns=columns)
+    close = _frame({symbol: [10.0] * 4 for symbol in columns}, columns=columns)
+    trailing_peg = _peg_frame({symbol: [3.0] * 4 for symbol in columns}, columns=columns)
+    as_of = _day(gpone)
+
+    chosen = chosen_valuation(
+        close,
+        trailing_pe,
+        gpone=gpone,
+        as_of=as_of,
+        restate_peg=PegRestatement(trailing_peg=trailing_peg, financials=flat),
+    )
+
+    assert "sh600519" in chosen.forward_symbols, "它走的是前瞻，不属于「没有一致预期」那一类"
+    assert chosen.peg is not None
+    assert chosen.peg.loc[as_of, "sh600519"] != chosen.peg.loc[as_of, "sh600519"], "该是 NaN"
+    assert chosen.peg_missing == ("sh600519", "sh600006"), "两种原因都得数进来"
+
+
+def test_a_market_without_the_file_family_loses_its_peg_too(gpone):
+    """北交所**赔**在 PEG 上，赚在 PE 上：PE 照历史退回，PEG 却要按原式取缺失。
+
+    两边不一样是刻意的，判据是「财年T **知道**还是**不知道**」：本机没有 ``gpbjone.dat``，
+    就意味着那 140 只的 ``财年T`` 在这儿恒为 0——**知道就是 0**，故按守卫取缺失。PE 那条路
+    不退是因为它压根不问财年；而对「不知道」的情形（文件读不到）两条路都不动。
+    """
+    columns = ("sh600519", "bj920001", "bj430047")
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in columns}, columns=columns)
+    close = _frame({symbol: [10.0] * 4 for symbol in columns}, columns=columns)
+    trailing_peg = _peg_frame({symbol: [3.0] * 4 for symbol in columns}, columns=columns)
+
+    chosen = chosen_valuation(
+        close,
+        trailing_pe,
+        gpone=gpone,
+        as_of=_day(gpone),
+        restate_peg=PegRestatement(trailing_peg=trailing_peg, financials=_strategies_for(gpone)),
+    )
+
+    assert chosen.unsupported == ("bj920001", "bj430047")
+    assert chosen.pe["bj920001"].tolist() == [10.0] * 4, "PE 照历史口径逐格不动"
+    assert chosen.peg is not None
+    assert (
+        chosen.peg.loc[chosen.pe.index[-1], "bj920001"]
+        != chosen.peg.loc[chosen.pe.index[-1], "bj920001"]
+    ), "PEG 该是 NaN"
+    assert chosen.peg_missing == ("bj920001", "bj430047")
+
+
+def test_a_symbol_whose_file_is_unreadable_keeps_its_peg(gpone):
+    """目录指错时 PEG **一格不动**——不知道的事不拿去做决定。
+
+    与北交所相反：那是「知道财年T 是 0」，这是「连有没有预期都不知道」。此时候选集不该因为
+    一个路径打错而悄悄换掉，而这一档本来就另行报出来了（``unreadable``）。
+    """
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in ("sh600519", "sh600006", "sz000001")})
+    close = _frame({symbol: [10.0] * 4 for symbol in trailing_pe.columns})
+    trailing_peg = _peg_frame({symbol: [3.0] * 4 for symbol in trailing_pe.columns})
+
+    chosen = chosen_valuation(
+        close,
+        trailing_pe,
+        gpone=gpone,
+        as_of=_day(gpone),
+        restate_peg=PegRestatement(trailing_peg=trailing_peg, financials=_strategies_for(gpone)),
+    )
+
+    assert chosen.unreadable == ("sz000001",)
+    assert chosen.peg is not None
+    assert chosen.peg["sz000001"].tolist() == [3.0] * 4, "读不到就不动它，也不抹掉它"
+    assert "sz000001" not in chosen.peg_missing
+
+
+def test_without_a_restatement_peg_is_none_and_nothing_else_moves(gpone):
+    """不给 ``restate_peg`` 就整段跳过 PEG——``b1`` 一个 PEG 门都没有，不花这笔钱。
+
+    ``peg is None`` 表示「这次没重述」，而**不是**「重述后写不进去」：这两件事必须分得开，
+    否则调用方没法判断该不该把表写回去。
+    """
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in ("sh600519", "sh600006", "sz000001")})
+    close = _frame({symbol: [1010.58] * 4 for symbol in trailing_pe.columns})
+
+    chosen = chosen_valuation(close, trailing_pe, gpone=gpone, as_of=_day(gpone))
+
+    assert chosen.peg is None
+    assert chosen.peg_missing == ()
+    assert chosen.pe.loc[_day(gpone), "sh600519"] == pytest.approx(15.0, rel=1e-6), "PE 照旧走前瞻"
+
+
+def test_an_evaluation_day_before_the_file_was_written_restates_no_peg(gpone):
+    """评估日早于写入日 → PEG 整张表逐格不变。回测的评估日全在过去，走的就是这一支。"""
+    import datetime as dt
+
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in ("sh600519", "sh600006", "sz000001")})
+    close = _frame({symbol: [1010.58] * 4 for symbol in trailing_pe.columns})
+    trailing_peg = _peg_frame({symbol: [3.0] * 4 for symbol in trailing_pe.columns})
+    earlier = _day(gpone) - dt.timedelta(days=3)
+
+    chosen = chosen_valuation(
+        close,
+        trailing_pe,
+        gpone=gpone,
+        as_of=earlier,
+        restate_peg=PegRestatement(trailing_peg=trailing_peg, financials=_strategies_for(gpone)),
+    )
+
+    assert chosen.peg_missing == (), "评估日还没到写入日，财年T 就不该被拿来用"
+    assert chosen.peg is not None and chosen.peg.equals(trailing_peg), "早于写入日却动了 PEG"
+
+
+def test_a_peg_frame_that_does_not_line_up_is_rejected(gpone):
+    """PEG 表对不上也得报错——它和 PE 表要逐格改写同一批 (标的, 交易日)。"""
+
+    trailing_pe = _frame({symbol: [10.0] * 4 for symbol in _PEG_COLUMNS})
+    close = _frame({symbol: [10.0] * 4 for symbol in trailing_pe.columns})
+    wider = _peg_frame(
+        {symbol: [3.0] * 4 for symbol in ("sh600519", "sh600006", "sz000001", "sh600999")},
+        columns=("sh600519", "sh600006", "sz000001", "sh600999"),
+    )
+
+    with pytest.raises(ValueError, match="restate_peg"):
+        chosen_valuation(
+            close,
+            trailing_pe,
+            gpone=gpone,
+            as_of=_day(gpone),
+            restate_peg=PegRestatement(trailing_peg=wider, financials=_strategies_for(gpone)),
+        )
+
+
+def test_the_peg_restatement_cannot_be_half_given():
+    """给定 PEG 的两个输入是**一个**类型：只给表格不给财务，在构造处就写不出来。
+
+    这与 :class:`Chosen` 的用意一样——把「给了一半」这种中间态从类型上消掉，而不是靠约定。
+    """
+    with pytest.raises(TypeError):
+        PegRestatement(trailing_peg=_peg_frame({symbol: [1.0] * 4 for symbol in _PEG_COLUMNS}))

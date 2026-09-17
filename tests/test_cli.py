@@ -1606,6 +1606,115 @@ def test_a_screen_other_than_b1_ignores_the_forward_root(tmp_path):
     assert metadata["valuation_caliber"] is None
 
 
+def test_the_growth_screen_restates_the_peg_and_says_how_many_it_dropped(tmp_path):
+    """``undervalued_growth`` 按前瞻跑时，PEG 也要重述——并**印出**它摘掉了多少只。
+
+    两件事一起钉：① 原式那条 ``财年T>0`` 的守卫真的生效了（``sh600006`` 在一致预期文件里但
+    没有预期，故评估日那天它的 PEG 该是缺失）；② 这个数必须说出来——PEG 那道门这次只看得到
+    池子的一部分，不印出来，读产物的人只会看到候选变少而不知道为什么。
+    """
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60, start="2026-06-01")
+    # 再加一只**在一致预期文件里、但没有预期**的标的（财年T = 0），它就是被守卫摘掉的那个。
+    make_dataroot(tmp_path, symbol="sh600006", periods=60, start="2026-06-01")
+    forward_root = _forward_root_written_on(tmp_path, "2026-06-15")
+    args = screen_args(
+        screen="undervalued_growth",
+        as_of="2026-07-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    printed = out.getvalue()
+    assert "前瞻：1/2 个标的按「选用PE」评估" in printed
+    assert "PEG：1/2 个标的在评估日没有 PEG" in printed
+
+    import json
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    caliber = metadata["valuation_caliber"]
+    assert caliber["forward_symbols"] == 1
+    assert caliber["peg_missing"] == 1, "摘掉了谁必须记进产物，不能只在屏幕上闪过"
+    assert "选用增" in caliber["peg_caliber"]
+
+
+def test_the_legacy_valuation_screen_keeps_the_historical_peg(tmp_path):
+    """``valuation``（旧版，留给对照实验用）**不开**前瞻——它要是也换口径，对照就一起动了。
+
+    与 ``momentum`` 那条的区别在于：``valuation`` 真的读 PE 与 PEG，所以「不开」是个取舍，
+    不是「用不上」。故它单独测一遍，免得日后有人按「读估值的都该开」把它加进名单。
+    """
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60, start="2026-06-01")
+    forward_root = _forward_root_written_on(tmp_path, "2026-06-15")
+    args = screen_args(
+        screen="valuation",
+        as_of="2026-07-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "前瞻：" not in out.getvalue()
+
+    import json
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert metadata["valuation_caliber"] is None
+
+
+def test_the_data_snapshot_records_the_consensus_files_it_read(tmp_path):
+    """那份 ``gp*one.dat`` 进了 ``run.json`` 的数据摘要（票据 #50 修订）。
+
+    它从接上前瞻那天起就是选股的真实输入之一，却一直没进摘要——于是产物说的「这次读了哪些
+    文件」是错的。这里同时钉两件事：**跑了前瞻就记**，**没跑前瞻就不记**（后者由
+    ``momentum`` 那条守着，见上）。
+    """
+    import json
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60, start="2026-06-01")
+    forward_root = _forward_root_written_on(tmp_path, "2026-06-15")
+    args = screen_args(
+        screen="b1",
+        as_of="2026-07-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    manifest = [entry["path"] for entry in metadata["data_snapshot"]["manifest"]]
+
+    assert any(path.endswith("gpshone.dat") for path in manifest), manifest
+    assert not any(path.endswith("gpbjone.dat") for path in manifest), "本机没有这份，别记假的"
+
+
 def _forward_root_written_on(tmp_path, day: str):
     """把真实夹具拷成一份一致预期目录，并把**写入日**改成给定的一天。
 

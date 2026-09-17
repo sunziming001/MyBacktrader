@@ -81,6 +81,20 @@ DEFAULT_QUALITY_BARS = 1300
 ALL_CANDIDATES = "all"
 
 
+#: **前瞻口径开给哪几条规则**——白名单，不在名单里的整步跳过。
+#:
+#: 默认关是刻意的：前瞻换的是「便宜/贵」的口径，而 ``valuation``（旧版规则）在仓库里的用途
+#: 恰恰是给新规则当对照物——让它跟着换口径，对照也一起移动了。故名单里只有现役的两条：
+#: ``b1``（PE 与 PE 百分位两条门）与 ``undervalued_growth``（同上，外加 PEG）。
+FORWARD_SCREENS = ("b1", "undervalued_growth")
+
+#: 名单里**还读 PEG** 的那几条——它们要多重述一份 ``选用PEG``。
+#:
+#: ``b1`` 一个 PEG 门都没有；为它重述要按标的各读一遍基期年报净利，那是白花的钱。
+#: 故这里比 :data:`FORWARD_SCREENS` 更窄，而不是让所有人一起算。
+PEG_SCREENS = ("undervalued_growth",)
+
+
 def _count_or_all(raw: str):
     """``--top-n`` 的取值解析：整数，或字面 ``all``。"""
     if raw == ALL_CANDIDATES:
@@ -205,10 +219,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help="一致预期数据目录（T0002/hq_cache，里面是 gpshone.dat / gpszone.dat）。给了就在"
-        "**评估日当天**对 B1 启用前瞻口径：有一致预期的标的按「选用PE」评估，没有的退回历史。"
+        "**评估日当天**给读估值的规则启用前瞻口径：有一致预期的标的按「选用PE」评估，没有的"
+        "退回历史。开给 b1 与 undervalued_growth 两条（后者连 PEG 一起换成原式的"
+        "「PEG := 选用PE ÷ 选用增」，那道「财年T>0」守卫会让没有一致预期的标的**没有 PEG**）；"
+        "valuation（旧版）刻意不开，它是留给对照实验的。"
         "一致预期是**快照**、没有历史，故它只在评估日不早于该文件最后一次写入时生效——"
         "回溯到更早的日子会自动退回历史口径，故**回测侧刻意没有这个开关**"
-        "（理由与实测数字见 ADR-0006 修订二、修订三）。",
+        "（理由与实测数字见 ADR-0006 修订二、修订三、修订四）。",
     )
     screen.add_argument(
         "--non-loss",
@@ -456,7 +473,9 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         skipped=loaded.skipped,
         benchmark_prices=benchmark,
         benchmark_symbol=args.benchmark,
-        snapshot_paths=_snapshot_paths(loaded, args),
+        # 回测那条路**结构上**够不着一致预期（`_forward_caliber` 只有 `screen` 调），
+        # 故那两份文件一个字节都没读——记进摘要就又是假话了。
+        snapshot_paths=_snapshot_paths(loaded, args, used_forward=False),
     )
 
     _report_result(result, run_dir, stdout)
@@ -624,20 +643,29 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
 
 
 def _forward_caliber(args, *, signals, markets, as_of, screen_label, stdout) -> dict | None:
-    """把 ``选用PE`` 写进 ``signals``，并回报这次用的是哪一档口径。
+    """把 ``选用PE``（读 PEG 的规则还多一份 ``选用PEG``）写进 ``signals``，并回报这次用的口径。
 
     **只有 ``mbt screen`` 调这个函数。** 回测那条路不调，故一致预期在结构上进不了回测——
     这不是靠条件判断挡住的，是根本没有那条代码路径。
 
     启用条件（缺一不可，给不全就整步跳过并说明原因）：
 
-    ======================  ==================================================
-    条件                    为什么
-    ======================  ==================================================
-    ``--forward-root`` 给了 没给就是「不启用」，这是默认。
-    ``--screen b1``         B1 的估值两条过滤器才读 PE；别的规则不吃这一档。
-    ``--cw-root`` 给了      没有历史 PE 序列就无从「用历史兜底」。
-    ======================  ==================================================
+    ==========================  ==================================================
+    条件                        为什么
+    ==========================  ==================================================
+    ``--forward-root`` 给了     没给就是「不启用」，这是默认。
+    ``--screen`` 在名单里       见 :data:`FORWARD_SCREENS`：只有读估值的规则吃这一档。
+    ``--cw-root`` 给了          没有历史 PE 序列就无从「用历史兜底」。
+    ==========================  ==================================================
+
+    **为什么是白名单。** 默认关、要用就显式加进来：前瞻改的是「便宜/贵」的口径，而
+    ``valuation``（旧版规则）在仓库里的用途恰恰是给新规则当**对照物**——让它跟着换口径，
+    对照也就一起移动了，那两份产物就没法比。故名单里只有现役的两条。
+
+    **PEG 是另一档，只给读它的规则。** ``undervalued_growth`` 的 ``growth_worth_paying``
+    门读 PEG，故它的前瞻那一档要把 PEG 也按原式重述（``选用PE ÷ 选用增``，外加原式那条
+    ``财年T>0`` 的守卫——**没有一致预期就没有 PEG**，会摘掉池子里一大片）。``b1`` 没有 PEG
+    门，为它多算一遍基期净利是白花的钱，故不重述。
 
     **逐标的降级发生在 :func:`mbt.data.forward.chosen_valuation` 里**，判据是「评估日不早于
     该文件最后一次写入」。故这里不需要判断「现在是不是盘后」——回溯到更早的日子会自己退回
@@ -645,24 +673,36 @@ def _forward_caliber(args, *, signals, markets, as_of, screen_label, stdout) -> 
 
     返回值是写进产物的口径记录（``None`` 表示这一步没跑）。降级要看得见：印一行说明。
     """
-    if not getattr(args, "forward_root", None) or screen_label != "b1":
+    if not getattr(args, "forward_root", None) or screen_label not in FORWARD_SCREENS:
         return None
     if not getattr(args, "cw_root", None):
         return None
 
     import pandas as pd
 
-    from mbt.data import FORWARD_CAVEAT, GponeDataSource, chosen_valuation
-    from mbt.data.valuation import PE, PE_PERCENTILE
+    from mbt.data import FORWARD_CAVEAT, GponeDataSource, PegRestatement, chosen_valuation
+    from mbt.data.fundamental import CwDataSource
+    from mbt.data.valuation import PE, PE_PERCENTILE, PEG
 
     close = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
     existing = signals[PE]
+    restate = (
+        PegRestatement(trailing_peg=signals[PEG], financials=CwDataSource(args.cw_root))
+        if screen_label in PEG_SCREENS
+        else None
+    )
     chosen = chosen_valuation(
-        close, existing, gpone=GponeDataSource(args.forward_root), as_of=as_of
+        close,
+        existing,
+        gpone=GponeDataSource(args.forward_root),
+        as_of=as_of,
+        restate_peg=restate,
     )
 
     signals[PE] = chosen.pe
     signals[PE_PERCENTILE] = chosen.pe_percentile
+    if chosen.peg is not None:
+        signals[PEG] = chosen.peg
 
     total = len(chosen.pe.columns)
     print(
@@ -684,8 +724,17 @@ def _forward_caliber(args, *, signals, markets, as_of, screen_label, stdout) -> 
             f"（如 {chosen.unreadable[0]}）——--forward-root 指对了吗？",
             file=stdout,
         )
+    if chosen.peg is not None:
+        # 这一行必须印：它说清了 PEG 那道门这次实际只看得到池子的多少。缺的那部分不是
+        # 「数据没更新」，是原式自己那三条守卫摘掉的——不印出来，读产物的人只会看到
+        # 候选变少而不知道为什么。
+        print(
+            f"  PEG：{len(chosen.peg_missing)}/{total} 个标的在评估日没有 PEG"
+            "（原式的三条守卫：没有一致预期、预测亏损、基期亏损），这些标的过不了 PEG 那道门",
+            file=stdout,
+        )
 
-    return {
+    caliber = {
         "caliber": "选用PE（前瞻优先，无一致预期者退回历史）",
         "as_of": as_of.isoformat(),
         "forward_symbols": len(chosen.forward_symbols),
@@ -694,6 +743,10 @@ def _forward_caliber(args, *, signals, markets, as_of, screen_label, stdout) -> 
         "unreadable": len(chosen.unreadable),
         "note": FORWARD_CAVEAT,
     }
+    if chosen.peg is not None:
+        caliber["peg_caliber"] = "选用PE ÷ 选用增（原式三道守卫：选用PE>0、|选用增|>0.1、财年T>0）"
+        caliber["peg_missing"] = len(chosen.peg_missing)
+    return caliber
 
 
 def _resolve_as_of(panel, stdout, stderr):
@@ -1154,11 +1207,25 @@ def _load_benchmark(args, stderr):
         return None
 
 
-def _snapshot_paths(loaded, args) -> list[Path]:
-    """本次实际读到的文件：各标的的 ``.day`` 加上权息文件——数据快照摘要要覆盖全部。"""
+def _snapshot_paths(loaded, args, *, used_forward: bool) -> list[Path]:
+    """本次实际读到的文件：各标的的 ``.day``、权息文件，以及一致预期那两份（**真用了才记**）。
+
+    ``gp*one.dat`` 2026-09-17 才补进来（票据 #50 修订）：它从接上前瞻那天起就是选股的**真实
+    输入**之一，却一直不在摘要里——于是产物说的「这次读了哪些文件」是错的。溯源记录错一处，
+    回头对账就没法解释两份名单为什么不同。
+
+    ``used_forward`` 由调用方按「前瞻那一步到底跑没跑」给出，而不是看 ``--forward-root``
+    给没给：给了一条不读估值的规则（如 ``momentum``），那两份文件一个字节都没读，记进去就
+    又变成假话了。
+    """
     source = TdxDataSource(args.tdx_root)
     paths = [source.path_for(market.symbol) for market in loaded.markets]
     paths.append(Path(args.gbbq))
+    forward_root = getattr(args, "forward_root", None)
+    if used_forward and forward_root:
+        from mbt.data import GponeDataSource
+
+        paths.extend(GponeDataSource(forward_root).files())
     return paths
 
 
@@ -1304,7 +1371,9 @@ def _write_screen_artifacts(
         "screen": describe_screen(screen, screen_label),
         "valuation_caliber": caliber,
         "universe": universe,
-        "data_snapshot": data_snapshot(_snapshot_paths(loaded, args)),
+        "data_snapshot": data_snapshot(
+            _snapshot_paths(loaded, args, used_forward=caliber is not None)
+        ),
         "git": git_version(),
     }
     (run_dir / "run.json").write_text(
