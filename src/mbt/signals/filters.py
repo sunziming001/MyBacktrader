@@ -317,11 +317,15 @@ def no_contained_run(panel: Panel, anchors, *, days: int) -> pd.DataFrame:
     rows, columns = close.shape
     # 内含：收盘落在**前一根**的区间内。shift(1) 处缺失 ⇒ 比较为假，正是「不给乐观答案」。
     contained = ((close <= high.shift(1)) & (close >= low.shift(1))).to_numpy(dtype=bool)
-    bits = contained.astype(np.int64)
 
     # c 上长度为 days 的滑动窗口和（截止当根、含当根）；不足 days 根处不可能满足。
-    cumulative = np.cumsum(bits, axis=0)
-    base = np.zeros((rows, columns), dtype=np.int64)
+    #
+    # **位置与计数一律用 int32，不用 int64**（issue #78）。面板的行数是「全体交易日的并集」，
+    # 目前 8,786 行，离 2^31 差着五个数量级；而同一张面板上 int64 一格是 8 字节，合计
+    # **366 MiB 一个**（8786 × 5453 × 8），本函数一次要摆好几个。全市场跑批因此撞上内存上限、
+    # 整轮作废（实测 2026-09-17 一晚两红两绿）。逐格语义不变，故这里只是换宽度。
+    cumulative = np.cumsum(contained, axis=0, dtype=np.int32)
+    base = np.zeros((rows, columns), dtype=np.int32)
     if rows > days:
         base[days:] = cumulative[:-days]
     window_sum = cumulative - base
@@ -330,7 +334,7 @@ def no_contained_run(panel: Panel, anchors, *, days: int) -> pd.DataFrame:
         window[:] = False
 
     # 最近一次满足的行号；-1 表示此前没有。
-    positions = np.where(window, np.arange(rows, dtype=np.int64)[:, None], -1)
+    positions = np.where(window, np.arange(rows, dtype=np.int32)[:, None], -1)
     latest = np.maximum.accumulate(positions, axis=0)
 
     # 段起点 = 峰值 + 1 = (row - peak_age) + 1；窗口左端 = latest - days + 1。
@@ -338,7 +342,7 @@ def no_contained_run(panel: Panel, anchors, *, days: int) -> pd.DataFrame:
     peak_age = anchors.peak_age.to_numpy(dtype=float)
     with np.errstate(invalid="ignore"):
         left_edge = latest - days + 1
-        segment_start = np.arange(rows, dtype=np.int64)[:, None] - peak_age + 1
+        segment_start = np.arange(rows, dtype=np.int32)[:, None] - peak_age + 1
         # 本函数答的是「**没有**这样的串才算合格」，故这里必须**取反**：
         # `has_run` 为真表示调整期内确实存在那么一段，那一格不合格。
         has_run = left_edge >= segment_start

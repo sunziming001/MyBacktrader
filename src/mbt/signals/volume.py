@@ -463,7 +463,8 @@ def _top_of_advance(high: np.ndarray, trough_pos: np.ndarray) -> np.ndarray:
     推进，故重扫的总代价是 O(行数·列数)，不是 O(段长·行数)。实测全市场约 4 秒。
     """
     rows, columns = high.shape
-    top = np.full((rows, columns), -1, dtype=np.int64)
+    # 存的是**行号**（-1 表示段无效），不是价格：int32 足够（见 issue #78 那条注记）。
+    top = np.full((rows, columns), -1, dtype=np.int32)
     for column in range(columns):
         current = -1
         best = -1.0
@@ -673,8 +674,9 @@ def volume_pattern(
     finite = np.isfinite(vol)
     prefix_total = np.zeros((rows + 1, columns), dtype=float)
     prefix_total[1:] = np.where(finite, vol, 0.0).cumsum(axis=0)
-    prefix_count = np.zeros((rows + 1, columns), dtype=np.int64)
-    prefix_count[1:] = finite.cumsum(axis=0)
+    # 计数是**窗口内有限值的个数**，最大就是行数，int32 足够（见 issue #78 那条注记）。
+    prefix_count = np.zeros((rows + 1, columns), dtype=np.int32)
+    prefix_count[1:] = finite.cumsum(axis=0, dtype=np.int32)
 
     for column in range(columns):
         first, last = int(bounds[column]), int(bounds[column + 1])
