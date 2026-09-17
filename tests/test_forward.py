@@ -18,7 +18,14 @@ from pathlib import Path
 import pytest
 
 from mbt.data import Chosen, ForwardReading, choose, reading, readings_frame, uses_forward
-from mbt.data.forward import FIELD_EPS_T, FIELD_FISCAL_YEAR, FIELD_NET_PROFIT_T, FIELD_PE_EXPECTED
+from mbt.data.forward import (
+    FIELD_EPS_T,
+    FIELD_FISCAL_YEAR,
+    FIELD_NET_PROFIT_T,
+    FIELD_PE_EXPECTED,
+    chosen_valuation,
+    forward_available,
+)
 from mbt.data.fundamental import FinancialRecord
 from mbt.data.gpone import GponeDataSource
 
@@ -294,3 +301,220 @@ def test_the_snapshot_frame_is_one_row_per_symbol(gpone):
 def test_the_field_ordinals_are_the_ones_the_formula_names():
     """四个字段号写死在常量里，与帮助原文对齐——改错了会读到另一个字段。"""
     assert (FIELD_FISCAL_YEAR, FIELD_EPS_T, FIELD_NET_PROFIT_T, FIELD_PE_EXPECTED) == (4, 5, 8, 23)
+
+
+# --- 五、可用性判据：从文件写下那天起才许用（票据 #50 修订） -----------------
+
+
+def test_forward_is_available_from_the_day_the_file_was_written_onward(gpone):
+    """``评估日 ≥ 文件最后写入日`` ⇒ 可用；早一天就不行。
+
+    早于该日的评估日上，我们手上这份内容**可能已经不是**那天的内容——不可知，故不许用。
+    这一条把「前瞻只在盘后选股生效」从约定变成了可执行的判据：日常任务收盘后下载、
+    随即选股，评估日正好等于写入日。
+    """
+    import datetime as dt
+
+    written = gpone.updated_on("sh600519")
+
+    assert forward_available("sh600519", gpone=gpone, as_of=written) is True
+    assert forward_available("sh600519", gpone=gpone, as_of=written - dt.timedelta(days=1)) is False
+
+
+def test_forward_is_unavailable_once_the_bar_year_leaves_the_forecast_year(gpone):
+    """写入日之后也**不一定**可用：原式还有 ``K线年 = 财年T`` 这条。
+
+    fixture 里一致预期指的财年是 2026，故到了 2027 年就不能再拿它当「今年的预期」——
+    那是去年的预测，而原式特意拦住了这一脚。
+    """
+    import datetime as dt
+
+    written = gpone.updated_on("sh600519")
+    after_the_forecast_year = dt.date(written.year + 1, 1, 5)
+
+    assert forward_available("sh600519", gpone=gpone, as_of=after_the_forecast_year) is False
+
+
+def test_a_symbol_without_a_consensus_falls_back_to_trailing(gpone):
+    """``sh600006`` 在文件里、也有别的字段，但**没有一致预期**（财年T = 0）→ 退回历史。
+
+    这正是「有前瞻就用前瞻，没有就用历史」里那个「没有」。
+    """
+    assert forward_available("sh600006", gpone=gpone, as_of=gpone.updated_on("sh600006")) is False
+
+
+def test_a_market_without_a_file_cannot_answer_the_question(gpone):
+    """文件读不到时 ``forward_available`` **报错**，而不是回答 ``False``。
+
+    「这只票没有一致预期」和「我把目录指错了」是两件事，判据本身分不出来，故把分类留给
+    调用方：:func:`chosen_valuation` 会接住它、退回历史，并把读不到的标的**点名列出来**。
+    """
+    import datetime as dt
+
+    from mbt.data.errors import MarketDataError
+
+    with pytest.raises(MarketDataError):
+        forward_available("sz000001", gpone=gpone, as_of=dt.date(2026, 9, 17))
+
+
+# --- 六、把选择落到表上 -----------------------------------------------------
+
+
+def _frame(values_by_symbol, columns=("sh600519", "sh600006", "sz000001")):
+    """把 ``{标的: [四天的 PE]}`` 摊成日期 × 标的的表；列序**显式**给出，便于断言。"""
+    import pandas as pd
+
+    index = pd.bdate_range("2026-09-14", periods=4)
+    return pd.DataFrame(values_by_symbol, index=index)[list(columns)]
+
+
+def _day(gpone):
+    """fixture 文件的写入日，**转成 Timestamp**——索引是 DatetimeIndex，用 ``date`` 恒不命中。"""
+    import pandas as pd
+
+    return pd.Timestamp(gpone.updated_on("sh600519"))
+
+
+def test_the_chosen_pe_switches_only_the_evaluation_day(gpone):
+    """``选用PE`` 只有**评估日那一行**换成前瞻值，更早的行一格不动。
+
+    期望值手算：茅台一致预期 EPS 是 67.372，取收盘 1010.58 使 ``PE前瞻 = 15``（整数好核对）。
+    前三天按历史口径是 10 / 20 / 10，评估日那行则由 10 变成 15。
+    """
+    trailing = _frame(
+        {
+            "sh600519": [10.0, 20.0, 10.0, 10.0],
+            "sh600006": [5.0, 30.0, 5.0, 30.0],
+            "sz000001": [8.0, 8.0, 20.0, 8.0],
+        }
+    )
+    close = _frame(
+        {
+            "sh600519": [1010.58] * 4,
+            "sh600006": [10.0] * 4,
+            "sz000001": [10.0] * 4,
+        }
+    )
+    as_of = _day(gpone)
+
+    chosen = chosen_valuation(close, trailing, gpone=gpone, as_of=as_of)
+
+    assert chosen.pe.loc[as_of, "sh600519"] == pytest.approx(15.0, rel=1e-6)
+    assert list(chosen.pe["sh600519"][:-1]) == [10.0, 20.0, 10.0], "评估日之前的行不许动"
+    assert chosen.forward_symbols == ("sh600519",)
+
+
+def test_a_symbol_without_a_consensus_keeps_its_trailing_pe(gpone):
+    """没一致预期、或连文件都没有的标的 → 逐格保持历史口径，且**点名**记进 ``unreadable``。
+
+    只有茅台那只该走前瞻；另两只一个是「没有预期」，一个是「整个市场没有文件」。
+    """
+    trailing = _frame(
+        {
+            "sh600519": [10.0, 20.0, 10.0, 10.0],
+            "sh600006": [5.0, 30.0, 5.0, 30.0],
+            "sz000001": [8.0, 8.0, 20.0, 8.0],
+        }
+    )
+    close = _frame({symbol: [10.0] * 4 for symbol in trailing.columns})
+
+    chosen = chosen_valuation(close, trailing, gpone=gpone, as_of=_day(gpone))
+
+    assert chosen.pe["sh600006"].tolist() == [5.0, 30.0, 5.0, 30.0]
+    assert chosen.pe["sz000001"].tolist() == [8.0, 8.0, 20.0, 8.0]
+    assert chosen.forward_symbols == ("sh600519",), "有预期的那只仍该走前瞻"
+    assert chosen.unreadable == ("sz000001",), "文件读不到的要点名，否则指错目录看不出来"
+
+
+def test_a_market_without_the_file_family_is_not_called_unreadable(gpone):
+    """北交所是**已知覆盖缺口**，不是「读不到」。两者必须分开计数。
+
+    合在一起会天天报「--forward-root 指对了吗」：实测本机 5,375 个标的里有 276 只北交所，
+    每天都会顶上来。**天天喊就等于不喊**——真正指错目录的那天反而淹在噪声里。故这里断言：
+    bj 进 ``unsupported``，一个也不进 ``unreadable``。
+    """
+    trailing = _frame(
+        {
+            "sh600519": [10.0, 20.0, 10.0, 10.0],
+            "bj920001": [7.0, 7.0, 7.0, 7.0],
+            "bj430047": [9.0, 9.0, 9.0, 9.0],
+        },
+        columns=("sh600519", "bj920001", "bj430047"),
+    )
+    close = _frame({symbol: [10.0] * 4 for symbol in trailing.columns}, columns=trailing.columns)
+
+    chosen = chosen_valuation(close, trailing, gpone=gpone, as_of=_day(gpone))
+
+    assert chosen.unsupported == ("bj920001", "bj430047")
+    assert chosen.unreadable == (), "北交所有没有 gpbjone.dat 与目录指错无关，不该混进来"
+    assert chosen.pe["bj920001"].tolist() == [7.0, 7.0, 7.0, 7.0], "照历史口径逐格不动"
+
+
+def test_the_percentile_is_recomputed_from_the_chosen_pe(gpone):
+    """百分位必须从 ``选用PE`` **重算**——否则「按前瞻选便宜」只换了分子、没换尺子。
+
+    手算：茅台窗口内 ``选用PE`` 是 10 / 20 / 10 / 15，最低 10、最高 20，故评估日为
+    ``(15 − 10) ÷ 10 = 0.5``；若漏掉重算，它会停在历史口径的 ``(10 − 10) ÷ 10 = 0``。
+    """
+    trailing = _frame(
+        {
+            "sh600519": [10.0, 20.0, 10.0, 10.0],
+            "sh600006": [5.0, 30.0, 5.0, 30.0],
+            "sz000001": [8.0, 8.0, 20.0, 8.0],
+        }
+    )
+    close = _frame(
+        {
+            "sh600519": [1010.58] * 4,
+            "sh600006": [10.0] * 4,
+            "sz000001": [10.0] * 4,
+        }
+    )
+    as_of = _day(gpone)
+
+    chosen = chosen_valuation(close, trailing, gpone=gpone, as_of=as_of)
+
+    assert chosen.pe_percentile.loc[as_of, "sh600519"] == pytest.approx(0.5, rel=1e-6)
+    assert chosen.pe_percentile.loc[as_of, "sh600006"] == pytest.approx(1.0, rel=1e-6)
+    assert chosen.pe_percentile.loc[as_of, "sz000001"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_an_evaluation_day_before_the_file_was_written_changes_nothing(gpone):
+    """把评估日挪到写入日之前，整张表**逐格相同**——那条闸门就是在这里兑现的。
+
+    这正是「回测里前瞻永不生效」的机理：历史 bar 全都早于写入日，故全部退回历史口径。
+    """
+    import datetime as dt
+
+    trailing = _frame(
+        {
+            "sh600519": [10.0, 20.0, 10.0, 10.0],
+            "sh600006": [5.0, 30.0, 5.0, 30.0],
+            "sz000001": [8.0, 8.0, 20.0, 8.0],
+        }
+    )
+    close = _frame({symbol: [1010.58] * 4 for symbol in trailing.columns})
+    earlier = _day(gpone) - dt.timedelta(days=3)
+
+    chosen = chosen_valuation(close, trailing, gpone=gpone, as_of=earlier)
+
+    assert chosen.forward_symbols == ()
+    assert chosen.pe.equals(trailing), "评估日早于写入日却动了数值"
+
+
+def test_a_close_frame_that_does_not_line_up_is_rejected(gpone):
+    """两份表的标的集合不一致 → 报错，不许按标签各对齐各的（那会静默错位）。"""
+    import pandas as pd
+
+    trailing = _frame(
+        {
+            "sh600519": [10.0, 20.0, 10.0, 10.0],
+            "sh600006": [5.0, 30.0, 5.0, 30.0],
+            "sz000001": [8.0, 8.0, 20.0, 8.0],
+        }
+    )
+    close = trailing.copy()
+    close["sh600999"] = pd.Series([1.0] * 4, index=trailing.index)
+
+    with pytest.raises(ValueError, match="标的"):
+        chosen_valuation(close, trailing, gpone=gpone, as_of=_day(gpone))

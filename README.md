@@ -360,6 +360,20 @@ b1_daily.bat
 | `b1_daily.log` | **本次**运行的全部输出（约 8 KB）。失败时脚本会把它 `type` 到控制台 |
 | `b1_daily.history.log` | 历次日志。每次运行前，上一份 `b1_daily.log` 自动滚到这里 |
 
+`run.json` 里还留了一份 `valuation_caliber`：这次有几个标的按前瞻 PE 评估、几个因为所在
+市场没有这族数据、几个因为文件读不到。名单本身**看不出**它用的是哪一档口径（形状完全一样），
+故这条记录是事后复盘「这份名单到底怎么来的」唯一的地方——
+
+```json
+{ "caliber": "选用PE（前瞻优先，无一致预期者退回历史）",
+  "forward_symbols": 1266, "symbols": 5375, "unsupported": 276, "unreadable": 0,
+  "as_of": "2026-09-16", "note": "这是「现在这一版」一致预期，不是评估日当时的；…" }
+```
+
+`unreadable` **不是 0** 就说明 `--forward-root` 指错了（沪深那两份文件不在）；`unsupported`
+是本机没有北交所那份文件，属正常。两个数刻意分开——合起来报会让每天那 276 只北交所标的
+顶成一个「目录指错了吗」的假警报，真指错那天反而看不出来。
+
 日志用**滚动**而不是一路追加：主日志永远只装本次运行，故失败时 `type` 出来的是这次的
 报错，而不是攒了几个月的噪音。历史照样留着，只是搬到了另一个文件。
 
@@ -370,6 +384,23 @@ b1_daily.bat
 与真实数据冒烟测试同一套。**没设、或指错，脚本立刻报错退出**，打印是哪一个变量、
 错在哪——不猜、不兜底。这条纪律的来历见下一节末尾：一个错误的默认路径，会让
 「缺失」看起来像「正常」。
+
+第三个变量 `MBT_TDX_GPONE`（指向 `T0002\hq_cache`，里面是 `gpshone.dat` / `gpszone.dat`）
+**与上面两个不同：它是可选的**。给了，B1 的「PE 为正」那道门在有**一致预期**的标的上改看
+前瞻 PE，于是「按已披露财报在亏、按预测不亏」的标的进得来；没给、或指错，脚本只印一行
+`NOTE` 就照旧用历史口径跑完——**不报错、不退出**，因为它少的只是一项好处。
+
+它可选的代价是「指错了不吭声」，故脚本会检查那个目录里到底有没有 `gpshone.dat`：目录不
+对就出 `NOTE`，而不是把一份空数据当成「今天没人有预期」。口径落在产物里可查（见下），
+日常任务不会靠人去记。
+
+真要用，把它加进环境变量（本机示例）：
+
+```powershell
+$env:MBT_TDX_GPONE = "D:\Tools\new_tdx\T0002\hq_cache"
+```
+
+**别把它指向 `vipdoc`**：那族 `gp*.dat` 是另一个东西（见 `docs/research/` 与 ADR-0008）。
 
 脚本顶部有三个旋钮：`TOP_N`（默认 `all`，即全池不截断）、`OUT_DIR`、`EXTRA`
 （追加给 `mbt screen` 的参数）。
@@ -568,6 +599,7 @@ result = run_backtest(prices, symbol="sh600000", strategy=BuyAndHold)
 ```powershell
 $env:MBT_TDX_ROOT = "D:\Tools\new_tdx\vipdoc"
 $env:MBT_TDX_GBBQ = "D:\Tools\new_tdx\T0002\hq_cache\gbbq"
+$env:MBT_TDX_GPONE = "D:\Tools\new_tdx\T0002\hq_cache"   # 一致预期，只有这块测试要用
 .venv\Scripts\python.exe -m pytest -m realmdata
 ```
 

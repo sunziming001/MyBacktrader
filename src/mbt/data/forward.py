@@ -45,6 +45,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from .valuation import DEFAULT_WINDOW
+
 #: 取「基期年报」的字段名：归母净利润（元，累计）。年末那一期即全年数。
 _BASE_PROFIT_FIELD = "net_profit_ytd"
 
@@ -92,16 +94,8 @@ class ForwardReading:
         return (self.net_profit_t - self.base_net_profit) / self.base_net_profit * 100.0
 
     def pe_forward(self, close: float) -> float:
-        """``PE前瞻 = IF(EPS_T>0, C/EPS_T, IF(PE预期>0, PE预期, 0))``。
-
-        参数:
-            close: **原始价**（当时的成交价），不是后复权价。
-        """
-        if self.eps_t > 0:
-            return close / self.eps_t
-        if self.pe_expected > 0:
-            return self.pe_expected
-        return 0.0
+        """``PE前瞻``——见模块级 :func:`pe_forward`。"""
+        return pe_forward(self.eps_t, self.pe_expected, close=close)
 
 
 @dataclass(frozen=True)
@@ -117,6 +111,22 @@ class Chosen:
     used_forward: bool
 
 
+def pe_forward(eps_t: float, pe_expected: float, *, close: float) -> float:
+    """``PE前瞻 = IF(EPS_T>0, C/EPS_T, IF(PE预期>0, PE预期, 0))``。
+
+    参数:
+        close: **原始价**（当时的成交价），不是后复权价。
+
+    公式只写这一处：:meth:`ForwardReading.pe_forward` 与
+    :func:`chosen_valuation` 都走它，免得同一条式子长成两份而各自漂移。
+    """
+    if eps_t > 0:
+        return close / eps_t
+    if pe_expected > 0:
+        return pe_expected
+    return 0.0
+
+
 def uses_forward(fiscal_year: float, bar_year: int) -> bool:
     """``用前瞻 := 财年T>0 AND K线年=财年T``。
 
@@ -124,6 +134,49 @@ def uses_forward(fiscal_year: float, bar_year: int) -> bool:
     （例如到了次年，T 还是去年那个）——那时用预期口径会拿旧预测配新价格。
     """
     return fiscal_year > 0 and int(fiscal_year) == bar_year
+
+
+def forward_available(symbol: str, *, gpone, as_of) -> bool:
+    """该标的在评估日**能不能**用前瞻口径。
+
+    两条同时成立才算可用：
+
+    ==================  ==================================================
+    条件                为什么
+    ==================  ==================================================
+    ``评估日 ≥ 文件写入日``  一致预期是**快照**、没有历史（ADR-0006 修订二）。早于文件写入日的
+                        评估日上，我们手上这份内容可能已经不是那天的内容——不可知，故不许用。
+    ``用前瞻`` 成立        原式自己的那条（见 :func:`uses_forward`）：有预期、且财年对得上当前年份。
+    ==================  ==================================================
+
+    第一条把「前瞻只在盘后选股生效」从约定变成了**判据**：日常任务收盘后下载数据、随即选股，
+    评估日正好等于写入日；而任何回溯到更早的评估日，手里这份快照都可能已被后面的下载覆盖过。
+
+    拿不到前瞻的（没一致预期、财年对不上）返回 ``False``——「没有就用历史」。
+
+    .. warning::
+
+        文件**读不到**时本函数**报错**，不是返回 ``False``。「这只票没有一致预期」与「目录
+        指错了」是两回事，判据本身分不出来。调用方（:func:`chosen_valuation`）接住它、退回
+        历史，并把读不到的标的点名列出来——降级可以是暗的，但**指错目录不能**。
+
+        调用方要先把「这市场压根没有这族文件」摘出去（:meth:`GponeDataSource.covers`），
+        否则北交所那几百只每天都会顶上来当「读不到」。
+
+    这只回答「能不能用」，不回答「用了多少」；调用方要统计并印出来。
+
+    参数:
+        as_of: 评估日（``datetime.date``）。**这是可用性的闸门，不是取数的键**——本模块仍然
+            取不到「评估日当时」的一致预期，只是拒绝在不足以支撑它的日子上使用。
+    """
+    import datetime as dt
+
+    if isinstance(as_of, dt.datetime):
+        as_of = as_of.date()
+    written = gpone.updated_on(symbol)
+    fiscal_year = gpone.value(symbol, FIELD_FISCAL_YEAR)
+
+    return written <= as_of and uses_forward(fiscal_year or 0.0, as_of.year)
 
 
 def choose(
@@ -228,3 +281,129 @@ def readings_frame(readings_by_symbol: Mapping[str, ForwardReading]) -> pd.DataF
             for symbol, item in readings_by_symbol.items()
         }
     ).T
+
+
+@dataclass(frozen=True)
+class ChosenValuation:
+    """盘后选股用的**「选用PE」两张表**：数值表与由它重算的百分位表。
+
+    两张**必须同出一处**：百分位是「在窗口里的相对位置」，换了分子却留着旧尺子，读出来的
+    便宜/贵就不是同一个口径了。故这里不给「只要一张」的构造方式。
+
+    属性:
+        pe: ``选用PE``——评估日那一行前瞻优先（有前瞻数据的标的），其余行是历史口径。
+        pe_percentile: 由 ``pe`` 重算的百分位，窗口与 :func:`mbt.data.valuation.pe_percentile` 同。
+        forward_symbols: 走成了前瞻的标的（评估日那行确实换了值的）。
+        unsupported: 该市场**根本没有**这族文件的标的（本机是北交所，没有 ``gpbjone.dat``——
+            公式文档说 ``GPONEDAT`` 适用沪深京，但客户端没落这个文件）。这是**已知的覆盖
+            缺口**，安静退回历史即可，不该报错。
+        unreadable: 市场**有**这族文件、但文件读不到（如 ``--forward-root`` 指错目录）。
+            与 ``unsupported`` 分开正是为了这一条：它需要有人去看一眼。
+
+        ``unsupported`` 与 ``unreadable`` 若合成一个数，盘后选股会**每天**为 276 只北交所
+        标的喊「指对目录了吗」——天天喊就等于不喊，真正指错的那天反而看不出来。
+    """
+
+    pe: pd.DataFrame
+    pe_percentile: pd.DataFrame
+    forward_symbols: tuple[str, ...] = ()
+    unsupported: tuple[str, ...] = ()
+    unreadable: tuple[str, ...] = ()
+
+
+def chosen_valuation(
+    close: pd.DataFrame,
+    trailing_pe: pd.DataFrame,
+    *,
+    gpone,
+    as_of,
+    window: int = DEFAULT_WINDOW,
+) -> ChosenValuation:
+    """把历史 PE 表换成**盘后选股口径**的 ``选用PE``：评估日那行前瞻优先，其余照旧。
+
+    「有前瞻就用前瞻，没有就用历史」——逐标的降级，判据是 :func:`forward_available`
+    （评估日 ≥ 文件写入日，且原式的 ``用前瞻`` 成立）。
+
+    「没有前瞻」有两种，走的是两条分支、报的也是两种话：市场**没有这族文件**（北交所）是
+    已知缺口，安静退回；市场**有文件但读不到**才记进 ``unreadable`` 让人去看。合起来报会让
+    盘后选股每天为几百只北交所标的喊「目录指错了吗」，真正指错的那天就被淹了。
+
+    **为什么只动评估日那一行。** 本地的一致预期是快照、没有历史（ADR-0006 修订二），故历史
+    各行**没有**前瞻值可取——它们只能是历史口径。这也顺带给出了本模块最重要的那条性质：
+    任何早于文件写入日的评估日上，整张表逐格不变，于是**回测里前瞻永不生效**（回测的评估日
+    全在过去）。有一条测试钉着它。
+
+    **百分位是重算的**，且窗口里混着两种口径：历史的那些点是历史 PE，评估日那点是前瞻 PE。
+    这是机械结果，不是选择——历史那一段确实没有前瞻可取。代价是**偏移**：一致预期 EPS 高于
+    实际 EPS 的标的，``PE前瞻 < PE历史``，于是显得更便宜、更容易过「PE 百分位低」那道门。
+    要用这张表就得认下这个偏移，别把它当成两把尺子量出来的同一个数。
+
+    参数:
+        close: **原始价**（当时的成交价）表，日期 × 标的。PE 要用原始价，不是后复权价。
+        trailing_pe: 历史口径的动态 PE 表，形状须与 ``close`` 一致。
+        as_of: 评估日，必须落在两张表的索引里。
+    """
+    for name, frame in (("close", close), ("trailing_pe", trailing_pe)):
+        if not _same_labels(close, frame):
+            raise ValueError(
+                f"close 与 trailing_pe 的标的/交易日不一致（{name} 对不上）——"
+                "两者必须同源同形，否则会按标签各对齐各的、静默错位"
+            )
+
+    from .errors import MarketDataError
+    from .valuation import pe_percentile
+
+    # `as_of` 收 `date` / `datetime` / 字符串，与 `Screen.apply` 同宽；但对表下笔时得是
+    # `Timestamp`——`DatetimeIndex` 不做隐式转换，拿 `date` 去比会**恒不命中**。
+    stamp = pd.Timestamp(as_of)
+    if stamp not in close.index:
+        raise ValueError(
+            f"评估日 {as_of} 不在表里——`选用PE` 只写在评估日那一行，日子对不上就无处可写。"
+            "调用方须传一个数据里真有的交易日（见 `mbt screen` 的评估日解析）。"
+        )
+
+    chosen = trailing_pe.copy()
+    went_forward: list[str] = []
+    unsupported: list[str] = []
+    unreadable: list[str] = []
+
+    for symbol in chosen.columns:
+        if not gpone.covers(symbol):
+            # 已知的覆盖缺口（北交所）：退回历史，不报警——见 ChosenValuation 的说明。
+            unsupported.append(symbol)
+            continue
+        try:
+            usable = forward_available(symbol, gpone=gpone, as_of=stamp)
+        except MarketDataError:
+            # 这个市场有文件、但读不到。降级为历史，但**点名记下**——指错目录时要看得出来。
+            unreadable.append(symbol)
+            continue
+        if not usable:
+            continue
+
+        price = close.at[stamp, symbol]
+        if pd.isna(price):
+            continue
+        chosen.at[stamp, symbol] = pe_forward(
+            gpone.value(symbol, FIELD_EPS_T) or 0.0,
+            gpone.value(symbol, FIELD_PE_EXPECTED) or 0.0,
+            close=float(price),
+        )
+        went_forward.append(symbol)
+
+    return ChosenValuation(
+        pe=chosen,
+        pe_percentile=pe_percentile(chosen, window),
+        forward_symbols=tuple(went_forward),
+        unsupported=tuple(unsupported),
+        unreadable=tuple(unreadable),
+    )
+
+
+def _same_labels(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+    """两张表是否同日同标的——顺序不比，集合与索引类型要比。"""
+    return (
+        left.shape == right.shape
+        and left.index.equals(right.index)
+        and left.columns.equals(right.columns)
+    )

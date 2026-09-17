@@ -201,6 +201,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="财务数据目录（vipdoc/cw）。用 --non-loss 时必填",
     )
     screen.add_argument(
+        "--forward-root",
+        default=None,
+        metavar="DIR",
+        help="一致预期数据目录（T0002/hq_cache，里面是 gpshone.dat / gpszone.dat）。给了就在"
+        "**评估日当天**对 B1 启用前瞻口径：有一致预期的标的按「选用PE」评估，没有的退回历史。"
+        "一致预期是**快照**、没有历史，故它只在评估日不早于该文件最后一次写入时生效——"
+        "回溯到更早的日子会自动退回历史口径，故**回测侧刻意没有这个开关**"
+        "（理由与实测数字见 ADR-0006 修订二、修订三）。",
+    )
+    screen.add_argument(
         "--non-loss",
         action="store_true",
         help="启用「非亏损」过滤（按公告日的累计归母净利润；缺财报的标的排除）",
@@ -613,6 +623,79 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
     return factory(top_n=top_n), signals
 
 
+def _forward_caliber(args, *, signals, markets, as_of, screen_label, stdout) -> dict | None:
+    """把 ``选用PE`` 写进 ``signals``，并回报这次用的是哪一档口径。
+
+    **只有 ``mbt screen`` 调这个函数。** 回测那条路不调，故一致预期在结构上进不了回测——
+    这不是靠条件判断挡住的，是根本没有那条代码路径。
+
+    启用条件（缺一不可，给不全就整步跳过并说明原因）：
+
+    ======================  ==================================================
+    条件                    为什么
+    ======================  ==================================================
+    ``--forward-root`` 给了 没给就是「不启用」，这是默认。
+    ``--screen b1``         B1 的估值两条过滤器才读 PE；别的规则不吃这一档。
+    ``--cw-root`` 给了      没有历史 PE 序列就无从「用历史兜底」。
+    ======================  ==================================================
+
+    **逐标的降级发生在 :func:`mbt.data.forward.chosen_valuation` 里**，判据是「评估日不早于
+    该文件最后一次写入」。故这里不需要判断「现在是不是盘后」——回溯到更早的日子会自己退回
+    历史口径，而回测的评估日全在过去。
+
+    返回值是写进产物的口径记录（``None`` 表示这一步没跑）。降级要看得见：印一行说明。
+    """
+    if not getattr(args, "forward_root", None) or screen_label != "b1":
+        return None
+    if not getattr(args, "cw_root", None):
+        return None
+
+    import pandas as pd
+
+    from mbt.data import FORWARD_CAVEAT, GponeDataSource, chosen_valuation
+    from mbt.data.valuation import PE, PE_PERCENTILE
+
+    close = pd.DataFrame({market.symbol: market.prices["close"] for market in markets})
+    existing = signals[PE]
+    chosen = chosen_valuation(
+        close, existing, gpone=GponeDataSource(args.forward_root), as_of=as_of
+    )
+
+    signals[PE] = chosen.pe
+    signals[PE_PERCENTILE] = chosen.pe_percentile
+
+    total = len(chosen.pe.columns)
+    print(
+        f"前瞻：{len(chosen.forward_symbols)}/{total} 个标的按「选用PE」评估"
+        f"（评估日 {as_of:%Y-%m-%d}，其余无一致预期或数据未覆盖，按历史口径）",
+        file=stdout,
+    )
+    if chosen.unsupported:
+        # 不叫「注意」、不问路径：这是本机的已知覆盖缺口（北交所没有 gpbjone.dat）。印出来是
+        # 让人知道这几百只**不是**被漏掉了，只是没有这族数据。
+        print(
+            f"  其中 {len(chosen.unsupported)} 个标的所在市场没有一致预期数据"
+            f"（如 {chosen.unsupported[0]}，见 mbt.data.gpone），照历史口径评估",
+            file=stdout,
+        )
+    if chosen.unreadable:
+        print(
+            f"  注意：{len(chosen.unreadable)} 个标的的一致预期文件读不到"
+            f"（如 {chosen.unreadable[0]}）——--forward-root 指对了吗？",
+            file=stdout,
+        )
+
+    return {
+        "caliber": "选用PE（前瞻优先，无一致预期者退回历史）",
+        "as_of": as_of.isoformat(),
+        "forward_symbols": len(chosen.forward_symbols),
+        "symbols": total,
+        "unsupported": len(chosen.unsupported),
+        "unreadable": len(chosen.unreadable),
+        "note": FORWARD_CAVEAT,
+    }
+
+
 def _resolve_as_of(panel, stdout, stderr):
     """定出该按哪一天评估：``--as-of`` 给了就用它，没给则由数据自己回答。
 
@@ -768,6 +851,17 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 选，两边给出的候选完全不是一回事。
         screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout, progress)
         screen_label = getattr(args, "screen", None) or "none"
+        # **前瞻只在这里接**（票据 #50 修订）。回测那条路（`run_backtest_command`）没有这一步，
+        # 故它在**结构上**够不着一致预期——比在规则里判断「现在是不是盘后」硬得多。
+        # 而且它动的只是数据：`b1_screen` 一个参数都不加，照旧读面板的 PE / PE 百分位。
+        caliber = _forward_caliber(
+            args,
+            signals=signals,
+            markets=list(loaded.markets),
+            as_of=as_of,
+            screen_label=screen_label,
+            stdout=stdout,
+        )
         if screen is None:
             # `--screen none` 才走到这里；`--top-n all` 在规则自己的默认里也是不截断。
             # 产物记的必须是**实际跑的**那条：这一步换成动量之后，标签得跟着改，否则
@@ -801,7 +895,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             loaded=len(loaded.markets),
         )
         run_dir = _write_screen_artifacts(
-            candidates, args, as_of, loaded, screen, screen_label, universe
+            candidates, args, as_of, loaded, screen, screen_label, universe, caliber=caliber
         )
     except Exception as exc:  # noqa: BLE001
         # 落盘失败（如目录已存在）也必须以**退出码**收场，而不是把原始异常抛给调用者。
@@ -1175,13 +1269,17 @@ def _report_candidates(candidates, as_of, run_dir, stdout) -> None:
 
 
 def _write_screen_artifacts(
-    candidates, args, as_of, loaded, screen, screen_label, universe
+    candidates, args, as_of, loaded, screen, screen_label, universe, *, caliber=None
 ) -> Path:
     """选股产物：候选清单 + 元数据。**复用 #10 的目录约定**，不新造一套。
 
     ``screen`` / ``screen_label`` / ``universe`` 由调用方给**实际用的**那些对象与标签——
     本函数自己不猜（原先这里写死过 ``rule`` 与 ``universe`` 两行常量，与 ``--screen`` 无关，
     见票据 #72）。
+
+    ``caliber`` 是这次用的**估值口径**（目前只有前瞻那一档会填）。它不属于 ``Screen``——
+    同一条规则在不同口径的数据上跑，产物必须答得出「这份名单是按哪种口径算的」，
+    否则隔天再翻这份留痕就只能靠猜（票据 #50 修订）。
     """
     import datetime as dt
     import json
@@ -1204,6 +1302,7 @@ def _write_screen_artifacts(
         "candidates": len(candidates),
         "skipped": [{"symbol": item.symbol, "kind": item.kind} for item in loaded.skipped],
         "screen": describe_screen(screen, screen_label),
+        "valuation_caliber": caliber,
         "universe": universe,
         "data_snapshot": data_snapshot(_snapshot_paths(loaded, args)),
         "git": git_version(),

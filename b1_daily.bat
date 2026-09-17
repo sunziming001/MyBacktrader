@@ -72,6 +72,23 @@ if not exist "%MBT_TDX_ROOT%\cw" (
     exit /b 2
 )
 
+rem Consistent-expectation data (forward-looking PE). OPTIONAL on purpose: without
+rem it the run still works, just purely on historical PE -- so a missing path here
+rem is a warning, never a stop. It lives OUTSIDE vipdoc, under the client's
+rem T0002\hq_cache, which is why it needs its own variable.
+rem
+rem What it buys: B1's "PE > 0" gate then reads the FORWARD PE where a consensus
+rem exists, so a name that is loss-making on filed reports but profitable on
+rem forecasts gets in. Only the evaluation day is affected, and only when that day
+rem is not earlier than the file's own write day -- which is exactly the case for
+rem this script (download after close, then screen). Backtests can never reach it;
+rem see ADR-0006 revision 3.
+rem
+rem Note the doubled quotes on the set below. cmd strips only the OUTERMOST pair,
+rem so the inner pair survives into the variable -- which is what we want, since
+rem the path may contain spaces. Verified by running it, not by reading it.
+set "FORWARD="
+
 if not defined MBT_TDX_GBBQ (
     echo ERROR: MBT_TDX_GBBQ is not set ^(the gbbq adjustment-events file^). See the README.
     exit /b 2
@@ -80,6 +97,19 @@ if not exist "%MBT_TDX_GBBQ%" (
     echo ERROR: MBT_TDX_GBBQ points at something that is not there:
     echo        "%MBT_TDX_GBBQ%"
     exit /b 2
+)
+
+rem Placed after the hard errors on purpose: a NOTE about a degraded-but-working
+rem run should not print above an ERROR that then stops the run anyway.
+if defined MBT_TDX_GPONE (
+    if exist "%MBT_TDX_GPONE%\gpshone.dat" (
+        set "FORWARD=--forward-root "%MBT_TDX_GPONE%""
+    ) else (
+        echo NOTE: MBT_TDX_GPONE is set but no gpshone.dat in it -- screening on
+        echo       historical PE only. Expected T0002\hq_cache.
+    )
+) else (
+    echo NOTE: MBT_TDX_GPONE is not set -- screening on historical PE only.
 )
 
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
@@ -110,7 +140,7 @@ echo ===== %DATE% %TIME% ===== > "%LOG%"
     --cw-root "%MBT_TDX_ROOT%\cw" ^
     --watchlist-dir "%OUT_DIR%" ^
     --output-dir "%OUT_DIR%\screens" ^
-    --progress %EXTRA% >> "%LOG%" 2>&1
+    %FORWARD% --progress %EXTRA% >> "%LOG%" 2>&1
 
 set "CODE=%ERRORLEVEL%"
 if not "%CODE%"=="0" (

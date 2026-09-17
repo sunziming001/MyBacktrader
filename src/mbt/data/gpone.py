@@ -59,6 +59,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import struct
 from functools import lru_cache
 from pathlib import Path
@@ -144,6 +145,17 @@ class GponeDataSource:
     def __init__(self, root):
         self._root = Path(root)
 
+    def covers(self, symbol: str) -> bool:
+        """本数据源**有没有这个市场**的那份文件——只看市场，不看文件在不在。
+
+        用途是把两种「读不到」分开，它们对用户的含义正相反：北交所（本机没有
+        ``gpbjone.dat``）是**已知的覆盖缺口**，安静退回历史即可；而沪深那份文件不在，
+        几乎总是 ``root`` **指错了目录**，必须喊出来。
+
+        :meth:`path_for` 两种都抛错（对调用方来说都是「取不到」），故要分辨只能问这里。
+        """
+        return symbol[:2] in _FILE_BY_MARKET
+
     def path_for(self, symbol: str) -> Path:
         """符号对应的文件。北交所、或前缀不认识时抛 :class:`MarketDataError`。"""
         market = symbol[:2]
@@ -186,6 +198,20 @@ class GponeDataSource:
         那几个字段，故这类断言必须打在整个文件上。
         """
         return {field for row in _load(self.path_for(symbol)).values() for field in row}
+
+    def updated_on(self, symbol: str) -> dt.date:
+        """该符号所在文件**最后写入那天**——「我们什么时候拿到这份一致预期」的答案。
+
+        这是前瞻可用性的判据（见 :mod:`mbt.data.forward`）：评估日早于这一天时，手上这份
+        内容可能已经不是那天的内容，故那时不得使用。
+
+        .. warning::
+
+            它**不是**「机构发布这些预测的日子」，而是「通达信客户端写下这个文件的时刻」。
+            对防前视而言前者才是要问的（我们何时**能知道**），但本地只有后者——故同一天下载
+            的文件里可能混着几周前发布的预测。那是数据质量的账，不是时点的账。
+        """
+        return dt.date.fromtimestamp(self.path_for(symbol).stat().st_mtime)
 
 
 def _load(path: Path) -> dict[int, dict[int, float]]:

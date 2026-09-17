@@ -48,11 +48,17 @@ def write_day(path: Path, records) -> None:
     path.write_bytes(bytes(blob))
 
 
-def make_dataroot(tmp_path, symbol="sh600000", periods=80, start_price=1000, closes=None):
+def make_dataroot(
+    tmp_path, symbol="sh600000", periods=80, start_price=1000, closes=None, start="2024-01-02"
+):
     """搭一个只含一个标的的最小数据源；价格恒定，故不会撞上涨跌停判定。
 
     日期用**交易日**（``bdate_range``）而非日历日——否则周六周日也成了交易日，
     「评估日不是交易日要报错」这条就测不出来了。
+
+    ``start`` 是首根 K 线的日期。需要把行情挪到**某个年份**时给（前瞻那条路要求评估日的年份
+    与该标的的一致预期财年相同，见 :func:`mbt.data.forward.uses_forward`，而这里的一致预期
+    夹具指的是 2026 年）。
 
     权息文件直接**用仓库里的真实夹具**：它的字节是真的，故取数路径上一路走通（稀释判定、
     越界检查都要读它）。
@@ -64,7 +70,7 @@ def make_dataroot(tmp_path, symbol="sh600000", periods=80, start_price=1000, clo
     import pandas as pd
 
     root = tmp_path / "vipdoc"
-    index = pd.bdate_range("2024-01-02", periods=periods)
+    index = pd.bdate_range(start, periods=periods)
     if closes is None:
         closes = [start_price] * periods
     assert len(closes) == periods, f"closes（{len(closes)} 个）须与 periods（{periods}）一致"
@@ -125,6 +131,7 @@ def screen_args(**overrides):
         watchlist_dir=None,
         limit=None,
         symbols_file=None,
+        forward_root=None,
     )
     base.update(overrides)
     return type("Args", (), base)
@@ -1429,6 +1436,227 @@ def test_the_b1_screen_needs_a_cw_root_because_two_of_its_filters_read_financial
 
     assert run_screen_command(args, stdout=out, stderr=err) == 1
     assert "cw-root" in err.getvalue()
+
+
+def test_forward_root_is_a_screen_only_switch(tmp_path):
+    """``--forward-root`` **只在 ``screen`` 上**——回测侧的参数表里没有它。
+
+    这一条与 ADR-0006 修订二同源：一致预期是快照、没有历史，回测的评估日全在过去，故它
+    在回测里永远只是前视偏差。挡法不是「运行时判断一下」，而是**回测那条路根本没有这个开关**，
+    于是也没有那段代码路径。哪天有人图省事把它加到 ``backtest`` 上，这条会红。
+    """
+    parser = build_parser()
+    screen_choices = parser.parse_args(
+        ["screen", "--tdx-root", "x", "--gbbq", "y", "--output-dir", "z"]
+    )
+    assert hasattr(screen_choices, "forward_root")
+
+    backtest = parser.parse_args(
+        [
+            "backtest",
+            "--strategy",
+            "m:S",
+            "--tdx-root",
+            "x",
+            "--gbbq",
+            "y",
+            "--output-dir",
+            "z",
+        ]
+    )
+    assert not hasattr(backtest, "forward_root"), "回测不该有前瞻数据入口"
+
+
+def test_the_daily_screen_reports_the_forward_caliber_when_the_forward_data_is_there(tmp_path):
+    """给了一致预期目录、且评估日不早于它的写入日 → 选股按「选用PE」跑，并**印出来**。
+
+    行情用 ``sh600000``（那份夹具里它有一致预期：财年 2026、EPS_T 1.521），故它该走前瞻。
+    三条条件都要凑齐，缺一条就退回历史：写入日早于评估日、**评估日的年份等于财年 2026**、
+    行情取的是原始价。第二条件由 ``start="2026-06-01"`` 保证——原式的 ``K线年 = 财年T``。
+    """
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60, start="2026-06-01")
+    forward_root = _forward_root_written_on(tmp_path, "2026-06-15")
+    args = screen_args(
+        screen="b1",
+        as_of="2026-07-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "前瞻：1/1 个标的按「选用PE」评估" in out.getvalue()
+
+    import json
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert metadata["valuation_caliber"]["forward_symbols"] == 1
+    assert "选用PE" in metadata["valuation_caliber"]["caliber"]
+
+
+def test_an_evaluation_day_before_the_forward_file_was_written_falls_back(tmp_path):
+    """评估日**早于**写入日 → 一个标的都不走前瞻，退回历史口径。
+
+    这是「回测里前瞻永不生效」在命令层的同一条性质：回测的评估日全部落在写入日之前。
+    年份刻意与财年一致（都在 2026），好让红的是**日期那一关**，不是年份那一关。
+    """
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60, start="2026-06-01")
+    forward_root = _forward_root_written_on(tmp_path, "2026-07-20")
+    args = screen_args(
+        screen="b1",
+        as_of="2026-07-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "前瞻：0/1 个标的按「选用PE」评估" in out.getvalue()
+
+
+def test_a_market_without_consensus_data_is_reported_without_crying_wolf(tmp_path):
+    """北交所标的进池时，只报「这市场没有这份数据」，**不许**喊「--forward-root 指对了吗」。
+
+    这一条防的是**噪声淹没警报**：本机实测 5,375 个标的里有 276 只北交所，而客户端没有
+    ``gpbjone.dat``。若把它和「沪深文件读不到」混成一个数，日更任务每天都会喊一次「目录指错了
+    吗」——真指错的那天就淹在噪声里了。故这里同时钉三件事：数量对（1/2 走前瞻）、
+    话对（说明市场无数据）、**警报不响**。
+    """
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60, start="2026-06-01")
+    # 再加一只北交所标的：它没有一致预期，因为**客户端没有那个文件**，与目录对不对无关。
+    make_dataroot(tmp_path, symbol="bj920001", periods=60, start="2026-06-01")
+
+    forward_root = _forward_root_written_on(tmp_path, "2026-06-15")
+    args = screen_args(
+        screen="b1",
+        as_of="2026-07-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    printed = out.getvalue()
+
+    assert "前瞻：1/2 个标的按「选用PE」评估" in printed
+    assert "bj920001" in printed, "要点名是哪个标的所在市场没有数据，免得看起来像漏掉了"
+    assert "指对了吗" not in printed, "北交所是已知缺口，不是路径错误——不许报警"
+    assert "注意：" not in printed
+
+    import json
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    caliber = metadata["valuation_caliber"]
+    assert caliber["unsupported"] == 1, "北交所那只记进 unsupported"
+    assert caliber["unreadable"] == 0, "它不该被算成「读不到」"
+
+
+def test_a_screen_other_than_b1_ignores_the_forward_root(tmp_path):
+    """``--forward-root`` 只对 ``b1`` 有意义——别的规则不读 PE，这一步整步跳过。
+
+    不跳过的话，产物里会留一份「按前瞻跑的」记录，而那份名单其实与前瞻无关。
+    """
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    forward_root = _forward_root_written_on(tmp_path, "2024-02-01")
+    args = screen_args(
+        screen="momentum",
+        as_of="2024-03-01",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        forward_root=str(forward_root),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    assert "前瞻：" not in out.getvalue()
+
+    import json
+
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert metadata["valuation_caliber"] is None
+
+
+def _forward_root_written_on(tmp_path, day: str):
+    """把真实夹具拷成一份一致预期目录，并把**写入日**改成给定的一天。
+
+    写入日是关键：闸门比的就是它（评估日不早于它才许用前瞻）。夹具在仓库里的写入日
+    是它被创建那天，比这些合成行情的日期晚，故要显式改成我们要的那天。
+    """
+    import datetime as dt
+    import os
+    import shutil
+    from pathlib import Path
+
+    target = tmp_path / "hq_cache"
+    target.mkdir()
+    copied = target / "gpshone.dat"
+    shutil.copy(Path(__file__).parent / "fixtures" / "gpone" / "gpshone.dat", copied)
+    stamp = dt.datetime.fromisoformat(f"{day}T15:00:00").timestamp()
+    os.utime(copied, (stamp, stamp))
+    return target
+
+
+def test_a_backtest_shaped_args_cannot_turn_the_forward_caliber_on(tmp_path):
+    """就算有人把这一步挪到共用路径上，**回测那套 args 也点不亮它**。
+
+    这是上面那条之外的**第二重保险**，因为两条防的是不同的事：那条防「参数表里多出开关」，
+    这条防「调用点被挪进共用路径」。回测的 args 没有 ``forward_root``，取到 None 即整步跳过，
+    ``signals`` 一格不动——于是回测拿到的 PE 与改这条分支之前逐格相同。
+
+    不在这里跑真回测：要让它逐笔成交得起一段八条过滤器全过的行情，而那件事
+    :mod:`tests.test_b1_screen` 已在规则层钉到具体某一根（134/135/136），CLI 层再照搬一遍
+    只是把同一段行情写两处。
+    """
+    import datetime as dt
+
+    from mbt.cli import _forward_caliber
+
+    args = make_args(screen="b1", cw_root=str(Path(__file__).parent / "fixtures" / "cw"))
+    signals = {"pe": pd.DataFrame({"sh600000": [10.0, 20.0]})}
+    out = io.StringIO()
+
+    before = signals["pe"].copy()
+    caliber = _forward_caliber(
+        args,
+        signals=signals,
+        markets=[],
+        as_of=dt.date(2024, 3, 1),
+        screen_label="b1",
+        stdout=out,
+    )
+
+    assert caliber is None
+    assert signals["pe"].equals(before), "回测那套 args 竟然动了 PE"
 
 
 def test_backtest_can_also_use_the_b1_gate(tmp_path):

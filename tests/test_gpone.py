@@ -204,9 +204,58 @@ def test_a_missing_file_says_what_is_wrong(tmp_path):
         GponeDataSource(tmp_path).snapshot("sh600000")
 
 
+def test_covering_a_market_is_about_the_market_not_about_the_file(gpone_root):
+    """``covers`` 只回答「这市场有没有这族文件」，**不看文件在不在**。
+
+    两种「读不到」对用户的含义正相反，盘后选股要分开报：北交所（本机没有 ``gpbjone.dat``）
+    是已知覆盖缺口，安静退回历史；沪深那份文件不在，几乎总是目录指错了，必须喊。
+
+    fixture 目录里**只有** ``gpshone.dat``：故沪市「覆盖」为真（文件确实在），深市也是真
+    「覆盖」而为假「读得到」——这正是要靠 ``covers`` 与 ``path_for`` 分工才分得出的那一对。
+    """
+    source = GponeDataSource(gpone_root)
+
+    assert source.covers("sh600000") is True
+    assert source.covers("sz000001") is True, "深市有这族文件，只是 fixture 里没放那一份"
+    assert source.covers("bj920819") is False, "北交所压根没有这族文件"
+    assert source.covers("xx000001") is False, "前缀不认识时同样是没有"
+
+    # 与 path_for 的分工：覆盖 ≠ 读得到。
+    with pytest.raises(MarketDataError):
+        source.path_for("sz000001")
+
+
 def test_a_file_whose_length_is_not_a_multiple_of_ten_is_rejected(tmp_path, gpone_root):
     """长度不是 10 的整数倍 → 报错。截断必须报错，否则会解出一串看起来正常的错数字。"""
     (tmp_path / "gpshone.dat").write_bytes(FIXTURE.read_bytes()[:-3])
 
     with pytest.raises(MarketDataError, match="不是 10 的整数倍"):
         GponeDataSource(tmp_path).snapshot("sh600000")
+
+
+def test_the_update_date_is_the_day_the_file_was_last_written(gpone_root):
+    """``updated_on`` 给出**文件最后写入那天**——「我们什么时候拿到这份一致预期」的答案。
+
+    它是前瞻可用性的判据：评估日早于这一天时，手上这份内容可能已经不是那天的内容，
+    故那时不得使用（见 :mod:`mbt.data.forward`）。
+    """
+    expected = dt.date.fromtimestamp(FIXTURE.stat().st_mtime)
+
+    assert GponeDataSource(gpone_root).updated_on("sh600000") == expected
+
+
+def test_a_market_whose_file_is_absent_raises_rather_than_reporting_today(gpone_root):
+    """文件不在就报错，**不能**退化成「今天刚更新过」——那会让前瞻凭空生效。
+
+    fixture 目录里只有 ``gpshone.dat``，没有 ``gpszone.dat``，正好拿来钉这一条。
+    """
+    with pytest.raises(MarketDataError, match="找不到|不存在"):
+        GponeDataSource(gpone_root).updated_on("sz000001")
+
+
+def test_a_freshly_written_file_is_available_on_its_own_day(tmp_path, gpone_root):
+    """刚写下的文件，当天就算可用——否则日常任务（收盘后下载、随即选股）永远用不上前瞻。"""
+    (tmp_path / "gpshone.dat").write_bytes(FIXTURE.read_bytes())
+    today = dt.date.today()
+
+    assert GponeDataSource(tmp_path).updated_on("sh600000") == today
