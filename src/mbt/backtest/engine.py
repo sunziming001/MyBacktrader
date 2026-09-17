@@ -21,7 +21,7 @@ import backtrader as bt
 import numpy as np
 import pandas as pd
 
-from mbt.data.market import MarketData
+from mbt.data.market import MarketData, backward_adjusted_markets
 from mbt.data.panel import assemble_panel
 from mbt.rules import SHIPPED_RULES_PATH, RuleTable
 from mbt.screen import SCREEN_FIELDS
@@ -410,23 +410,21 @@ def run_portfolio_backtest(
 
     table = rules if isinstance(rules, RuleTable) else RuleTable.load(rules)
 
-    # 复权在**这一处**统一做，且只做一次。于是选股用的面板、股票池、可交易掩码与撮合
-    # 全都落在**同一条**价格序列上。
+    # 复权在**这一处**统一做，且只做一次（`backward_adjusted_markets` 是它的唯一定义）。
+    # 于是选股用的面板、股票池、可交易掩码与撮合全都落在**同一条**价格序列上。
     #
     # 这不是洁癖：若面板取原始价而撮合取后复权价，同一个选股规则就在两个不同的序列上被
     # 评估——除权日的假跳空会进到动量、均线一类信号里（ADR-0003 明确否决「不复权直接用」
     # 正是为此），而成交却发生在复权后的序列上。那种错误不会报错，只会让选出来的标的与
-    # 实际能成交的价格不是一回事。
+    # 实际能成交的价格不是一回事。`mbt screen` 曾漏了这一处，同一个规则在两条路上给出不同
+    # 答案（票据 #73）；两条路现在共用这个入口。
     #
     # 下面三处 ``progress.stage`` 与引擎内的那一处合起来回答「现在在哪一步」：这几段都是
     # **按标的数 × 根数**的顺序扫描，全市场尺度下每段都是分钟量级，而它们之间没有任何输出
     # （见 `mbt.progress`）。
     if progress is not None:
         progress.stage("复权", note=f"{len(markets)} 个标的")
-    adjusted = [
-        MarketData(symbol=market.symbol, prices=market.backward_adjusted(), events=())
-        for market in markets
-    ]
+    adjusted = backward_adjusted_markets(markets)
 
     if progress is not None:
         progress.stage("建股票池", note=f"{len(markets)} 个标的")

@@ -46,6 +46,41 @@ def test_load_returns_raw_prices_and_events(fixture_root, gbbq_file):
     assert market.backward_adjusted().index.equals(market.prices.index)
 
 
+def test_backward_adjusted_markets_is_the_view_screening_runs_on(fixture_root, gbbq_file):
+    """一批行情的**后复权**视图——筛选、股票池与撮合都该落在它上面（票据 #73）。
+
+    返回的是**同一个标的的另一条价格序列**，不是一份新数据：`symbol` / 判定记录 / ST 期间
+    照旧，只有价格换成后复权，且 `events` 清空（它们已经折进价格，留着会被二次折算，见
+    :class:`mbt.data.MarketData` 的说明）。
+
+    夹具上 `sh600000` 在 2026-07-16 每 10 股派 4.20 元：原始价当日从 9.31 跌到 8.85
+    （一个 −4.94% 的假跳空），而后复权后应当只剩真实涨跌——按除权因子
+    ``前收盘 ÷ (前收盘 − 每股现金)`` 折算，当日应落在 ``8.85 × 9.31 ÷ 8.89 ≈ 9.268``。
+    """
+    from mbt.data import backward_adjusted_markets
+
+    market = load_market_data(
+        "sh600000", tdx_root=fixture_root, gbbq_path=gbbq_file, rules=LIMIT_RULES
+    )
+    ex_date = "2026-07-16"
+
+    adjusted = backward_adjusted_markets([market])
+
+    assert len(adjusted) == 1
+    view = adjusted[0]
+    assert view.symbol == market.symbol
+    assert view.events == (), "事件已折进价格，留着会被再折算一次"
+    assert view.st_periods == market.st_periods, "ST 期间是标的自己的事，与价格尺度无关"
+    assert not view.prices.equals(market.prices), "返回的必须是后复权价，不是原始价"
+    # 假跳空被抹平：原始价当日跌了 4.94%，后复权后回到除权前的水平附近。
+    assert market.prices["close"].loc[ex_date] == pytest.approx(8.85)
+    assert view.prices["close"].loc[ex_date] == pytest.approx(8.85 * 9.31 / 8.89, rel=1e-5)
+    assert view.prices["close"].loc[ex_date] > market.prices["close"].loc[ex_date]
+    # 原对象不被就地改动（视图是新的，行情是共享的）。
+    assert market.events, "原始行情上的权息事件不该被清掉"
+    assert market.prices["close"].loc[ex_date] == pytest.approx(8.85)
+
+
 def test_load_carries_the_dilution_verdicts(fixture_root, gbbq_file):
     """入口把**判定记录**一并交出，且事件已按判定结果处理（票据 #20）。
 

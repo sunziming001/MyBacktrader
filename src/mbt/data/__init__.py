@@ -34,7 +34,7 @@ from .loader import (
     slice_markets,
     stock_symbols,
 )
-from .market import MarketData, load_market_data
+from .market import MarketData, backward_adjusted_markets, load_market_data
 from .master import SecurityInfo, SecurityMasterDataSource, load_listing_dates
 from .panel import Panel, assemble_panel
 from .tdx import TdxDataSource
@@ -71,6 +71,7 @@ __all__ = [
     "adjustment_factors",
     "assemble_panel",
     "backward_adjusted",
+    "backward_adjusted_markets",
     "boundary_of",
     "check_updates",
     "combined_reference_price",

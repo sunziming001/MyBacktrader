@@ -28,7 +28,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pandas as pd
@@ -85,6 +85,30 @@ class MarketData:
     def forward_adjusted(self, as_of: dt.date | dt.datetime | None = None) -> pd.DataFrame:
         """**前复权**视图：展示用。最新价等于原始价，历史价被下调。"""
         return forward_adjusted(self.prices, self.events, as_of=as_of)
+
+
+def backward_adjusted_markets(markets) -> list[MarketData]:
+    """把一批行情换成**后复权**视图：选股、股票池与撮合都该落在同一条序列上（ADR-0003）。
+
+    为什么要有这个函数：`mbt backtest` 与 `mbt screen` 都要一份「能拿来算信号的价格」，
+    而它们此前各写一遍这段构造（回测写过、选股**漏了**，于是同一个规则在原始价与后复权价
+    两条序列上被评估——票据 #73）。两种写法只要分头演进，就会再次漂开；集中在**一处**定义
+    之后，「两条路的面板是同一条序列」由构造保证，而不是靠两边各自记得。
+
+    **返回的是同一个标的的另一条价格序列，不是一份新数据**：`symbol` / `verdicts` /
+    `st_periods` 原样带过来（它们描述的是标的本身，与价格尺度无关），只有两样变了——
+
+    - ``prices`` 换成 :meth:`MarketData.backward_adjusted` 的结果；
+    - ``events`` 清空。它们已经折进价格了，留着会诱使调用方再折一次；而按事件给后复权价
+      重算涨跌停基数是**错的**（除权跳空已被抹平，再折算等于多算一遍），见本模块的说明。
+
+    参数:
+        markets: 一串 :class:`MarketData`（原始价，已过越界检查）。
+
+    返回:
+        等长的列表，逐项对应，顺序不变。
+    """
+    return [replace(market, prices=market.backward_adjusted(), events=()) for market in markets]
 
 
 def load_market_data(

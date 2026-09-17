@@ -934,6 +934,150 @@ def test_the_screen_artifact_records_which_rule_it_ran(tmp_path):
     assert meta["screen"]["top_n"] == 2
 
 
+def make_ex_dividend_dataroot(tmp_path, periods=140):
+    """两只标的：只有 ``sh600000`` 在窗口内除权（2024-07-18 每 10 股派 3.21 元）。
+
+    窗口 2024-03-01 起，故 ``--as-of`` 那天有 100 根以上的行情——股票池要「上市以来至少
+    60 个交易日」，窗口太短会一只都留不下，那测的就不是选股了。
+
+    ``sz000001`` 的 2024-06-14 除权虽然也在窗口内，但它在这段里**价格是平的**（造数据时
+    没让它跌），故折算前后都是 0% 动量——它在这条测试里是不除权、也不涨跌的对照。
+
+    价格造得让两条序列给出**相反的**动量排序（除权后第 19 个交易日，2024-08-14）：
+
+    ================  ==================  ==================
+    标的              原始价 20 日动量     后复权 20 日动量
+    ================  ==================  ==================
+    sh600000          −1.0%（除权假跌）    **+2.28%**
+    sz000001          0%                  0%
+    ================  ==================  ==================
+
+    ``sh600000`` 在除权日从 10.00 落到 9.90，跌得比每股 0.321 元的分红**少**；后复权按
+    除权因子 ``前收盘 ÷ (前收盘 − 每股现金)`` 把它折算回去，假跳空于是被抹平。取前 1 名
+    时，「用哪条序列算」就决定了名单上是哪一只。
+
+    差异只在除权日之后的 20 根内存在（再往后回看窗口整段落在除权之后，两条序列又都趋平），
+    故两个测试都取 ``index[k + 19]``（除权后第 19 根）。返回 ``ex_date`` 是为了让测试自己
+    推算日子，不在断言里写死哪一天。
+
+    返回 ``(root, gbbq, index, ex_date)``。
+    """
+    index = pd.bdate_range("2024-03-01", periods=periods)
+    ex_date = pd.Timestamp("2024-07-18")
+    root = tmp_path / "vipdoc"
+
+    write_day(
+        root / "sh" / "lday" / "sh600000.day",
+        [
+            (int(f"{stamp:%Y%m%d}"), price, price, price, price, 0.0, 1000)
+            for stamp, price in zip(
+                index, [1000 if s < ex_date else 990 for s in index], strict=True
+            )
+        ],
+    )
+    write_day(
+        root / "sz" / "lday" / "sz000001.day",
+        [(int(f"{stamp:%Y%m%d}"), 1000, 1000, 1000, 1000, 0.0, 1000) for stamp in index],
+    )
+    gbbq = tmp_path / "gbbq"
+    gbbq.write_bytes(GBBQ_FIXTURE.read_bytes())
+    return root, gbbq, index, ex_date
+
+
+def run_screen_and_read_candidates(tmp_path, root, gbbq, day):
+    """跑一次 ``mbt screen``（动量、只取 1 只），返回候选名单与那次跑的产物目录。
+
+    #73 的两条测试都要这一小段：一条看名单本身，一条拿名单去比回测**成交**的标的。
+    """
+    out, err = capture()
+    args = screen_args(
+        screen="momentum",
+        top_n=1,
+        as_of=f"{day:%Y-%m-%d}",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+    )
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    return pd.read_csv(run_dir / "candidates.csv")["symbol"].tolist(), run_dir
+
+
+def test_the_screen_command_screens_on_backward_adjusted_prices(tmp_path):
+    """选股落在**后复权**价上，与回测是同一条序列（票据 #73）。
+
+    此前选股命令把原始价直接喂给 ``assemble_panel``，而回测喂的是后复权价——同一个
+    ``Screen`` 于是在两条序列上被评估，每日自选股与回测依据的规则给出的名单于是不一致。
+    ``tests/test_screen.py`` 的 ``test_the_screen_sees_the_same_price_series_that_gets_traded``
+    钉的是**引擎那半**；这条钉**选股命令这半**，合起来才是「同一条序列」。
+
+    夹具上 ``sh600000`` 在原始价下是 −1%（除权假跌）、在后复权价下是 +2.28%，而
+    ``sz000001`` 两条都是 0%。故名单上是 ``sh600000`` 才说明用的是后复权价。
+    """
+    import json
+
+    root, gbbq, index, ex_date = make_ex_dividend_dataroot(tmp_path)
+    day = index[index.get_loc(ex_date) + 19]
+    picked, run_dir = run_screen_and_read_candidates(tmp_path, root, gbbq, day)
+
+    assert picked == ["sh600000"], "候选是在原始价上算的——除权日的假跌把 sh600000 的动量压成了 −1%"
+    assert json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["candidates"] == 1
+
+
+def test_screen_and_backtest_pick_the_same_symbol_on_the_same_day(tmp_path):
+    """两条路在同一个评估日必须给出**同一个答案**（票据 #73 的验收）。
+
+    回测那边一直是对的（``engine.py`` 自己套了后复权），错的是选股命令。故修之前这两条会
+    分家：选股按原始价选 ``sz000001``，而回测按后复权价买 ``sh600000``。
+
+    可观测的差别在产物上：``screen`` 给的是 ``candidates.csv``，``backtest`` 的选股结果只能
+    从**成交**看出来（选股规则是入场闸门）。于是「名单」与「成交的标的」相等就是这条验收。
+
+    回测区间取 ``[除权日 − 40 根, 除权日 + 40 根]``，评估日取 ``除权日 + 19``：
+
+    - 长度必须 ≥ 60 根，否则**股票池**会把两只都当成次新股剔掉（引擎是在**已截断**的行情上
+      建池子的），而「满 60 根」的那一根出现在区间靠后的位置；
+    - 开头的 20 根给动量一个可用的回看窗口（引擎是在已截断的面板上算排序因子的，窗口太短
+      会全是缺失值、一个都不选）；
+    - 除权日之后的 20 根内两条序列才会分家，故评估日取在那段内；区间再往后留 20 根，好让
+      订单有机会成交（末尾那根下的单没有下一根可撮合）。
+
+    除权日之前两条序列都是平的，动量同分，按「代码升序」判给 ``sh600000``——那与后复权
+    的答案一致，故不影响本条的结论。
+    """
+    root, gbbq, index, ex_date = make_ex_dividend_dataroot(tmp_path)
+    k = index.get_loc(ex_date)
+    day = index[k + 19]
+    start, end = index[k - 40], index[k + 40]
+
+    listed, _ = run_screen_and_read_candidates(tmp_path, root, gbbq, day)
+
+    back_out, back_err = capture()
+    assert (
+        run_backtest_command(
+            make_args(
+                screen="momentum",
+                screen_top_n=1,
+                start=f"{start:%Y-%m-%d}",
+                end=f"{end:%Y-%m-%d}",
+                tdx_root=str(root),
+                gbbq=str(gbbq),
+                output_dir=str(tmp_path / "runs"),
+            ),
+            stdout=back_out,
+            stderr=back_err,
+        )
+        == 0
+    ), back_err.getvalue()
+    trades = pd.read_csv(next((tmp_path / "runs").iterdir()) / "trades.csv")
+
+    assert listed, "选股一个都没选出来，这条就白测了"
+    assert sorted(trades["symbol"].unique()) == sorted(
+        listed
+    ), "选股名单与回测成交的标的不是同一批——两条路用的价格序列不同"
+
+
 def test_the_screen_metadata_is_a_function_of_the_screen_switch(tmp_path):
     """两份产物**必须互不相同**——这条钉的是「元数据随 ``--screen`` 变化」本身。
 

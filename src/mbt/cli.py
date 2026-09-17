@@ -589,6 +589,10 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
 
     if not legacy:
         # 跌幅要回看 252 个交易日，故同样**先算后截**（见 drawdown_fields）。
+        #
+        # 这里传的是**原始**行情，而面板里其余价格信号都是后复权的：送股的假跳空会进到跌幅
+        # 读数里，而它既是过滤条件也是「低估成长」的排序因子。两条路（选股与回测）都这么算，
+        # 故不是两条路漂开，而是这一列与面板其余部分不同源——见票据 #75，那一处该换。
         if progress is not None:
             progress.stage("算跌幅信号", note="回看 252 个交易日")
         signals.update(drawdown_fields(full_markets))
@@ -701,11 +705,21 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         )
         return 1
 
-    from mbt.data import assemble_panel
+    from mbt.data import assemble_panel, backward_adjusted_markets
     from mbt.universe import build_universe
 
     try:
-        panel = assemble_panel(list(loaded.markets), SCREEN_FIELDS)
+        # **选股落在后复权价上，与回测同一条序列**（票据 #73）。此前这里把原始价直接喂给
+        # `assemble_panel`，于是同一个 `Screen` 在两条序列上被评估——除权日的假跳空会进到
+        # 均线、摆动点与量能读数里，每日自选股与回测依据的规则给出的名单于是不一致。
+        # 复权入口与引擎共用 `backward_adjusted_markets`，两条路不会各漂各的。
+        #
+        # 估值那边仍吃原始行情（PE 要用当时的成交价，后复权价会把它放大，见
+        # `mbt.data.valuation`）：复权只管「拿来算信号的价格」，不管「拿来估值的价格」。
+        if progress is not None:
+            progress.stage("复权", note=f"{len(loaded.markets)} 个标的")
+        adjusted = backward_adjusted_markets(loaded.markets)
+        panel = assemble_panel(adjusted, SCREEN_FIELDS)
         if as_of is None:
             as_of = _resolve_as_of(panel, stdout, stderr)
             if as_of is None:
@@ -728,7 +742,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
         universe_rules = UniverseRules(boards=_boards(args))
         pool = build_universe(
-            list(loaded.markets),
+            adjusted,
             rules=universe_rules,
             listing_dates=listing_dates,
         )
