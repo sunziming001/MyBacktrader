@@ -116,16 +116,36 @@ def describe_screen(screen, label: str | None = None) -> dict | None:
 
     过滤器与排序因子是 Python 可调用对象（常是 lambda），无法序列化。与其做一个看着能
     复现、实则悄悄丢条件的机制，不如把缺口写在元数据里。
+
+    **排序因子记在 ``factors``（列表），不是单数的 ``factor``**（票据 #72）。多因子屏幕
+    （ADR-0012 的 ``factors`` + ``weights`` + ``normalize``）的 ``Screen.factor`` 是
+    ``None``，原先只读它会让这条规则的排序因子在留痕里消失——「换了排序因子」于是成了
+    产物答不出的问题。列表没有「有因子却记成 null」这个歧义；单数的旧写法也归一到这里
+    （:attr:`mbt.screen.Screen.given_factors`），只是列表长度为 1。``weights`` /
+    ``normalize`` 原样记下当时的配置——``None`` 表示等权 / 不归一。
     """
     if screen is None:
         return None
 
-    filters = [f"{getattr(one, '__name__', type(one).__name__)}" for one in screen.filters]
-    factor = getattr(screen.factor, "__name__", None) if screen.factor else None
+    def names(parts) -> list[str]:
+        """部件的名字：优先它自己的 ``__name__``，只有可调用对象才退回类型名。
+
+        与 ``mbt.screen._part_name``（进度输出用的那处）同一口径——这里不 import 它是因为
+        那是选股库的内部实现，而本模块只消费 ``Screen`` 这个公开类型。
+        """
+        return [f"{getattr(one, '__name__', type(one).__name__)}" for one in parts]
+
     return {
         "label": label,
-        "filters": filters,
-        "factor": factor,
+        "filters": names(screen.filters),
+        # **排序因子记成列表**，不是单数的 `factor`（票据 #72）：多因子屏幕（ADR-0012 的
+        # `factors` + `weights` + `normalize`）的 `Screen.factor` 是 None，原先只读它会让
+        # B1 的形态分数在留痕里消失。列表没有「有因子却记成 null」这个歧义；单数那条旧路
+        # 也归一到这里（`Screen.given_factors`），只是列表长度为 1。
+        "factors": names(screen.given_factors),
+        # `weights` / `normalize` 原样记下当时的配置——None 表示等权 / 不归一。
+        "weights": list(screen.weights) if screen.weights is not None else None,
+        "normalize": screen.normalize,
         "top_n": screen.top_n,
         "reproducible": False,
         "note": "过滤器与排序因子是 Python 可调用对象，无法序列化；"

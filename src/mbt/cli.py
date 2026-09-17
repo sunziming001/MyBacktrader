@@ -398,6 +398,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     try:
         screen, signals = _screen_and_signals(args, loaded, full_markets, stdout, progress)
+        universe_rules = UniverseRules(boards=_boards(args), extra_mask=extra_mask)
         result = run_portfolio_backtest(
             list(loaded.markets),
             strategy,
@@ -407,7 +408,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             commission_min=args.commission_min,
             commission_mode=args.commission_mode,
             slippage=args.slippage,
-            universe_rules=UniverseRules(boards=_boards(args), extra_mask=extra_mask),
+            universe_rules=universe_rules,
             listing_dates=listing_dates,
             screen=screen,
             signals=signals,
@@ -425,6 +426,8 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         output_dir=args.output_dir,
         strategy=strategy,
         strategy_params=params,
+        screen=screen,
+        screen_label=getattr(args, "screen", None) or "none",
         cash=args.cash,
         max_positions=args.max_positions,
         costs={
@@ -433,7 +436,13 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             "commission_mode": args.commission_mode,
             "slippage": args.slippage,
         },
-        universe={"rule": "出厂设定", "candidates": len(symbols), "loaded": len(loaded.markets)},
+        universe=_describe_universe(
+            universe_rules,
+            args,
+            listing_dates,
+            considered=len(symbols),
+            loaded=len(loaded.markets),
+        ),
         skipped=loaded.skipped,
         benchmark_prices=benchmark,
         benchmark_symbol=args.benchmark,
@@ -467,6 +476,39 @@ def _boards(args) -> frozenset:
     if unknown:
         raise ValueError(f"未知板块 {unknown}；可用的有 {sorted(ALL_BOARDS)}")
     return frozenset(names)
+
+
+def _describe_universe(rules, args, listing_dates, *, considered: int, loaded: int) -> dict:
+    """把**实际用的**股票池口径记进产物元数据（票据 #72）。
+
+    原先两处都是写死的字符串（回测侧 ``{"rule": "出厂设定"}``、选股侧「排除次新股，纳入四个
+    板块」），与 ``--boards`` / ``--master`` 无关。产物要答的是「这一份结果是在哪个池子上算
+    的」，故逐项记下来——前四项取自**真正交给引擎的那份** :class:`~mbt.universe.UniverseRules`，
+    不是照着 ``args`` 再推一遍：
+
+    - ``boards``：实际纳入的板块（排序后，便于两两比对）；
+    - ``min_trading_days``：次新股门槛。口径是「上市以来的交易日数」，但**数值本身**由
+      下面那项决定它是怎么数出来的；
+    - ``recent_listing_rule``：上一条用的是**真实上市日**（``listing_date``）还是**本地行情
+      根数**（``available_bars``）。两者只在「数据窗口内上市的新股」上结论不同——行情根数
+      会把「数据刚好从上市日开始」当成「上市很久了」而放行（ADR-0013）。名字刻意不叫
+      ``listing_dates``：这里记的是**用哪种口径**，不是日期本身，叫日期会让人以为产物里有
+      上市日（ADR-0005：元数据不能声称它证明不了的东西）；
+    - ``non_loss``：是否叠加了「非亏损」这道基本面准入；
+    - ``considered``：进入取数的标的数（**加载前**），``loaded``：其中成功加载的。
+
+    ``non_loss`` 取自 ``--non-loss`` 这条开关而不是 ``rules.extra_mask``：两条命令把那道
+    掩码接进池子的位置不同（回测经 ``UniverseRules``，选股在 ``combine_masks`` 里合成），
+    开关才是两处共同的、且与用户意图一致的那一个。
+    """
+    return {
+        "boards": sorted(rules.boards),
+        "min_trading_days": rules.min_trading_days,
+        "recent_listing_rule": "listing_date" if listing_dates else "available_bars",
+        "non_loss": bool(getattr(args, "non_loss", False)),
+        "considered": considered,
+        "loaded": loaded,
+    }
 
 
 def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
@@ -684,9 +726,10 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             )
         else:
             print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
+        universe_rules = UniverseRules(boards=_boards(args))
         pool = build_universe(
             list(loaded.markets),
-            rules=UniverseRules(boards=_boards(args)),
+            rules=universe_rules,
             listing_dates=listing_dates,
         )
         masks = [pool]
@@ -710,10 +753,14 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 在选股侧并没有兑现——`backtest --screen valuation` 用估值规则，而 `screen` 仍按动量
         # 选，两边给出的候选完全不是一回事。
         screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout, progress)
+        screen_label = getattr(args, "screen", None) or "none"
         if screen is None:
             # `--screen none` 才走到这里；`--top-n all` 在规则自己的默认里也是不截断。
+            # 产物记的必须是**实际跑的**那条：这一步换成动量之后，标签得跟着改，否则
+            # run.json 会写着「none」而清单是动量算出来的（本票要修的正是这类失真）。
             top_n = None if args.top_n == ALL_CANDIDATES else args.top_n
             screen = momentum_screen(window=20, top_n=top_n)
+            screen_label = "momentum"
 
         from mbt.data.panel import with_signals
 
@@ -732,7 +779,16 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         progress.finish()
 
     try:
-        run_dir = _write_screen_artifacts(result, candidates, args, as_of, loaded, panel)
+        universe = _describe_universe(
+            universe_rules,
+            args,
+            listing_dates,
+            considered=loaded.total,
+            loaded=len(loaded.markets),
+        )
+        run_dir = _write_screen_artifacts(
+            candidates, args, as_of, loaded, screen, screen_label, universe
+        )
     except Exception as exc:  # noqa: BLE001
         # 落盘失败（如目录已存在）也必须以**退出码**收场，而不是把原始异常抛给调用者。
         print(f"错误：写入选股产物失败——{type(exc).__name__}: {exc}", file=stderr)
@@ -1104,12 +1160,19 @@ def _report_candidates(candidates, as_of, run_dir, stdout) -> None:
     print(f"\n产物：{run_dir}", file=stdout)
 
 
-def _write_screen_artifacts(result, candidates, args, as_of, loaded, panel) -> Path:
-    """选股产物：候选清单 + 元数据。**复用 #10 的目录约定**，不新造一套。"""
+def _write_screen_artifacts(
+    candidates, args, as_of, loaded, screen, screen_label, universe
+) -> Path:
+    """选股产物：候选清单 + 元数据。**复用 #10 的目录约定**，不新造一套。
+
+    ``screen`` / ``screen_label`` / ``universe`` 由调用方给**实际用的**那些对象与标签——
+    本函数自己不猜（原先这里写死过 ``rule`` 与 ``universe`` 两行常量，与 ``--screen`` 无关，
+    见票据 #72）。
+    """
     import datetime as dt
     import json
 
-    from mbt.report import data_snapshot, git_version
+    from mbt.report import data_snapshot, describe_screen, git_version
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1125,10 +1188,9 @@ def _write_screen_artifacts(result, candidates, args, as_of, loaded, panel) -> P
     metadata = {
         "as_of": as_of.isoformat(),
         "candidates": len(candidates),
-        "loaded": len(loaded.markets),
         "skipped": [{"symbol": item.symbol, "kind": item.kind} for item in loaded.skipped],
-        "universe": "出厂设定（排除次新股，纳入四个板块；ST 排除目前不生效）",
-        "rule": "按 20 日动量排序取前 N",
+        "screen": describe_screen(screen, screen_label),
+        "universe": universe,
         "data_snapshot": data_snapshot(_snapshot_paths(loaded, args)),
         "git": git_version(),
     }

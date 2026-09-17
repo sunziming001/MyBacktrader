@@ -238,6 +238,52 @@ def test_describe_screen_returns_none_when_there_is_no_screen():
     assert describe_screen(None) is None
 
 
+def test_a_multi_factor_screen_records_every_factor_and_its_weighting():
+    """多因子屏幕的排序因子必须**记全**——只读单数 ``factor`` 会让形态分数在留痕里消失。
+
+    ADR-0012 把 B1 的排序因子从 ``j_oversold`` 换成了三项合成的形态分数，而多因子屏幕的
+    ``Screen.factor`` 是 ``None``：留痕里于是写着 ``factor: null``，读的人会以为这条规则
+    不排序——而「换了排序因子」正是那次改动的核心。权重与归一口径同样得记，否则「三项等权、
+    逐日秩归一」这件事只剩八条过滤器可查。
+    """
+
+    def top_calm(panel):
+        raise NotImplementedError
+
+    def pullback_shrink(panel):
+        raise NotImplementedError
+
+    screen = Screen(
+        factors=(top_calm, pullback_shrink),
+        weights=(2.0, 1.0),
+        normalize="rank",
+        top_n=5,
+    )
+
+    described = describe_screen(screen, "两项合成")
+
+    assert described["factors"] == ["top_calm", "pullback_shrink"]
+    assert described["weights"] == [2.0, 1.0]
+    assert described["normalize"] == "rank"
+    assert described["top_n"] == 5
+
+
+def test_a_single_factor_screen_records_one_name_and_no_weighting():
+    """单因子那条旧路（``Screen(factor=...)``）也要有名字，且不假装有权重与归一。
+
+    它是 ``factor`` 那条输入的兼容路径：多因子是后来加的，早先的规则都走这里。
+    """
+
+    def momentum_20(panel):
+        raise NotImplementedError
+
+    described = describe_screen(Screen(factor=momentum_20, top_n=3), "单因子")
+
+    assert described["factors"] == ["momentum_20"]
+    assert described["weights"] is None
+    assert described["normalize"] is None
+
+
 def test_metrics_file_uses_null_instead_of_the_invalid_json_token_nan(tmp_path):
     """``NaN`` **不是合法 JSON**——`jq` / JavaScript / Rust 的解析器都会拒收整个文件。
 

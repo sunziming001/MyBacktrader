@@ -164,6 +164,24 @@ class Screen:
     normalize: str | None = None
     top_n: int | None = None
 
+    @property
+    def given_factors(self) -> tuple[FrameTransform, ...]:
+        """排序因子，**按给的写法**归一成一个序列——``factor`` 是单项的简写。
+
+        两种写法只在这一个地方归一：从 ``_score_parts``（真去算分）到
+        :func:`mbt.report.describe_screen`（只记名字）都读它，故「单数还是复数」这件事
+        不会在两个地方各判一次、再各漂一次。两个都给是不合法的配置（该以谁为准没有正确
+        答案），这里**报错**而不是挑一个——静默挑一个正是留痕与算分对不上的来路。
+        """
+        if self.factor is not None and self.factors:
+            raise ValueError(
+                "factor 与 factors 只能给一个：前者是单项的简写，后者是多因子。"
+                "两个都给时该以谁为准没有正确答案，故不猜。"
+            )
+        if self.factor is not None:
+            return (self.factor,)
+        return tuple(self.factors)
+
     def apply(
         self,
         panel: Panel,
@@ -273,16 +291,7 @@ class Screen:
 
     def _score_parts(self) -> tuple[tuple[FrameTransform, float], ...]:
         """把 ``factor`` / ``factors`` 两种写法归一成「(因子, 权重)」序列，并校验组合。"""
-        if self.factor is not None and self.factors:
-            raise ValueError(
-                "factor 与 factors 只能给一个：前者是单项的简写，后者是多因子。"
-                "两个都给时该以谁为准没有正确答案，故不猜。"
-            )
-
-        if self.factor is not None:
-            parts = ((self.factor, 1.0),)
-        else:
-            parts = tuple((one, 1.0) for one in self.factors)
+        parts = tuple((one, 1.0) for one in self.given_factors)
 
         if not parts:
             if self.weights or self.normalize:

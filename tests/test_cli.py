@@ -286,6 +286,35 @@ def test_the_backtest_artifacts_record_how_to_replay_it(tmp_path):
     assert meta["strategy"]["params"] == {"size": 200}
 
 
+def test_the_backtest_artifact_records_the_screen_it_used(tmp_path):
+    """回测产物也要记下**入场闸门是哪条规则**。
+
+    ``write_run_artifacts`` 一直收 ``screen`` / ``screen_label`` 两个参数，而回测那条调用
+    没传——于是 ``run.json`` 里恒为 ``"screen": null``：八条过滤器、排序因子、权重一条都
+    没留下，而提示语还写着「此处只记其名称」（那是在 ``describe_screen`` 里写的，从没被
+    回测调用过）。
+    """
+    import json
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    args = make_args(
+        screen="momentum",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+
+    run_dir = next((tmp_path / "runs").iterdir())
+    screen = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["screen"]
+
+    assert screen["label"] == "momentum"
+    assert screen["top_n"] == 5  # 没给 --top-n 时，候选数默认取「取前 N」的出厂值
+    assert screen["filters"] == []
+
+
 def test_symbols_that_cannot_be_loaded_are_skipped_with_a_reason(tmp_path):
     """跳过必须被**说出来**，且汇总里能按原因分类——静默跳过会让「跳过了什么」变成谜。"""
     root, gbbq = make_dataroot(tmp_path, symbol="sh600000")
@@ -813,6 +842,58 @@ def test_without_a_master_the_cli_says_which_rule_it_used(tmp_path):
     assert "近似口径" in out.getvalue()
 
 
+def test_the_universe_block_records_the_boards_that_were_actually_used(tmp_path):
+    """股票池口径要按**实际用的**记，不能是写死的字符串。
+
+    原先回测侧记 ``{"rule": "出厂设定"}``、选股侧记「排除次新股，纳入四个板块」——都与
+    ``--boards`` 无关。产物要答的是「这一份结果是在哪个池子上算的」，而池子正是被这个开关
+    改掉的。
+    """
+    import json
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    args = make_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+        boards="主板,创业板",
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "runs").iterdir())
+    universe = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["universe"]
+
+    assert universe["boards"] == ["主板", "创业板"]
+    assert universe["considered"] == 1  # 进入取数的标的数（--boards 之后的那个池子）
+
+
+def test_the_universe_block_tells_real_listing_dates_from_the_bars_approximation(tmp_path):
+    """次新股门槛用的是哪种上市日，必须记下来——两个口径对窗口内上市的新股结论不同。
+
+    有真实上市日时数的是「自上市日起的交易日」；没有则回退成「本地行情根数」，而后者会把
+    「数据刚好从上市日开始」当成「上市很久了」而放行（ADR-0013）。产物若不说用的是哪种，
+    事后无从判断。
+    """
+    import json
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    master = Path(__file__).parent / "fixtures" / "master" / "base.dbf"
+
+    for extra, expected in (({"master": str(master)}, "listing_date"), ({}, "available_bars")):
+        out_dir = tmp_path / f"runs-{expected}"
+        args = make_args(tdx_root=str(root), gbbq=str(gbbq), output_dir=str(out_dir), **extra)
+        out, err = capture()
+
+        assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+        run_dir = next(out_dir.iterdir())
+        universe = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["universe"]
+
+        assert universe["recent_listing_rule"] == expected
+        # 门槛本身也记：没有开关、恒为出厂值，记它是为了让上一条有主语（「按哪种口径数的 60 天」）。
+        assert universe["min_trading_days"] == 60
+
+
 def test_the_screen_command_says_which_rule_it_used(tmp_path):
     """选股命令也要说明口径——否则「用的哪个口径」成了谜（原先只有 backtest 会打印）。"""
     from mbt.cli import run_screen_command
@@ -823,6 +904,107 @@ def test_the_screen_command_says_which_rule_it_used(tmp_path):
 
     assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
     assert "近似口径" in out.getvalue()
+
+
+def test_the_screen_artifact_records_which_rule_it_ran(tmp_path):
+    """``run.json`` 要记下**真正跑的那条规则**，而不是一个写死的常量。
+
+    原先那两行是常量（``rule`` 恒为「按 20 日动量排序取前 N」），与 ``--screen`` 无关——
+    于是 ``--screen b1`` 的产物也这么写。做 ADR-0014 的 A/B 时正是先读到那句话，才去核实
+    到底跑没跑 b1。产物的用处就是事后回答「这一份候选是用哪条规则算出来的」。
+    """
+    import json
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = screen_args(
+        screen="momentum",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+    assert meta["screen"]["label"] == "momentum"
+    assert meta["screen"]["top_n"] == 2
+
+
+def test_the_screen_metadata_is_a_function_of_the_screen_switch(tmp_path):
+    """两份产物**必须互不相同**——这条钉的是「元数据随 ``--screen`` 变化」本身。
+
+    上面那两条各钉一条规则的内容，却都答不了「换规则时元数据会不会跟着换」：若有人把标签
+    重新写死成一个常量，两条里各有一半仍可能对上。同一次比对直接把这条关系钉住。
+    """
+    import json
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    blocks = {}
+    for name in ("momentum", "b1"):
+        out_dir = tmp_path / f"screens-{name}"
+        args = screen_args(
+            screen=name,
+            tdx_root=str(root),
+            gbbq=str(gbbq),
+            output_dir=str(out_dir),
+            cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+        )
+        out, err = capture()
+
+        assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+        run_dir = next(out_dir.iterdir())
+        blocks[name] = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["screen"]
+
+    assert blocks["momentum"]["label"] == "momentum"
+    assert blocks["b1"]["label"] == "b1"
+    assert blocks["momentum"] != blocks["b1"]
+
+
+def test_the_b1_artifact_names_all_eight_filters_and_the_three_pattern_components(tmp_path):
+    """``--screen b1`` 的产物要能看出跑的是 b1：八条过滤器 + 三个形态分数分量 + 权重 + 秩归一。
+
+    ADR-0012 的核心改动就是「排序因子从 ``j_oversold`` 换成形态分数」，而它在留痕里原先
+    是 ``null``——产物于是答不出「这一份候选是用哪条规则算出来的」。
+    """
+    import json
+    from pathlib import Path
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=60)
+    args = screen_args(
+        screen="b1",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        cw_root=str(Path(__file__).parent / "fixtures" / "cw"),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    screen = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["screen"]
+
+    assert screen["label"] == "b1"
+    assert screen["filters"] == [
+        "trend",
+        "not_below_the_line",
+        "position",
+        "low_j",
+        "volume",
+        "no_flat_pullback",
+        "profitable",
+        "cheap",
+    ]
+    assert screen["factors"] == ["top_calm", "pullback_shrink", "top_shadow"]
+    assert screen["weights"] == [1.0, 1.0, 1.0]
+    assert screen["normalize"] == "rank"
 
 
 def test_an_explicit_as_of_is_still_named_in_the_log(tmp_path):
