@@ -26,6 +26,7 @@ import pytest
 from mbt.backtest import run_backtest
 from mbt.data import (
     GbbqDataSource,
+    GpDataSource,
     SecurityMasterDataSource,
     TdxDataSource,
     backward_adjusted,
@@ -353,3 +354,42 @@ def test_real_dilution_judgement_does_not_bankrupt_the_universe(real_root, real_
     assert (
         judged / total >= 0.7
     ), f"判定通过率仅 {judged}/{total} = {judged / total:.0%}——判据正在把太多标的挡在门外"
+
+
+# --- gp*.dat：布局与时点缺口（票据 #50） --------------------------------------
+
+
+def test_real_gp_files_are_all_whole_thirteen_byte_records(real_root):
+    """真实 gp 文件**全部**是 13 字节的整数倍——布局假设在真实文件上的正面证据。
+
+    抽样而不是全量：这条要证的是「布局在真实文件上成立」，8,976 个文件里抽样足以推翻它，
+    而逐个 stat 只是把同样的断言重复几千遍。
+    """
+    from mbt.data.gp import RECORD_SIZE
+
+    files = sorted((real_root / "cw").glob("gpsh*.dat"))
+    assert len(files) > 100, "本机应有大量 gpsh 文件"
+
+    for path in files[::200]:
+        assert path.stat().st_size % RECORD_SIZE == 0, path.name
+        assert path.stat().st_size > 0, path.name
+
+
+def test_real_gp_daily_ids_are_capped_at_two_thousand_points(real_root):
+    """日频 id 只留**最近 2000 条**——这是 ADR-0006 登记的那个不可回溯缺口。
+
+    判据不是「条数恰好 2000」（那可能是巧合），而是**同一文件里多个 id 共用同一段起止日期**：
+    条数撞上同一个整数尚可解释，几个互不相关的 id 连日期跨度都分毫不差，只能是滚动窗口，
+    旧记录已被覆盖。故这些 id 的历史**不可能**回溯到评估日当时的样子。
+    """
+    from collections import Counter
+
+    tables = GpDataSource(real_root / "cw").tables("sh600000")
+    capped = {i: rows for i, rows in tables.items() if len(rows) == 2000}
+    assert len(capped) >= 5, f"只找到 {len(capped)} 个 2000 条的 id，不足以谈截断"
+
+    spans = Counter((rows[0].date, rows[-1].date) for rows in capped.values())
+    shared, count = spans.most_common(1)[0]
+
+    assert count >= 2, "没有任何两个 2000 条的 id 共享日期跨度——那 2000 就只是巧合了"
+    assert shared[1] >= dt.date(2026, 9, 1), f"窗口末端 {shared[1]} 不像「最新交易日」"

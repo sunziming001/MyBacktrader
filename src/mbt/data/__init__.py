@@ -26,6 +26,7 @@ from .fundamental import (
     non_loss_mask,
 )
 from .gbbq import GbbqDataSource, GbbqError, GbbqRecord
+from .gp import GpDataSource, GpRecord
 from .instrument import instrument_type, is_stock
 from .loader import (
     SkippedSymbol,
@@ -57,6 +58,8 @@ __all__ = [
     "GbbqDataSource",
     "GbbqError",
     "GbbqRecord",
+    "GpDataSource",
+    "GpRecord",
     "MarketData",
     "MarketDataError",
     "Panel",
