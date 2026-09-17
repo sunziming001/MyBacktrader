@@ -17,6 +17,7 @@
 
 import datetime as dt
 import os
+import struct
 from pathlib import Path
 
 import backtrader as bt
@@ -25,8 +26,10 @@ import pytest
 
 from mbt.backtest import run_backtest
 from mbt.data import (
+    GPONE_FIELDS,
     GbbqDataSource,
     GpDataSource,
+    GponeDataSource,
     SecurityMasterDataSource,
     TdxDataSource,
     backward_adjusted,
@@ -37,6 +40,7 @@ from mbt.data.tdx import DAY_RECORD_SIZE
 ROOT_VARIABLE = "MBT_TDX_ROOT"
 GBBQ_VARIABLE = "MBT_TDX_GBBQ"
 MASTER_VARIABLE = "MBT_TDX_MASTER"
+GPONE_VARIABLE = "MBT_TDX_GPONE"
 
 pytestmark = pytest.mark.realmdata
 
@@ -78,6 +82,18 @@ def real_master():
     path = _from_environment(MASTER_VARIABLE, "证券主表 base.dbf")
     if not path.is_file():
         pytest.fail(f"{MASTER_VARIABLE}={path} 不是文件")
+    return path
+
+
+@pytest.fixture
+def real_gpone():
+    """`GPONEDAT` 的来源目录 `T0002/hq_cache`（里面是 `gpshone.dat` / `gpszone.dat`）。
+
+    它既不在 `vipdoc` 之内，也不与 `gbbq` 同处，故同样单独一个环境变量。
+    """
+    path = _from_environment(GPONE_VARIABLE, "GPONEDAT 来源 gp*one.dat 所在目录")
+    if not path.is_dir():
+        pytest.fail(f"{GPONE_VARIABLE}={path} 不是目录")
     return path
 
 
@@ -393,3 +409,46 @@ def test_real_gp_daily_ids_are_capped_at_two_thousand_points(real_root):
 
     assert count >= 2, "没有任何两个 2000 条的 id 共享日期跨度——那 2000 就只是巧合了"
     assert shared[1] >= dt.date(2026, 9, 1), f"窗口末端 {shared[1]} 不像「最新交易日」"
+
+
+# --- GPONEDAT：真身是 T0002/hq_cache/gp*one.dat（票据 #50） --------------------
+
+
+def test_real_gpone_files_hold_exactly_the_documented_fields(real_gpone):
+    """`GPONEDAT` 的字段号恰好是 1..47——与公式帮助原文的范围一致。
+
+    这条同时把「哪一族文件才是 GPONEDAT 的来源」钉住：`vipdoc/cw` 那个 13 字节族里，
+    `id=4` 是收盘价量级，与帮助原文的「一致预期T年度」对不上。
+
+    断言打在整个文件上，不是单只标的——单只票只会有它有数据的那几个字段。
+    """
+    source = GponeDataSource(real_gpone)
+
+    assert source.fields_present("sh600000") == set(GPONE_FIELDS), "沪市文件应覆盖 1..47 全部字段"
+    # 深市缺 40、41（业绩快报的报告期与归母净利润）——本机实测如此，记下来免得当成回归
+    assert source.fields_present("sz000001") == set(GPONE_FIELDS) - {40, 41}
+
+
+def test_real_gpone_ipos_match_the_public_records(real_gpone):
+    """真实文件上的 IPO 锚点——公开数据，不是从文件里抄的。"""
+    source = GponeDataSource(real_gpone)
+
+    assert source.value("sh600519", 1) == pytest.approx(31.39, rel=1e-6)
+    assert source.value("sh600519", 2) == pytest.approx(7150.0, rel=1e-6)
+    assert source.value("sz300750", 1) == pytest.approx(25.14, rel=1e-6)
+
+
+def test_real_gpone_is_a_snapshot_with_no_history(real_gpone):
+    """每个 `(代码, 字段)` 只有**一条**记录——这是时点缺口的结构证据。
+
+    机构上一回给的一致预期已被覆盖，故这些字段**没有历史**；用它做的信号不得声称时点正确。
+    """
+    source = GponeDataSource(real_gpone)
+    path = source.path_for("sh600000")
+    raw = path.read_bytes()
+
+    seen = set()
+    for i in range(len(raw) // 10):
+        code, field, _ = struct.unpack_from("<IHf", raw, i * 10)
+        assert (code, field) not in seen, f"({code}, {field}) 出现两次——不再是快照"
+        seen.add((code, field))
