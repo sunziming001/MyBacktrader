@@ -19,6 +19,16 @@ from .adjust import (
 )
 from .anomaly import Anomaly, find_anomalies, require_no_anomalies
 from .errors import MarketDataError
+from .forward import (
+    FORWARD_CAVEAT,
+    Chosen,
+    ForwardReading,
+    choose,
+    reading,
+    readings,
+    readings_frame,
+    uses_forward,
+)
 from .fundamental import (
     CwDataSource,
     FinancialRecord,
@@ -55,9 +65,12 @@ from .updates import (
 __all__ = [
     "AdjustmentEvent",
     "Anomaly",
+    "Chosen",
     "CwDataSource",
     "DilutionVerdict",
     "FinancialRecord",
+    "FORWARD_CAVEAT",
+    "ForwardReading",
     "GbbqDataSource",
     "GbbqError",
     "GbbqRecord",
@@ -83,6 +96,7 @@ __all__ = [
     "backward_adjusted_markets",
     "boundary_of",
     "check_updates",
+    "choose",
     "combined_reference_price",
     "find_anomalies",
     "forward_adjusted",
@@ -94,8 +108,12 @@ __all__ = [
     "load_market_data",
     "load_universe_data",
     "non_loss_mask",
+    "reading",
+    "readings",
+    "readings_frame",
     "require_no_anomalies",
     "save_boundaries",
     "slice_markets",
     "stock_symbols",
+    "uses_forward",
 ]
