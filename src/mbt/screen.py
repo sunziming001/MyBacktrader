@@ -35,6 +35,13 @@ import pandas as pd
 
 from mbt.data.panel import Panel
 from mbt.signals import drawdown_from_high
+from mbt.universe import CHINEXT, MAIN_BOARD, STAR_MARKET
+
+#: **砖型**规则的板块范围：主板（沪深两市）、创业板、科创板，**排除北交所**。
+#:
+#: 「主板」这一个概念名已经合并了沪、深两个交易所口径（规则表按交易所分列是为了过户费，
+#: 那是另一回事，见 :func:`mbt.universe.build_universe`）。故这里写三个名字就是需求里那三个。
+BRICK_BOARDS = frozenset({MAIN_BOARD, CHINEXT, STAR_MARKET})
 
 #: 组面板时提供给选股规则的字段。刻意**不含** ``amount``：它与信号无关，没有理由被带进
 #: 计算（ADR-0009 的「字段显式声明」）。这是一份**固定声明**的集合，不是从数据里推断的。
@@ -178,6 +185,18 @@ class Screen:
     weights: tuple[float, ...] | None = None
     normalize: str | None = None
     top_n: int | None = None
+    #: 这条规则**自己声明的板块范围**（``CONTEXT.md`` 的**板块**，四个概念名）。
+    #:
+    #: ``None``（默认）表示「随调用方的股票池准入规则」——规则不插嘴。给了值则是**默认值**
+    #: 而不是硬约束：调用方显式指定了板块就以调用方为准（命令行上 ``--boards`` 就是这样）。
+    #:
+    #: 为什么声明在规则上、而不是由调用方每次手填：板块范围与「这条规则在哪些市场上成立」
+    #: 是同一件事，把它与规则写在一起，才不会出现「同一条规则在两台机器上跑出不同的池子」
+    #: ——而那**不会报错**，只是名单悄悄不一样。
+    #:
+    #: 规则**不建池**：它只声明范围，建池仍是 :func:`mbt.universe.build_universe` 的事
+    #: （理由见 :meth:`apply` 的 ``universe_mask``）。
+    boards: frozenset[str] | None = None
 
     @property
     def given_factors(self) -> tuple[FrameTransform, ...]:
@@ -540,6 +559,32 @@ def valuation_screen(
     )
 
 
+#: ``Screen.apply`` 递下来的面板在同一次调用里是**同一个对象**，故规则的中间量可以按面板
+#: 对象记住——这样一次选股里那笔昂贵的计算只付一遍。缓存按 ``is`` 认而不是按 ``id``：
+#: ``id`` 会在旧面板被回收之后指到新对象上。
+#:
+#: 抽成一处是因为它有两个使用者（B1 的摆动点与量能形态、砖型的砖型图），而「按什么认同一份
+#: 面板」是个容易写错的判据——写错会**静默地**用上另一张面板的读数。
+def _panel_memo(compute, progress, label):
+    """返回一个「按面板对象记住一次计算结果」的记忆器。
+
+    ``compute(panel)`` 只在面板换了对象时才真的跑，且**第一次**跑带 :func:`mbt.progress.timed`
+    记时——它落在第一个用到它的那个部件名下，不单列的话那一阶段的账会把它的代价算成自己的。
+    """
+    from mbt.progress import timed
+
+    cache: dict[str, object] = {}
+
+    def memo(panel):
+        if cache.get("panel") is not panel:
+            cache["panel"] = panel
+            with timed(progress, label):
+                cache["value"] = compute(panel)
+        return cache["value"]
+
+    return memo
+
+
 def b1_signals(
     markets,
     *,
@@ -796,7 +841,6 @@ def b1_screen(
         315 秒，比记一次 ``volume_pattern`` 贵得多；这是退回旧口径的代价之一。）
     """
     from mbt.data.valuation import PE, PE_PERCENTILE
-    from mbt.progress import timed
     from mbt.signals import (
         above_yellow,
         j_below,
@@ -811,27 +855,19 @@ def b1_screen(
     windows = tuple(yellow_windows)
 
     #: `Screen.apply` 递下来的面板在同一次调用里是**同一个对象**（见上面那条注记），故中间量
-    #: 按对象本身记住。缓存按 ``is`` 认而不是按 ``id``：``id`` 会在旧面板被回收后指到新对象上。
-    anchors_cache: dict[str, object] = {}
-    pattern_cache: dict[str, object] = {}
-
-    def anchors_of(panel):
-        if anchors_cache.get("panel") is not panel:
-            anchors_cache["panel"] = panel
-            # 首算（后面每个部件都复用）单独记时——它落在**第一个**用到它的阶段里，
-            # 不单列的话那一阶段的账会把它的代价算成自己的（见 `mbt.progress.timed`）。
-            with timed(progress, "swings（按面板缓存，首个用到它的部件付这一次）"):
-                anchors_cache["value"] = swings(panel["close"], retracement=retracement)
-        return anchors_cache["value"]
-
-    def pattern_of(panel):
-        if pattern_cache.get("panel") is not panel:
-            pattern_cache["panel"] = panel
-            with timed(progress, "volume_pattern（按面板缓存，三个因子共用这一次）"):
-                pattern_cache["value"] = volume_pattern(
-                    panel, anchors_of(panel), base_bars=volume_base_bars, atr_n=atr_n
-                )
-        return pattern_cache["value"]
+    #: 按对象本身记住（见 :func:`_panel_memo`）——这两个首算都很贵，而下面有七个部件要用到它们。
+    anchors_of = _panel_memo(
+        lambda panel: swings(panel["close"], retracement=retracement),
+        progress,
+        "swings（按面板缓存，首个用到它的部件付这一次）",
+    )
+    pattern_of = _panel_memo(
+        lambda panel: volume_pattern(
+            panel, anchors_of(panel), base_bars=volume_base_bars, atr_n=atr_n
+        ),
+        progress,
+        "volume_pattern（按面板缓存，三个因子共用这一次）",
+    )
 
     def trend(panel):
         return white_above_yellow(panel["close"], white_n, windows)
@@ -903,6 +939,107 @@ def b1_screen(
         weights=(1.0, 1.0, 1.0),
         normalize="rank",
         top_n=top_n,
+    )
+
+
+def brick_screen(*, top_n=None, progress=None) -> Screen:
+    """**砖型**的选股规则：前一天是**绿砖**、当天是**红砖**、且红砖**比那根绿砖大**，
+    按两个等权因子排序（需求方给定，见票据 #81）。
+
+    三条过滤器读的是同一个**砖型图**（:func:`~mbt.signals.indicators.brick_line`）：
+
+    ==================  ====================================================
+    过滤器              判据
+    ==================  ====================================================
+    前一天是绿砖        ``砖型图[t−1] < 砖型图[t−2]``
+    当天是红砖          ``砖型图[t] > 砖型图[t−1]``
+    红砖比绿砖大        ``砖的大小之比 > 1``（**严格**大于，等于即不合格）
+    ==================  ====================================================
+
+    排序因子两项**等权**，各自在**当日可交易池内**转成百分位再加权平均：
+
+    ==================  ====================================================
+    因子                读法（**越大越靠前**）
+    ==================  ====================================================
+    砖的大小之比        红砖的大小 ÷ 绿砖的大小
+    量能                当根成交量 ÷ **前一根**成交量
+    ==================  ====================================================
+
+    两只过滤器保证「大小之比」在入选格上**就是**「红砖 ÷ 绿砖」；分母恒为正，因为绿砖是严格
+    下降（见 :class:`~mbt.signals.indicators.BrickLine` 的那条不变量）。其余形态下同一个读数
+    算的是别的比值——会被过滤器筛掉，故这里不替它预设形态。
+
+    .. note::
+
+        **量能那一项不是「量比」，本项目刻意不用那个词。** 官方量比是「当日开盘后每分钟平均
+        成交量 ÷ 过去 5 个交易日每分钟平均成交量」，是个**盘中**指标，用日线数据无法忠实复现；
+        用一个有法定含义的词去指另一件事正是本项目反复警惕的失真（见
+        :func:`~mbt.signals.indicators.volume_ratio` 的告警与 ``README.md``）。本项就是
+        「当根整日量 ÷ 前一根整日量」，由现成的 :func:`~mbt.signals.indicators.volume_ratio`
+        取 ``n=1`` 算出——**不另写一份**。
+
+    .. note::
+
+        **两个因子等权，指的是「秩」等权**，不是数值等权。故一个极端放量的标的不会因为倍数
+        特别大而压过另一个；等比的是各自在池内的分位（``Screen`` 的 ``normalize="rank"``）。
+
+    .. note::
+
+        **板块范围写在规则上**（``boards``）：主板（沪深两市）、创业板、科创板，**排除北交所**。
+        调用方显式给了板块就以调用方为准。
+
+    .. note::
+
+        **这条规则只读行情**，不需要财务数据目录（``--cw-root``）——它的三个过滤器与两个因子
+        全部由开高低收与成交量算出，没有一项来自财报。
+
+    .. note::
+
+        砖型图那三层递推平滑自带一段约百根的暖机（记忆按 ``(5/6)^t`` 衰减），序列起点对末位
+        的影响到那里已落进浮点噪声。面板窗口短于它时读数会**静默算在更短的历史上**。
+        本规则**不**自己声明要读多深的历史——那道闸门目前仍是 ``mbt.cli`` 里一个全局常量
+        （按最深的那条规则取），对砖型是偏严的；改成「规则自己声明」是另一张票的事。
+
+    参数:
+        top_n: 只取前 N 名。``None``（默认）表示不截断。
+        progress: 进度上报的接收端。砖型图是三次递推平滑，三个过滤器与一个因子都要用它，故
+            按面板对象**只算一次**并单独记时——否则它的代价会被算进第一个碰到它的那个部件名
+            下（见 :func:`mbt.progress.timed`）。
+    """
+    from mbt.signals import brick_line, green_brick, red_brick, volume_ratio
+
+    readings = _panel_memo(
+        brick_line,
+        progress,
+        "brick（按面板缓存，三个过滤器与一个因子共用这一次）",
+    )
+
+    def previous_green(panel):
+        # `fill_value=False`：调序在最后一行不成立，而「前一根是绿砖」在那时**为假**
+        # （没有前一根）——不能让它变成缺失，过滤器会把缺失当不合格，两者恰好一致，
+        # 但显式写出来才读得出「这是判据，不是缺数据」。
+        return green_brick(readings(panel).line).shift(1, fill_value=False)
+
+    def red_today(panel):
+        return red_brick(readings(panel).line)
+
+    def bigger_than_the_green(panel):
+        # 比值缺失（分母为 0 或前一根没有砖）时比较恒为假 —— 正是「不合格」。
+        return readings(panel).size_ratio > 1.0
+
+    def size_ratio(panel):
+        return readings(panel).size_ratio
+
+    def traded_volume_ratio(panel):
+        return volume_ratio(panel["volume"], n=1)
+
+    return Screen(
+        filters=(previous_green, red_today, bigger_than_the_green),
+        factors=(size_ratio, traded_volume_ratio),
+        weights=(1.0, 1.0),
+        normalize="rank",
+        top_n=top_n,
+        boards=BRICK_BOARDS,
     )
 
 
