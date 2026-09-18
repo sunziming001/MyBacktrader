@@ -202,7 +202,8 @@ class AStockBroker(bt.brokers.BackBroker):
         ("universe", None),
         #: boolean 标的宽表：当日**选股结果**。给出时，未被选中的买入被拒、卖出不受限。
         ("selection", None),
-        #: 字段名 → 标的宽表：**额外信号**（如估值），供策略读取。引擎不解释它。
+        #: 字段名 → 标的宽表：**额外信号**（如估值），供策略读取。引擎会往它的**副本**里
+        #: 并进**选股分数**（``mbt.screen.SCREEN_SCORE_FIELD``），除此之外不解释它。
         ("signals", None),
         #: 标的连续多少个交易日无 K 线后，挂单失效。默认 5。
         ("order_expiry_ticks", 5),
