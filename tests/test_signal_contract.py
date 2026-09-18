@@ -77,6 +77,23 @@ def pattern_columns(panel):
     )
 
 
+def brick_columns(panel):
+    """砖型图那三条读数并成一张表，好让判据**一次盖住全部三条**。
+
+    只盖 ``line`` 是不够的：``size`` 与 ``size_ratio`` 都取**前一根**，而「取前一根」正是
+    最容易被写成「取未来一根」的地方。
+    """
+    readings = signals.brick_line(panel)
+    return pd.concat(
+        {
+            "line": readings.line,
+            "size": readings.size,
+            "size_ratio": readings.size_ratio,
+        },
+        axis=1,
+    )
+
+
 #: 取**标的宽表**的信号（``DataFrame → DataFrame``）。
 SYMBOL_FRAME_SIGNALS = [
     ("sma", lambda frame: signals.sma(frame, n=3)),
@@ -108,6 +125,8 @@ SYMBOL_FRAME_SIGNALS = [
     ),
     ("swings", swing_columns),
     ("volume_structure", volume_columns),
+    ("red_brick", lambda frame: signals.red_brick(frame)),
+    ("green_brick", lambda frame: signals.green_brick(frame)),
     (
         "volume_contraction",
         lambda frame: signals.volume_contraction(
@@ -148,13 +167,14 @@ PANEL_SIGNALS = [
         ),
     ),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
+    ("brick_line", brick_columns),
     ("volume_pattern", pattern_columns),
 ]
 
 #: ``__all__`` 里**不是信号**的公开名：它们是返回类型的容器（三条线 / 四个摆动点字段 /
 #: 四+五条量能读数），本身不产生数值序列，故没有可截断重算的「输出」——分别由上面的
 #: ``kdj`` / ``swings`` / ``volume_structure`` / ``volume_pattern`` 条目一并覆盖。
-NON_SIGNAL_EXPORTS = {"KDJ", "Swings", "VolumePattern", "VolumeStructure"}
+NON_SIGNAL_EXPORTS = {"KDJ", "BrickLine", "Swings", "VolumePattern", "VolumeStructure"}
 
 #: 八根 K 线、两个标的，含一处停牌造成的缺失——缺失正是因果性最容易出错的地方。
 SYMBOL_FRAME_VALUES = {

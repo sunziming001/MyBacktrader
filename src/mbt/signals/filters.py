@@ -59,6 +59,32 @@ def rising_streak(prices: pd.DataFrame, n: int) -> pd.DataFrame:
     return (prices.diff() > 0).rolling(n, min_periods=n).sum() == n
 
 
+def red_brick(line: pd.DataFrame) -> pd.DataFrame:
+    """**红砖**：砖型图相对**前一根**上升（``CONTEXT.md``）。
+
+    方向是相对前一根说的，不是相对均线、也不是相对 0——故一根从 0 底抬到 3 的砖也是红砖。
+
+    口径只写在 :func:`~mbt.signals.indicators.brick_line` 里，本函数只做比较——同
+    :func:`above_ma` 与 :func:`~mbt.signals.indicators.sma` 的分工。故它取的是**砖型图**
+    （``BrickLine.line``）而不是那个 :class:`~mbt.signals.indicators.BrickLine` 整体。
+
+    ``line`` 缺失处取 ``False``（比较恒假）：不知道是不是红砖，按「不合格」处置。
+    """
+    line = check_symbol_frame(line)
+    return line > line.shift(1)
+
+
+def green_brick(line: pd.DataFrame) -> pd.DataFrame:
+    """**绿砖**：砖型图相对**前一根**下降。
+
+    与 :func:`red_brick` 对称但**不是**它的取反：两根相等时既非红也非绿（图上不画砖），
+    故两个函数在那一格**同时**为 ``False``。判据若要问「不是红砖」，请自己写「不是」——
+    把 ``green_brick`` 当 ``red_brick`` 的补集会漏掉持平那一档。
+    """
+    line = check_symbol_frame(line)
+    return line < line.shift(1)
+
+
 def volume_surge(volumes: pd.DataFrame, k: float, n: int) -> pd.DataFrame:
     """放量 k 倍：当根成交量**严格高于**前 n 日均量的 k 倍。
 

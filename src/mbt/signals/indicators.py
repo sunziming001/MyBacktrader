@@ -190,6 +190,132 @@ def kdj(panel: Panel, n: int, m1: int, m2: int) -> KDJ:
     return KDJ(k=k, d=d, j=3.0 * k - 2.0 * d)
 
 
+#: 公式里写死的窗口与偏移。它们**刻意不是参数**：砖型图是一条具体的公式，换掉其中任何一个数
+#: 就是**另一条线**，而两条线同名会让「用的哪个口径」从调用处消失。见 :func:`brick_line`。
+_BRICK_WINDOW = 4
+_BRICK_FAST_N = 4
+_BRICK_SLOW_N = 6
+_BRICK_FLOOR = 4.0
+
+
+class BrickLine(NamedTuple):
+    """砖型图连同它那两个**派生读数**，各为一条标的宽表。
+
+    只有 ``line`` 是 ``CONTEXT.md`` 的**砖型图**；另外两条由它算出，是各自的术语：
+
+    ===============  ==================================================================
+    字段              术语（``CONTEXT.md``）与读法
+    ===============  ==================================================================
+    ``line``          **砖型图**：公式末句减 4、与 0 取大之后的那条线
+    ``size``          **砖的大小**：``|line[t] − line[t−1]|``，两砖相等时为 0
+    ``size_ratio``    ``size[t] ÷ size[t−1]``；前一根没有砖（大小为 0）时为**缺失**
+    ===============  ==================================================================
+
+    三条都**不含判断**（判据在 :func:`~mbt.signals.filters.red_brick` 与
+    :func:`~mbt.signals.filters.green_brick`），故照常遵循指标契约；方向各不相同，故
+    **不要**直接当排序因子用之前先看清哪一条朝哪边。
+
+    ``size`` 取**绝对值**，故「砖的大小」恒为正——绿砖（严格下降）也不例外。这条不是顺手
+    取的：它使「红砖的大小 ÷ 绿砖的大小」的分母**不可能为零**，而那个比值是排序因子之一。
+
+    ``size_ratio`` 是**机械**读数，**不**先判红绿：只有当 ``line[t−1]`` 是绿砖、``line[t]``
+    是红砖时，它才等于「红砖的大小 ÷ 绿砖的大小」。其余形态下它算的是别的比值——判据会把那些
+    格子筛掉，故这里**不**替它预设形态（预设等于把判断塞进指标里）。前一根大小为 0（两根持平、
+    或前一根在缺口上）时比值**无定义**，取缺失而**不**取无穷：那条砖根本不存在，除法没有对象。
+    """
+
+    line: pd.DataFrame
+    size: pd.DataFrame
+    size_ratio: pd.DataFrame
+
+
+def brick_line(panel: Panel) -> BrickLine:
+    """**砖型图**，照行情软件那条公式字面实现。
+
+    公式（``VAR`` 编号照原样保留，便于与图上逐句对读）::
+
+        VAR1A := (HHV(H, 4) − C) ÷ (HHV(H, 4) − LLV(L, 4)) × 100 − 90
+        VAR2A := SMA(VAR1A, 4, 1) + 100
+        VAR3A := (C − LLV(L, 4)) ÷ (HHV(H, 4) − LLV(L, 4)) × 100
+        VAR4A := SMA(VAR3A, 6, 1)
+        VAR5A := SMA(VAR4A, 6, 1) + 100
+        VAR6A := VAR5A − VAR2A
+        砖型图 := IF(VAR6A > 4, VAR6A − 4, 0)
+
+    两个位置读数（``VAR1A`` 量「离窗口最高价多远」、``VAR3A`` 量「离窗口最低价多远」）各做
+    通达信递推均值后相减，故这条线与 :func:`~mbt.signals.indicators.kdj` 是**同一族**、用
+    同一个零件（:func:`_smooth_frame`）。
+
+    参数:
+        panel: 须含 ``high`` / ``low`` / ``close``，三者同日对齐（由 :class:`~mbt.data.panel.Panel`
+            保证）。**不需要**成交量——量那一条是排序因子，不在本函数里。
+
+    返回:
+        :class:`BrickLine`。
+
+    .. note::
+
+        **两处 ``+100`` 相消，故这里直接相减。** ``VAR5A − VAR2A`` 展开后那两个 ``+100``
+        一正一负消掉，故本函数算的是``SMA(SMA(VAR3A,6,1),6,1) − SMA(VAR1A,4,1)``。这不是
+        化简求快——先加 100 再减回来会白白丢掉两个数的低位精度，而数学上两式恒等。
+
+    .. note::
+
+        **末句那个「与 0 取大」照字面保留**（ADR-0016）。它是本条线定义的一部分：接近底部时
+        ``VAR6A ≤ 4`` 一律记 0，于是图上那段**既不红也不绿**，而一根从 0 抬到 3 的红砖与一根
+        8 → 11 的红砖被判为**同高**（``size`` 都是 3）。这两条后果是认下的，不是瑕疵。
+
+    .. note::
+
+        **缺口处缺失，不取 0——这是对公式字面的**一处刻意偏离**。** 行情软件上没有缺口行，
+        故它的 ``IF`` 把「算不出」判成假、给出 0；本项目按缺口纪律取**缺失**（ADR-0005）。
+        差别是实质性的：取 0 会把一个停牌日伪造成「落在 0 底的一天」，于是复牌那天凭空多出
+        一根砖，而它不会报错。
+
+        同理，窗口内最高价等于最低价（一字板、长期停牌复牌）时分母为 0，那两个位置读数一律
+        缺失——不是 0。
+
+    .. note::
+
+        前 3 根缺失：``HHV``/``LLV`` 都要 4 根，窗口不满即缺失，故递推从第 4 根播种。这里
+        **不**照行情软件在不足 4 根时按已有的几根算——那是缺口纪律的另一面（``kdj`` 同）。
+
+        递推的记忆按 ``(5/6)^t`` 衰减，故它自带一段约百根的暖机；序列起点对末位的影响到那里
+        已落进浮点噪声。这段深度由**消费它的选股规则**自己声明——历史够不够深是规则的属性，
+        本函数不猜。
+    """
+    high = check_symbol_frame(panel["high"])
+    low = check_symbol_frame(panel["low"])
+    close = check_symbol_frame(panel["close"])
+
+    highest = high.rolling(_BRICK_WINDOW, min_periods=_BRICK_WINDOW).max()
+    lowest = low.rolling(_BRICK_WINDOW, min_periods=_BRICK_WINDOW).min()
+    span = highest - lowest
+
+    near_high = (highest - close) / span * 100.0 - 90.0
+    near_low = (close - lowest) / span * 100.0
+    # 分母为 0 时两个读数都无定义：先算比值、再把分母非正的位置判为缺失，
+    # 免得 0/0 的 NaN 与「窗口不满」的 NaN 混为一谈（与 `kdj` 同一处置）。
+    near_high = near_high.where(span > 0)
+    near_low = near_low.where(span > 0)
+
+    var6 = _smooth_frame(_smooth_frame(near_low, 1.0 / _BRICK_SLOW_N), 1.0 / _BRICK_SLOW_N) - (
+        _smooth_frame(near_high, 1.0 / _BRICK_FAST_N)
+    )
+
+    # 照字面的 IF(VAR6A>4, VAR6A−4, 0)：先减 4、再与 0 取大。
+    floored = (var6 - _BRICK_FLOOR).where(var6 > _BRICK_FLOOR, 0.0)
+    # 再补回缺口：`where` 的假分支（包括 NaN 处的假）已把缺失写成 0，故这一步不可省。
+    line = floored.where(var6.notna())
+
+    size = line.diff().abs()
+    denominator = size.shift(1)
+    # 前一根没有砖（大小为 0 或缺失）时比值无定义——取缺失，不取无穷。
+    size_ratio = (size / denominator).where(denominator > 0)
+
+    return BrickLine(line=line, size=size, size_ratio=size_ratio)
+
+
 def volume_ratio(volumes: pd.DataFrame, n: int) -> pd.DataFrame:
     """成交量比：``当根成交量 ÷ 前 n 根均量``。
 
