@@ -164,6 +164,34 @@ def test_the_window_includes_the_current_day():
     assert pe_percentile(frame([2.0, 1.0]), window=2).iloc[1, 0] == pytest.approx(0.0)
 
 
+def test_one_row_short_of_the_window_moves_the_percentile():
+    """窗口少一行，读数就变——**这就是 `--panel-bars` 那道暖机闸门的依据**（ADR-0014）。
+
+    造一条把**极低值放在窗口首行**的序列：窗口取 1000 行时它算进 ``LLV``，取 999 行时被
+    排出窗口，于是同一评估日的百分位从 ``(15−1)/(20−1)`` 变成 ``(15−5)/(20−5)``。
+
+    它钉的是一条**契约**：``pe_percentile`` 对不足窗口的历史照常给值（见上一条），所以
+    「历史够不够」这件事**不能**靠这个函数自己发现，只能由调用方在取数时拦住。
+    """
+    values = [5.0] * 1200
+    values[200] = 1.0  # 窗口（倒数 1000 行）的首行，即 LLV
+    values[500] = 20.0  # HHV
+    values[-1] = 15.0  # 评估日：既不是高也不是低，故百分位对窗口长度敏感
+    full = frame(values)
+    evaluated = full.index[-1]
+
+    expected = (15.0 - 1.0) / (20.0 - 1.0)
+    assert pe_percentile(full).loc[evaluated, "sh600000"] == pytest.approx(expected)
+
+    # 窗口**刚好**盖住那一行极低值 → 逐位相同。
+    assert pe_percentile(full.iloc[-1000:]).loc[evaluated, "sh600000"] == pytest.approx(expected)
+
+    # 少一行 → 极低值落在窗口之外 → 读数变了（差 0.07，不是末位级）。
+    short = pe_percentile(full.iloc[-999:]).loc[evaluated, "sh600000"]
+    assert short == pytest.approx((15.0 - 5.0) / (20.0 - 5.0))
+    assert abs(short - expected) > 0.05
+
+
 def test_a_non_positive_window_is_rejected():
     with pytest.raises(ValueError, match="窗口至少为 1"):
         pe_percentile(frame([1.0]), window=0)

@@ -25,6 +25,7 @@ ATR 这类信号在一行内同时用 ``high``、``low``、``close`` 且必须**
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 
 import pandas as pd
@@ -208,6 +209,78 @@ def assemble_panel(markets: Sequence[MarketData], fields: Sequence[str]) -> Pane
         built[field] = pd.concat(series, axis=1, keys=symbols)
 
     return Panel(built)
+
+
+def _calendar_of(markets: Sequence[MarketData]) -> pd.DatetimeIndex:
+    """各标的交易日索引的**并集**——即 :func:`assemble_panel` 会给出的那个行索引。
+
+    放在这里、而不是让调用方自己拼，是为了让「面板有几行」只有一处定义：并集这件事
+    ``assemble_panel`` 已经在做（``pd.concat`` 的外连接），而 :func:`panel_window` 要在
+    **组装之前**回答「会切到哪一天」——那时还没有面板可问。两者必须给出同一个索引，否则
+    「切的哪一段」与「算的哪一段」就不是一回事了；`test_a_computed_window_starts_on_a_panel_row`
+    把这条钉住。
+
+    ``Index.union`` 在两侧相同时直接返回自身，而 A 股各标的的交易日日历绝大多数相同，
+    故这一串并集实际很便宜——但这条性质不写下来，读代码的人会以为它是 O(标的数 × 行数)。
+    """
+    calendar: pd.DatetimeIndex | None = None
+    for market in markets:
+        index = pd.DatetimeIndex(market.prices.index)
+        calendar = index if calendar is None else calendar.union(index)
+    return pd.DatetimeIndex([]) if calendar is None else calendar
+
+
+@dataclass(frozen=True)
+class PanelWindow:
+    """一次「按根数取末端窗口」的结论（ADR-0014）。
+
+    属性:
+        start: 要保留的最早那根 K 线的日期；``None`` 表示**不切**——请求的根数不小于
+            评估日之前的可得行数，切了也等于没切。
+        available: **评估日及其之前**的日历行数。它就是「评估日身后有多少历史」，也就是
+            暖机闸门要比的那个量。
+        rows: 切完之后窗口里的行数；不切时等于 ``available``。
+    """
+
+    start: pd.Timestamp | None
+    available: int
+    rows: int
+
+
+def panel_window(markets: Sequence[MarketData], *, as_of, bars: int) -> PanelWindow:
+    """算出「评估日往前 ``bars`` 根」该从哪一天开始保留（ADR-0014）。
+
+    这是**日历**口径，不是逐标的的根数口径：并集日历切到末端 ``bars`` 行，各标的取自己
+    落在其中的那些行。两者的差别就是本函数存在的理由——逐标的取末端 ``bars`` 根，一只
+    停牌三年的标的照样贡献三年前的旧行，并集日历于是降不到想去的地方（实测只从
+    8387 行降到 6792 行）；切日历才真正降到 ``bars``（票据 #78）。
+
+    ``as_of`` 之后的行**不保留**：评估日之后的数据没有任何消费者（``Screen`` 内部本来
+    也把它切掉），留着只是白占内存。
+
+    为什么在库里而不在 CLI：与 :func:`mbt.data.loader.slice_markets` 同理，这是个数据操作，
+    且「切在哪一天」有一处 off-by-one 需要被定义与测试（``bars`` 是**窗口的总行数**、含
+    评估日自己，故窗口起点是倒数第 ``bars`` 行、而不是 ``bars + 1`` 行）。CLI 只做参数搬运，
+    **闸门也在 CLI**——「多深的历史才算够」是选股规则的属性（见 ``PANEL_WARMUP_BARS``），
+    不是数据层的属性，本函数只如实回答「切到哪、剩多少行」。
+
+    参数:
+        markets: 已加载的行情。
+        as_of: 评估日。``None`` 表示不设上界（窗口取整段日历的末端）。
+        bars: 窗口的总行数；**必须为正**。
+
+    抛:
+        ValueError: ``bars < 1``。
+    """
+    if bars < 1:
+        raise ValueError(f"窗口至少为 1 根，收到 {bars}（0 是「不切」，由调用方自己判断）")
+
+    calendar = _calendar_of(markets)
+    upto = calendar if as_of is None else calendar[calendar <= pd.Timestamp(as_of)]
+    available = len(upto)
+    if available <= bars:
+        return PanelWindow(start=None, available=available, rows=available)
+    return PanelWindow(start=upto[-bars], available=available, rows=bars)
 
 
 #: 「最近这些天」的窗口长度，用来算**覆盖率的中位参照**。取 21——一个月左右的交易日，

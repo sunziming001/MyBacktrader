@@ -22,6 +22,7 @@ from mbt.cli import (
     ALL_CANDIDATES,
     DEFAULT_START,
     MAX_FAILURE_RATE,
+    PANEL_WARMUP_BARS,
     _resolve_as_of,
     _write_watchlist,
     build_parser,
@@ -1365,6 +1366,146 @@ def test_the_report_counts_the_skips_from_loading_not_just_from_slicing(tmp_path
     assert isinstance(sliced, UniverseLoad)
     assert [item.symbol for item in sliced.skipped] == ["sh000001"], "上游的跳过被丢掉了"
     assert len(sliced.markets) == 1
+
+
+def test_the_panel_window_keeps_exactly_the_requested_number_of_rows():
+    """见 `tests/test_panel.py`：库侧的口径测试在那边（这里只测 CLI 怎么用它）。"""
+
+
+# --- 每日选股的面板窗口（``--panel-bars``）-----------------------------------
+#
+# 面板日历截断是**提升内存上限**的手段，不是一次口径变更，故这一组钉的是
+# 「切了要说、切不动要说、切得太短要拒」，而不是「切完结果仍然一样」——
+# 后者是信号层的契约（见 test_valuation 那条 1000/999 断崖）。
+
+
+def test_panel_bars_is_a_screen_only_switch():
+    """与 ``--forward-root`` 同理：回测那条路上**没有**这个开关。
+
+    回测的区间由 ``--start`` / ``--end`` 给，而它是各自算区间、逐日推进的，不需要一个
+    「末端窗口」；把这个开关也开给回测，只会让人以为它也有同样的内存效果。
+    """
+    parser = build_parser()
+
+    screen = parser.parse_args(["screen", "--tdx-root", "x", "--gbbq", "y", "--output-dir", "z"])
+    assert screen.panel_bars == 0, "默认必须是「不截断」"
+
+    backtest = parser.parse_args(
+        [
+            "backtest",
+            "--strategy",
+            EXAMPLE_STRATEGY,
+            "--tdx-root",
+            "x",
+            "--gbbq",
+            "y",
+            "--output-dir",
+            "z",
+        ]
+    )
+    assert not hasattr(backtest, "panel_bars")
+
+
+def test_panel_bars_cuts_the_panel_calendar_to_the_tail(tmp_path):
+    """切了要说（日志 + 产物）：同一份名单按 1301 根还是按 1000 根历史算出来的，看 CSV 分不出。"""
+    import json
+
+    root, gbbq = make_dataroot(tmp_path, periods=1200)
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        as_of=None,  # 由数据自己定评估日，故评估日就在末根
+        panel_bars=1100,
+    )
+    out, err = capture()
+
+    code = run_screen_command(args, stdout=out, stderr=err)
+
+    assert code == 0, err.getvalue()
+    assert "面板：日历 1200 行 → 1100 行" in out.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert metadata["panel_bars"] == 1100
+    assert metadata["panel_rows"] == 1100
+
+
+def test_panel_bars_below_the_deepest_lookback_refuses_to_run(tmp_path):
+    """窗口短于规则的深回看 → **拒跑**，而不是给一个按更短历史算出来的答案。
+
+    ``pe_percentile`` 对不足窗口的历史照常给值（``min_periods=1``），故这件事不会有别的
+    地方发现：名单照旧生成，只是读数算在更短的窗口上（实测 999 行就有 81 只标的不同）。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=1200)
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        as_of=None,
+        panel_bars=PANEL_WARMUP_BARS - 1,
+    )
+    out, err = capture()
+
+    code = run_screen_command(args, stdout=out, stderr=err)
+
+    assert code == 1
+    assert str(PANEL_WARMUP_BARS) in err.getvalue()
+    assert not (tmp_path / "screens").exists(), "拒绝运行就不该留下产物目录"
+
+
+def test_the_gate_also_fires_when_the_data_is_too_short_to_cut(tmp_path):
+    """**闸门看的是「实际会用到多少历史」，不是「请求了多少」。**
+
+    这条是本票最容易漏的一格：请求 1301 根，而数据只有 900 根，于是**切不动**——此时若把闸门
+    挂在「切没切」上，它就整个跳过了，而评估日身后只有 900 行，``pe_percentile`` 照样在一个
+    比 1000 更短的历史上给值，名单照样生成。两种情形（请求太少、数据太短）后果相同，故都得拦。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=PANEL_WARMUP_BARS - 100)
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        as_of=None,
+        panel_bars=1301,  # 比可得历史长，切不动
+    )
+    out, err = capture()
+
+    code = run_screen_command(args, stdout=out, stderr=err)
+
+    assert code == 1
+    assert "900" in err.getvalue(), "报错要说清实际剩了多少行"
+    assert not (tmp_path / "screens").exists()
+
+
+def test_a_request_longer_than_the_data_but_still_deep_enough_proceeds(tmp_path):
+    """切不动、但身后的历史**够深** → 不切，继续跑，并如实说「未截断」。
+
+    这才是「历史本来就比 N 短」那句话的适用范围（ADR-0014 决策 9）：不是「短了就一律放行」，
+    而是「短到切不动、但没短到影响读数」——两个条件都要满足。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=PANEL_WARMUP_BARS + 200)
+    args = screen_args(
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        as_of=None,
+        panel_bars=PANEL_WARMUP_BARS + 500,  # 比可得历史长，切不动
+    )
+    out, err = capture()
+
+    code = run_screen_command(args, stdout=out, stderr=err)
+
+    assert code == 0, err.getvalue()
+    assert f"不足请求的 {PANEL_WARMUP_BARS + 500} 根，未截断" in out.getvalue()
+
+
+def test_a_negative_panel_bars_is_a_usage_error():
+    """``--panel-bars -1`` 看着像「不截断」，实际是「比任何真实窗口都短」——故是用法错误。
+
+    这一格若被当成 0，闸门就被绕过了（两个数在 ``min(bars, 历史行数)`` 里含义相反）。
+    """
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["screen", "--panel-bars", "-1"])
 
 
 # --- 每日选股：评估日、全池、自选股文件 ----------------------------------------

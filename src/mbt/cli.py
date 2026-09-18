@@ -46,10 +46,12 @@ from mbt.data import (
     load_listing_dates,
     load_universe_data,
     non_loss_mask,
+    panel_window,
     slice_markets,
     stock_symbols,
 )
 from mbt.data.errors import MarketDataError
+from mbt.data.valuation import DEFAULT_WINDOW
 from mbt.progress import DEFAULT_INTERVAL, ConsoleProgress
 from mbt.report import DEFAULT_BENCHMARK_SYMBOL, WATCHLIST_NAME, write_run_artifacts
 from mbt.screen import SCREEN_FIELDS, momentum_screen
@@ -71,6 +73,25 @@ MAX_FAILURE_RATE = 0.30
 #: 可省，默认取「最近一个齐全的交易日」，而那要读数据才知道。于是 ``start`` 无从算起，
 #: 检查只能覆盖全部历史，全市场实测因此多拒了 1,028 只（17.4%，ADR-0014）。
 DEFAULT_QUALITY_BARS = 1300
+
+
+#: ``--panel-bars`` 的默认值：``0`` = **不截断**。
+#:
+#: 默认关是刻意的：截断换掉的是「算读数用的那一段历史」，它是否等值要靠证据说话（ADR-0014
+#: 那一节），故由**每日脚本**显式打开，不把一次证据规格很重的改动塞进所有人的默认路径。
+DEFAULT_PANEL_BARS = 0
+
+#: ``--panel-bars`` 的**下限**：面板窗口必须盖过规则最深的那处回看。
+#:
+#: ``pe_percentile`` 在历史不足窗口时照常给值（``min_periods=1``），只是那个值算在更短的
+#: 窗口上——**不报错，只让名单悄悄变**。实测面板取 1000 行时评估日的读数与全长逐位相同，
+#: 取 999 行则有 81 只标的的读数不同（最大一处 0.815 → 0.029，``sh600114``）。故这里是一道
+#: **闸门**，不是一句警告：请求的根数、与「实际能拿到多少历史」两者取小，小于它即拒绝运行。
+#:
+#: 取 ``DEFAULT_WINDOW`` 而不是另写一个 1000：最深回看就是它，写死两份迟早对不上。
+#: 注意它按**所有规则里最深的那处**取，故对动量那类不看 PE 的规则是偏严的——这是有意的：
+#: 宁可让一个不需要长历史的规则多要一点，也不要为每条规则维护一份「它最深看多远」的表。
+PANEL_WARMUP_BARS = DEFAULT_WINDOW
 
 
 #: ``--top-n all`` 的取值：**不截断**（每个合格标的都留，即规则自己的默认）。
@@ -271,6 +292,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"质检（稀释判定 + 越界检查）只覆盖评估日往前 N 根（默认 {DEFAULT_QUALITY_BARS}，"
         "见 ADR-0014）。它必须盖过任何规则的回看，否则检查比用到的数据还短；给 0 表示不限制"
         "（检查全部历史，即修复前的行为，会让十几年前的越界把标的拒之门外）",
+    )
+    screen.add_argument(
+        "--panel-bars",
+        type=_panel_bars_arg,
+        default=DEFAULT_PANEL_BARS,
+        metavar="N",
+        help="把选股用的面板**日历**截到评估日往前 N 根（默认 0，即不截断）。这是**日历**口径"
+        "：逐标的取末端 N 根省不下多少，因为老标的照样把并集日历撑到十几年前。上限见"
+        " ADR-0014，B1 的每日脚本用 1301",
     )
     screen.add_argument(
         "--screen",
@@ -507,6 +537,28 @@ def _boards(args) -> frozenset:
     return frozenset(names)
 
 
+def _panel_bars_arg(text: str) -> int:
+    """``--panel-bars`` 的参数转换：非负整数。
+
+    负数是**报错**而不是当成 0：``min(bars, 历史行数)`` 那道闸门里两个数含义相反，而
+    ``--panel-bars -1`` 看着像「不截断」，实际是「比任何真实窗口都短」。挡在解析这一步，
+    错的是命令行而不是这次选股，故该以用法错误收场（与 ``--quality-bars`` 的宽容不同：
+    那个的 0 有明确语义「不限制」，负数没有）。
+    """
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"不能为负，收到 {value}（0 表示不截断）")
+    return value
+
+
+def _requested_panel_bars(args) -> int:
+    """``--panel-bars`` 的取值；不给即 ``0``（不截断）。
+
+    ``getattr`` 兜底：有测试手工搭 args 桩，回测那条路也没有这一项。
+    """
+    return getattr(args, "panel_bars", 0) or 0
+
+
 def _describe_universe(rules, args, listing_dates, *, considered: int, loaded: int) -> dict:
     """把**实际用的**股票池口径记进产物元数据（票据 #72）。
 
@@ -540,14 +592,20 @@ def _describe_universe(rules, args, listing_dates, *, considered: int, loaded: i
     }
 
 
-def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
+def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None):
     """按 ``--screen`` **指名**一条库里的规则，并备好它需要的信号。
 
     本函数只做「指名 + 备料」，规则的语义、默认值与测试都在库里（:mod:`mbt.screen`）——AC
     明令 CLI 是库入口的薄映射，不含独立业务逻辑。
 
-    ``full_markets`` 是**截断之前**的行情：估值要用完整历史算（百分位回看 1000 个交易日），
-    算完再截到回测区间。故它不能等于 ``loaded.markets``。
+    ``raw_markets`` 是喂**估值**的那份行情：**原始价**，与喂给面板的那份（后复权价）不是同一份。
+    理由只有一条——PE 是「当时的成交价 ÷ 每股收益」，而后复权价以序列首根为基准放大，会把 PE
+    一起放大（见 :mod:`mbt.data.valuation`）。
+
+    它**不再是**「截断之前的行情」：面板日历截断（``--panel-bars``）之后，选股这边收的就是
+    截断后的那一份，估值跟着一起收窄是**刻意的**（百分位本就在窗口上算）。窗口够不够长由
+    ``PANEL_WARMUP_BARS`` 那道闸门回答（ADR-0014）。回测那边仍传切片之前的行情，因为它的
+    截断工具是 ``clip_fields``（先按整段算完再截到区间）；两条路各自选择，不是同一个口径。
 
     返回 ``(screen, signals)``：``screen`` 交引擎当入场闸门，``signals`` 同时交给策略
     （``broker.signals``），于是**同一个条件不必写两遍**（ADR-0001）。
@@ -592,11 +650,11 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
 
     # 传的是**原始**行情：PE 要用当时的成交价，而后复权价以首根为基准放大（见 valuation_for）。
     if progress is not None:
-        progress.stage("算估值信号", note=f"{len(full_markets)} 个标的 × 全部财报")
-    valuation = valuation_for(full_markets, CwDataSource(args.cw_root))
+        progress.stage("算估值信号", note=f"{len(raw_markets)} 个标的 × 全部财报")
+    valuation = valuation_for(raw_markets, CwDataSource(args.cw_root))
     covered = int(valuation.pe.notna().any().sum())
     print(
-        f"估值：{covered}/{len(full_markets)} 个标的算出了动态PE（其余无可用财报）",
+        f"估值：{covered}/{len(raw_markets)} 个标的算出了动态PE（其余无可用财报）",
         file=stdout,
     )
 
@@ -624,10 +682,10 @@ def _screen_and_signals(args, loaded, full_markets, stdout, progress=None):
         # 故不是两条路漂开，而是这一列与面板其余部分不同源——见票据 #75，那一处该换。
         if progress is not None:
             progress.stage("算跌幅信号", note="回看 252 个交易日")
-        signals.update(drawdown_fields(full_markets))
+        signals.update(drawdown_fields(raw_markets))
         covered_fall = int(signals["drawdown_1y"].notna().any().sum())
         print(
-            f"跌幅：{covered_fall}/{len(full_markets)} 个标的有满一年的回看窗口",
+            f"跌幅：{covered_fall}/{len(raw_markets)} 个标的有满一年的回看窗口",
             file=stdout,
         )
 
@@ -845,19 +903,19 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     from mbt.universe import build_universe
 
     try:
-        # **选股落在后复权价上，与回测同一条序列**（票据 #73）。此前这里把原始价直接喂给
-        # `assemble_panel`，于是同一个 `Screen` 在两条序列上被评估——除权日的假跳空会进到
-        # 均线、摆动点与量能读数里，每日选股的名单与回测依据的规则给出的名单于是不一致。
-        # 复权入口与引擎共用 `backward_adjusted_markets`，两条路不会各漂各的。
+        # **评估日与股票池都在截断之前定**（ADR-0014）。这两步都得看着**完整**日历回答，
+        # 故它们不能挪到面板截断之后：
         #
-        # 估值那边仍吃原始行情（PE 要用当时的成交价，后复权价会把它放大，见
-        # `mbt.data.valuation`）：复权只管「拿来算信号的价格」，不管「拿来估值的价格」。
-        if progress is not None:
-            progress.stage("复权", note=f"{len(loaded.markets)} 个标的")
-        adjusted = backward_adjusted_markets(loaded.markets)
-        panel = assemble_panel(adjusted, SCREEN_FIELDS)
+        #   * 评估日取「最近一个齐全的交易日」，而那个判据是**相对**当天全市场的覆盖数
+        #     （``mbt.data.panel.latest_complete_day``）。数据是分批落盘的，末几根常常只有
+        #     少数标的被写到——先切掉一段日历，这个判据就没有可比的对象了。
+        #   * 股票池的次新股门槛在没有 ``--master`` 时数的是「**截至当日的累计根数**」
+        #     （``mbt.universe``）。窗口一短，累计就从新起点数起，长期停牌的标的会静默掉出
+        #     池子（本机实测今天影响 0 只，但那是数据凑巧，不是结构保证）。
         if as_of is None:
-            as_of = _resolve_as_of(panel, stdout, stderr)
+            # 只用 ``close`` 一栏去问：``latest_complete_day`` 看的本来就是收盘价的覆盖数
+            # （``coverage`` 的默认字段），而全字段面板比它贵一个量级。这一份是临时的。
+            as_of = _resolve_as_of(assemble_panel(loaded.markets, ("close",)), stdout, stderr)
             if as_of is None:
                 return 1
         else:
@@ -877,10 +935,70 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         else:
             print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
         universe_rules = UniverseRules(boards=_boards(args))
-        pool = build_universe(
-            adjusted,
-            rules=universe_rules,
-            listing_dates=listing_dates,
+        # 传**原始**行情，与下面复权后的面板无关：这一步只问「收盘价非缺失的累计根数」，
+        # 而复权是逐日乘同一个正数、不改变缺失的形状，故与传后复权价逐格相同。
+        pool = build_universe(loaded.markets, rules=universe_rules, listing_dates=listing_dates)
+
+        # **面板日历截断**（ADR-0014）。为什么是日历而不是逐标的的根数：把并集日历切到末端
+        # N 行，各标的只取落在其中的行——一只 1992 年上市的老标的会把整段日历撑到 1992 年，
+        # 而它早年那几千行几乎是空的（本地 5377 只里只有 45 只首根早于 2015），逐标的截尾巴
+        # 省不下这些行。
+        panel_bars = _requested_panel_bars(args)
+        windowed = loaded
+        panel_rows = None
+        if panel_bars > 0:
+            window = panel_window(markets=loaded.markets, as_of=as_of, bars=panel_bars)
+            # **闸门看的是「实际会用到多少历史」，不是「请求了多少」。** 这两种情形都要拦：
+            # 请求的根数本身太少（``--panel-bars 999``），以及数据不够长以致切不动、评估日
+            # 身后本来就只有那么几行（短历史 + 大 N）。两者的后果相同——``pe_percentile``
+            # 会在一个比它自己窗口更短的历史上给值，**不报错、只让名单悄悄变**。
+            effective = min(panel_bars, window.available)
+            if effective < PANEL_WARMUP_BARS:
+                print(
+                    f"错误：面板窗口只有 {effective} 行（评估日身后 {window.available} 行，"
+                    f"请求 {panel_bars} 行），短于收盘价百分位要看的 {PANEL_WARMUP_BARS} 个"
+                    "交易日。窗口比它短时那个读数是按更短的历史算出来的，名单会跟着变却不"
+                    f"报错（ADR-0014）。请取 {PANEL_WARMUP_BARS} 以上，或先补深数据；"
+                    "B1 的每日脚本用 1301",
+                    file=stderr,
+                )
+                return 1
+            if window.start is None:
+                print(
+                    f"面板：日历 {window.available} 行，不足请求的 {panel_bars} 根，未截断",
+                    file=stdout,
+                )
+            else:
+                windowed = slice_markets(
+                    loaded.markets, start=window.start, end=as_of, skipped=loaded.skipped
+                )
+                dropped = len(loaded.markets) - len(windowed.markets)
+                print(
+                    f"面板：日历 {window.available} 行 → {window.rows} 行"
+                    f"（{window.start:%Y-%m-%d} 起，评估日往前 {panel_bars} 根）"
+                    + (f"；窗口内没有 K 线的 {dropped} 只标的不参与" if dropped else ""),
+                    file=stdout,
+                )
+            panel_rows = window.rows
+        markets = windowed.markets
+
+        # **选股落在后复权价上，与回测同一条序列**（票据 #73）。此前这里把原始价直接喂给
+        # `assemble_panel`，于是同一个 `Screen` 在两条序列上被评估——除权日的假跳空会进到
+        # 均线、摆动点与量能读数里，每日选股的名单与回测依据的规则给出的名单于是不一致。
+        # 复权入口与引擎共用 `backward_adjusted_markets`，两条路不会各漂各的。
+        #
+        # 估值那边仍吃原始行情（PE 要用当时的成交价，后复权价会把它放大，见
+        # `mbt.data.valuation`）：复权只管「拿来算信号的价格」，不管「拿来估值的价格」。
+        if progress is not None:
+            progress.stage("复权", note=f"{len(markets)} 个标的")
+        adjusted = backward_adjusted_markets(markets)
+        panel = assemble_panel(adjusted, SCREEN_FIELDS)
+        # 股票池是按**完整**日历算的，而面板已经切过：把它对到面板的日期与标的上。
+        # `fill_value=False`——窗口内没有 K 线的标的，本就不该在池子里。
+        pool = pool.reindex(
+            index=panel.fields["close"].index,
+            columns=panel.fields["close"].columns,
+            fill_value=False,
         )
         masks = [pool]
         # AC 要求「非亏损」过滤**同时**接入股票池与选股规则。选股侧走的是 `Screen.apply` 的
@@ -902,7 +1020,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 是**同一个对象**（ADR-0001）。此前这里写死 `momentum_screen`，于是「同一条件只写一遍」
         # 在选股侧并没有兑现——`backtest --screen valuation` 用估值规则，而 `screen` 仍按动量
         # 选，两边给出的候选完全不是一回事。
-        screen, signals = _screen_and_signals(args, loaded, list(loaded.markets), stdout, progress)
+        screen, signals = _screen_and_signals(args, windowed, list(markets), stdout, progress)
         screen_label = getattr(args, "screen", None) or "none"
         # **前瞻只在这里接**（票据 #50 修订）。回测那条路（`run_backtest_command`）没有这一步，
         # 故它在**结构上**够不着一致预期——比在规则里判断「现在是不是盘后」硬得多。
@@ -910,7 +1028,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         caliber = _forward_caliber(
             args,
             signals=signals,
-            markets=list(loaded.markets),
+            markets=list(markets),
             as_of=as_of,
             screen_label=screen_label,
             stdout=stdout,
@@ -948,7 +1066,15 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             loaded=len(loaded.markets),
         )
         run_dir = _write_screen_artifacts(
-            candidates, args, as_of, loaded, screen, screen_label, universe, caliber=caliber
+            candidates,
+            args,
+            as_of,
+            windowed,
+            screen,
+            screen_label,
+            universe,
+            caliber=caliber,
+            panel_rows=panel_rows,
         )
     except Exception as exc:  # noqa: BLE001
         # 落盘失败（如目录已存在）也必须以**退出码**收场，而不是把原始异常抛给调用者。
@@ -1336,7 +1462,16 @@ def _report_candidates(candidates, as_of, run_dir, stdout) -> None:
 
 
 def _write_screen_artifacts(
-    candidates, args, as_of, loaded, screen, screen_label, universe, *, caliber=None
+    candidates,
+    args,
+    as_of,
+    loaded,
+    screen,
+    screen_label,
+    universe,
+    *,
+    caliber=None,
+    panel_rows=None,
 ) -> Path:
     """选股产物：候选清单 + 元数据。**复用 #10 的目录约定**，不新造一套。
 
@@ -1347,6 +1482,15 @@ def _write_screen_artifacts(
     ``caliber`` 是这次用的**估值口径**（目前只有前瞻那一档会填）。它不属于 ``Screen``——
     同一条规则在不同口径的数据上跑，产物必须答得出「这份名单是按哪种口径算的」，
     否则隔天再翻这份留痕就只能靠猜（票据 #50 修订）。
+
+    ``loaded`` 也必须是**答案真正依据的那一份**取数结果，即面板截断之后的那一份：它的
+    ``skipped`` 把两个阶段的跳过都带着（``slice_markets`` 会把上游的并进来），于是
+    「窗口内没有 K 线而不参与」的标的会出现在产物里，不会只活在控制台那一行。`data_snapshot`
+    同理——它记的是「这份答案读过的文件」，不是「加载阶段碰过的文件」。
+
+    ``panel_rows`` 是面板**实际**有几行（切完之后）。它与 ``args.panel_bars``（**请求**切多少）
+    是两件事：数据不够长时请求 1301 而实际只有 1100 行，只记请求值就等于记了个没发生的动作
+    （ADR-0014）。
     """
     import datetime as dt
     import json
@@ -1367,6 +1511,11 @@ def _write_screen_artifacts(
     metadata = {
         "as_of": as_of.isoformat(),
         "candidates": len(candidates),
+        # 面板日历**请求**截多少根、**实际**有几行（ADR-0014）。两个都记：同一份名单按 1301
+        # 根还是按 1000 根历史算出来的，看 CSV 分不出来，而两者可以给出不同的候选（见那条
+        # 闸门）。只记请求值不够——数据不够长时它记的是一个没发生的动作。
+        "panel_bars": _requested_panel_bars(args),
+        "panel_rows": panel_rows,
         "skipped": [{"symbol": item.symbol, "kind": item.kind} for item in loaded.skipped],
         "screen": describe_screen(screen, screen_label),
         "valuation_caliber": caliber,

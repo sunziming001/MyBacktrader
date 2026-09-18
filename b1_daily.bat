@@ -45,6 +45,20 @@ rem It is empty because the research arms behind ADR-0012 ran with a bare
 rem UniverseRules() (no listing_dates) -- matching them keeps this tool's
 rem universe the same as the one those conclusions were drawn from.
 set "EXTRA="
+
+rem How many trading days of history the screen is computed on (see ADR-0014).
+rem Why it matters: one in five hundred symbols here (45 of 5377) has bars going
+rem back to 1992, so the panel the rules read is 8387 rows tall while the rules
+rem only ever look ~1000 days back. Cutting the calendar to the tail drops
+rem sampled peak commit from 13.5 GB to 4.1 GB and the wall time from 324s to
+rem 199s, with the same candidates in the same order (issue #78).
+rem
+rem 1301 = 1000 (the deepest lookback, the PE percentile window) + 30% + 1 --
+rem the same derivation as --quality-bars. Below 1000 the screen REFUSES to
+rem run rather than quietly computing percentiles on a short window.
+rem
+rem Set 0 to turn the cut off (that is the library default).
+set "PANEL_BARS=1301"
 rem ---------------------------------------------------------------------------
 
 set "ROOT=%~dp0"
@@ -140,6 +154,7 @@ echo ===== %DATE% %TIME% ===== > "%LOG%"
     --cw-root "%MBT_TDX_ROOT%\cw" ^
     --watchlist-dir "%OUT_DIR%" ^
     --output-dir "%OUT_DIR%\screens" ^
+    --panel-bars %PANEL_BARS% ^
     %FORWARD% --progress %EXTRA% >> "%LOG%" 2>&1
 
 set "CODE=%ERRORLEVEL%"
