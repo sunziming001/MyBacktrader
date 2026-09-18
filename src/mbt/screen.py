@@ -40,6 +40,21 @@ from mbt.signals import drawdown_from_high
 #: 计算（ADR-0009 的「字段显式声明」）。这是一份**固定声明**的集合，不是从数据里推断的。
 SCREEN_FIELDS = ("open", "high", "low", "close", "volume")
 
+#: **选股分数**（``CONTEXT.md``）在**策略可读信号**里的字段名。
+#:
+#: 它是「名次只有一份」这条纪律的落点：``Screen`` 算出 ``ScreenResult.scores`` 之后，引擎把它
+#: **原样**并进 ``broker.signals``，于是策略读到的就是规则算过的那一份。**不让策略照着重算**
+#: ——复算必然漂移（权重与归一的默认值在规则那里），而漂移了不会报错。
+#:
+#: 形状与 :class:`~mbt.screen.ScreenResult` 的 ``scores`` 一致：**标的宽表**（行 = 交易日，
+#: 列 = 标的），与评估日的面板同日同标的；过滤器筛掉的标的**其数值仍在**（是否合格由
+#: ``selection_mask`` 回答，不靠这张表缺席）。
+#:
+#: 这条通道**对所有规则一律打开**：不读它的策略一个字节都不受影响（有测试钉住「成交逐笔
+#: 相同」），故它是纯增量。规则**没有排序因子**时不注入——那时「这条规则不谈名次」，而
+#: ``SCREEN_SCORE_FIELD in signals`` 正是策略分辨这一点的依据，塞一个空帧进去会让它说谎。
+SCREEN_SCORE_FIELD = "screen_score"
+
 #: 「低估成长」策略用的跌幅信号字段名。
 #:
 #: 由 :func:`drawdown_fields` 产出，与 :func:`undervalued_growth_screen` 同在本模块——两者的

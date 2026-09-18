@@ -24,7 +24,7 @@ import pandas as pd
 from mbt.data.market import MarketData, backward_adjusted_markets
 from mbt.data.panel import assemble_panel
 from mbt.rules import SHIPPED_RULES_PATH, RuleTable
-from mbt.screen import SCREEN_FIELDS
+from mbt.screen import SCREEN_FIELDS, SCREEN_SCORE_FIELD
 from mbt.universe import build_universe
 
 from .costs import AStockBroker, AStockCommissionInfo
@@ -369,6 +369,14 @@ def run_portfolio_backtest(
       ``None``）。它与股票池**分开**给，因为两者的处置不同：出池要清仓，只是没被选中
       则未必——合成一道闸门虽然等价，却把这份信息抹掉了。
 
+    **选股分数也在 ``self.broker.signals`` 里**：给了 ``screen`` 且那条规则有**排序因子**时，
+    引擎把规则算出的 ``scores`` **原样**并进信号（字段名见 ``mbt.screen.SCREEN_SCORE_FIELD``，
+    口径见 ``CONTEXT.md`` 的**选股分数**），故策略能按名次决定先买谁。**不要照着重算**——
+    复算会漂移，而漂移了不会报错。
+
+    那个字段的有无取决于**这条规则谈不谈名次**，与是哪一天无关：规则没有排序因子、或压根
+    没给规则时它**不存在**（读成缺失），故策略应当先问这一条，再谈按名次买。
+
     三者中前两张加上选股结果都会由**撮合层**强制（买入侧），策略读它们是为了自己做决定，
     不是替代约束。**池与选股这两张按「下单那一根」判**，不按成交那一根——订单在 T 收盘下定、
     T+1 开盘成交，按下单那根判才是「策略在 T 做的决定」，按成交那根判会额外要求「T+1 仍成立」。
@@ -433,14 +441,25 @@ def run_portfolio_backtest(
     )
 
     selection_mask = None
+    selection_scores = None
     if screen is not None:
         # 不在这里再包一层 stage：`Screen.apply` 自己会按**逐个过滤器**上报，那比「正在算
         # 选股掩码」精确得多——而它内部恰恰是最慢的一段（每个过滤器各扫一遍全部标的）。
-        selection_mask = screen.apply(
+        screened = screen.apply(
             _with_signals(assemble_panel(adjusted, SCREEN_FIELDS), signals),
             universe_mask=universe_mask,
             progress=progress,
-        ).selected
+        )
+        selection_mask = screened.selected
+        selection_scores = screened.scores
+
+    # **名次只有一份**（口径见 ``mbt.screen.SCREEN_SCORE_FIELD``）：把规则算出的选股分数原样
+    # 并进策略可读的信号。这一步动的是**交给撮合与策略**的那一份，而喂给规则自己的面板在上一行
+    # 就已经建好了——故规则自己的计算不可能被它影响。复制一份再塞，不改调用方的那个映射。
+    broker_signals = signals
+    if selection_scores is not None and not selection_scores.empty:
+        broker_signals = dict(signals or {})
+        broker_signals[SCREEN_SCORE_FIELD] = selection_scores
 
     return _drive_engine(
         adjusted,
@@ -448,7 +467,7 @@ def run_portfolio_backtest(
         table=table,
         universe_mask=universe_mask,
         selection_mask=selection_mask,
-        signals=signals,
+        signals=broker_signals,
         cash=cash,
         max_positions=max_positions,
         sizer=sizer,
