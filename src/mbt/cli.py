@@ -194,10 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument(
         "--screen",
-        choices=("none", "momentum", "undervalued_growth", "valuation", "b1"),
+        choices=("none", "momentum", "undervalued_growth", "valuation", "b1", "brick"),
         default="none",
         help="入场闸门：指名库里的一条选股规则（undervalued_growth 与 b1 需 --cw-root；"
-        "valuation 是前者的旧版，留给对照）",
+        "valuation 是前者的旧版，留给对照；brick 只读行情，且自带板块范围）",
     )
     backtest.add_argument(
         "--screen-top-n",
@@ -304,10 +304,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     screen.add_argument(
         "--screen",
-        choices=("momentum", "undervalued_growth", "valuation", "b1"),
+        choices=("momentum", "undervalued_growth", "valuation", "b1", "brick"),
         default="momentum",
-        help="用哪条选股规则（undervalued_growth 与 b1 需 --cw-root；valuation 是前者的旧版）"
-        "。默认 momentum",
+        help="用哪条选股规则（undervalued_growth 与 b1 需 --cw-root；valuation 是前者的旧版；"
+        "brick 只读行情，且自带板块范围）。默认 momentum",
     )
     screen.add_argument(
         "--screen-top-n",
@@ -455,7 +455,7 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     try:
         screen, signals = _screen_and_signals(args, loaded, full_markets, stdout, progress)
-        universe_rules = UniverseRules(boards=_boards(args), extra_mask=extra_mask)
+        universe_rules = UniverseRules(boards=_boards(args, rule=screen), extra_mask=extra_mask)
         result = run_portfolio_backtest(
             list(loaded.markets),
             strategy,
@@ -520,16 +520,21 @@ def _progress(args, stdout):
     return ConsoleProgress(stdout, every=interval)
 
 
-def _boards(args) -> frozenset:
-    """``--boards`` 解析成板块集合；未给即出厂设定（四个全收）。
+def _boards(args, rule=None) -> frozenset:
+    """板块集合：``--boards`` 最优先，其次是**规则自己声明的**，最后才是出厂设定。
 
     板块名用 `CONTEXT.md` 的**四个概念名**，其中「主板」已经合并了沪、深两个交易所口径
     （规则表按交易所分列是为了过户费，那是另一回事）。故要「主板+创业板+科创板」就写
     ``--boards 主板,创业板,科创板``。
+
+    **为什么读规则**：板块范围与「这条规则在哪些市场上成立」是同一件事，写在规则上才不会
+    出现「同一条规则在两台机器上跑出不同的池子」——而那不会报错，只是名单悄悄不一样
+    （砖型就是一条自带板块范围的规则，见 ``mbt.screen.BRICK_BOARDS``）。``--boards`` 仍然
+    最优先：它是调用方在那个当下的显式选择，覆盖规则的声明是它的本意。
     """
     raw = getattr(args, "boards", None)
     if not raw:
-        return ALL_BOARDS
+        return getattr(rule, "boards", None) or ALL_BOARDS
     names = [piece.strip() for piece in raw.split(",") if piece.strip()]
     unknown = [name for name in names if name not in ALL_BOARDS]
     if unknown:
@@ -592,11 +597,70 @@ def _describe_universe(rules, args, listing_dates, *, considered: int, loaded: i
     }
 
 
-def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None):
+#: ``_screen_and_signals`` 的 ``screen`` 参数的「没给」哨兵。**用独立常量而不是 ``None``**：
+#: ``None`` 是 ``--screen none`` 的**合法取值**，两者在这种参数位置上不可区分。
+_UNSET = object()
+
+
+def _screen_top_n(args) -> int | None:
+    """候选集大小：``--screen-top-n`` / ``--max-positions`` / ``--top-n`` 里**第一个明确给了的**。
+
+    默认取最大持仓数：取前 N 却只持有 M < N 只，多出来的候选没有意义。而 ``--top-n all``
+    要先于回退单独判——它是「不截断」，不能被 ``or`` 链当成「没给」而落到 5（见
+    :data:`ALL_CANDIDATES`）。
+    """
+    requested = [getattr(args, name, None) for name in ("screen_top_n", "max_positions", "top_n")]
+    if ALL_CANDIDATES in requested:
+        return None
+    return next((value for value in requested if value is not None), 5)
+
+
+def _named_screen(args, *, progress=None):
+    """按**名字**造出那条选股规则——**不碰任何行情数据**。
+
+    与 :func:`_screen_and_signals` 分开，是为了让「规则是什么」可以先于「池子怎么建」拿到：
+    规则可以**自己声明板块范围**（``Screen.boards``），而建池要用它。造规则是纯构造（返回
+    一堆闭包，不读数据），故提前调用它不改变任何计算顺序。
+
+    ``--screen none`` 与未知名字分别返回 ``None`` 与报错，与旧行为一致。
+    """
+    name = getattr(args, "screen", None) or "none"
+    top_n = _screen_top_n(args)
+
+    if name == "none":
+        return None
+    if name == "momentum":
+        return momentum_screen(window=20, top_n=top_n)
+    if name == "brick":
+        # 砖型只读行情（开高低收 + 成交量），故它比下面那几条少一个 `--cw-root` 前置条件。
+        from mbt.screen import brick_screen
+
+        return brick_screen(top_n=top_n, progress=progress)
+    if name not in ("undervalued_growth", "valuation", "b1"):
+        raise ValueError(f"未知的 --screen {name!r}")
+
+    # `valuation` 是旧名（无跌幅条件、按百分位排序），留给对照实验。
+    legacy = name == "valuation"
+    from mbt.screen import b1_screen, undervalued_growth_screen, valuation_screen
+
+    if name == "b1":
+        # 把 progress 递进规则：它内部那两处**按面板缓存的一次性计算**（`swings`、
+        # `volume_pattern`）要单独记时，否则它们的代价会被算进第一个碰到它们的那个阶段里
+        # （见 `mbt.progress.timed`）。
+        return b1_screen(top_n=top_n, progress=progress)
+    factory = valuation_screen if legacy else undervalued_growth_screen
+    return factory(top_n=top_n)
+
+
+def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None, screen=_UNSET):
     """按 ``--screen`` **指名**一条库里的规则，并备好它需要的信号。
 
     本函数只做「指名 + 备料」，规则的语义、默认值与测试都在库里（:mod:`mbt.screen`）——AC
     明令 CLI 是库入口的薄映射，不含独立业务逻辑。
+
+    ``screen`` 是**已经造好的**规则对象；不给则在这里按名字造一条。留这个口子是为了让调用方
+    能先拿到规则再建股票池——规则可以自己声明板块范围（``Screen.boards``），而建池要用它。
+    造规则是纯构造，故提前与重复都不改变任何计算。
 
     ``raw_markets`` 是喂**估值**的那份行情：**原始价**，与喂给面板的那份（后复权价）不是同一份。
     理由只有一条——PE 是「当时的成交价 ÷ 每股收益」，而后复权价以序列首根为基准放大，会把 PE
@@ -614,18 +678,10 @@ def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None):
     if name == "none":
         return None, None
 
-    # 候选集大小默认取最大持仓数：取前 N 却只持有 M < N 只，多出来的候选没有意义。
-    #
-    # 三个来源按优先级取**第一个明确给了的**，而 ``--top-n all`` 要先于回退单独判——
-    # 它是「不截断」，不能被 ``or`` 链当成「没给」而落到 5（理由见 :data:`ALL_CANDIDATES`）。
-    requested = [getattr(args, name_, None) for name_ in ("screen_top_n", "max_positions", "top_n")]
-    if ALL_CANDIDATES in requested:
-        top_n = None
-    else:
-        top_n = next((value for value in requested if value is not None), 5)
-
-    if name == "momentum":
-        return momentum_screen(window=20, top_n=top_n), None
+    if screen is _UNSET:
+        screen = _named_screen(args, progress=progress)
+    if name in ("momentum", "brick"):
+        return screen, None
 
     if name not in ("undervalued_growth", "valuation", "b1"):
         raise ValueError(f"未知的 --screen {name!r}")
@@ -646,7 +702,7 @@ def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None):
     from mbt.data.fundamental import CwDataSource
     from mbt.data.panel import clip_fields
     from mbt.data.valuation import valuation_for
-    from mbt.screen import b1_screen, drawdown_fields, undervalued_growth_screen, valuation_screen
+    from mbt.screen import drawdown_fields
 
     # 传的是**原始**行情：PE 要用当时的成交价，而后复权价以首根为基准放大（见 valuation_for）。
     if progress is not None:
@@ -663,10 +719,7 @@ def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None):
     # **B1 到这里就够了。** 它另外两条量能过滤要的 `swings` 与 `volume_pattern` 是规则
     # 内部自算并记忆在面板对象上的（见 `mbt.screen.b1_screen`），不是外部喂进来的信号。
     if name == "b1":
-        # 把 progress 递进规则：它内部那两处**按面板缓存的一次性计算**（`swings`、
-        # `volume_pattern`）要单独记时，否则它们的代价会被算进第一个碰到它们的那个阶段里
-        # （见 `mbt.progress.timed`）。
-        return b1_screen(top_n=top_n, progress=progress), clip_fields(
+        return screen, clip_fields(
             signals,
             loaded.markets,
             # 选股命令没有 --start/--end（评估日由 --as-of 承担），故用 getattr 兜底。
@@ -696,8 +749,7 @@ def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None):
         start=getattr(args, "start", None),
         end=getattr(args, "end", None),
     )
-    factory = valuation_screen if legacy else undervalued_growth_screen
-    return factory(top_n=top_n), signals
+    return screen, signals
 
 
 def _forward_caliber(args, *, signals, markets, as_of, screen_label, stdout) -> dict | None:
@@ -934,7 +986,11 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             )
         else:
             print("未提供 --master，次新股门槛用「本地行情根数」的近似口径", file=stdout)
-        universe_rules = UniverseRules(boards=_boards(args))
+        # 板块范围可以由**规则自己声明**（`Screen.boards`），而建池要用它，故这里先把规则
+        # 造出来并一路传下去（造规则是纯构造，不读数据）。用的是**同一个对象**，故「选股与
+        # 回测读同一个规则」这条不因这一处提前而变成两份。
+        screen = _named_screen(args, progress=progress)
+        universe_rules = UniverseRules(boards=_boards(args, rule=screen))
         # 传**原始**行情，与下面复权后的面板无关：这一步只问「收盘价非缺失的累计根数」，
         # 而复权是逐日乘同一个正数、不改变缺失的形状，故与传后复权价逐格相同。
         pool = build_universe(loaded.markets, rules=universe_rules, listing_dates=listing_dates)
@@ -1020,7 +1076,9 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
         # 是**同一个对象**（ADR-0001）。此前这里写死 `momentum_screen`，于是「同一条件只写一遍」
         # 在选股侧并没有兑现——`backtest --screen valuation` 用估值规则，而 `screen` 仍按动量
         # 选，两边给出的候选完全不是一回事。
-        screen, signals = _screen_and_signals(args, windowed, list(markets), stdout, progress)
+        screen, signals = _screen_and_signals(
+            args, windowed, list(markets), stdout, progress, screen=screen
+        )
         screen_label = getattr(args, "screen", None) or "none"
         # **前瞻只在这里接**（票据 #50 修订）。回测那条路（`run_backtest_command`）没有这一步，
         # 故它在**结构上**够不着一致预期——比在规则里判断「现在是不是盘后」硬得多。

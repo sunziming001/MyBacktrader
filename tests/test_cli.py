@@ -942,6 +942,119 @@ def test_the_screen_artifact_records_which_rule_it_ran(tmp_path):
     assert meta["screen"]["top_n"] == 2
 
 
+def test_the_brick_screen_runs_without_a_cw_root(tmp_path):
+    """砖型只读行情，故 ``--screen brick`` **不需要** ``--cw-root``。
+
+    这与 b1 / undervalued_growth 不同（那两条要财务数据算 PE），也是这条规则更省事的地方：
+    少一个必须配对的路径开关。少给一个它根本不用不着的东西，不该报错。
+    """
+    import json
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    args = screen_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+    assert meta["screen"]["label"] == "brick"
+
+
+def test_the_brick_rule_restricts_the_universe_to_its_own_boards(tmp_path):
+    """砖型的板块范围由**规则自己声明**，``--boards`` 没给时就用它：主板、创业板、科创板。
+
+    这一条钉住的是「声明落在规则上、且真的被池子用上」——否则需求里那句「排除北交所」只会
+    是一句注释。北交所那只**故意也放进数据源**：它若被收进池子，本断言就会在 ``boards``
+    上露馅（``considered`` 也会从 1 变 2）。
+    """
+    import json
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    # 再摆一只北交所的标的：它的板块可判定（`bj920001`），只是不该被砖型收进来。
+    make_dataroot(tmp_path, symbol="bj920001", periods=80, start_price=2000)
+
+    args = screen_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    universe = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["universe"]
+
+    assert universe["boards"] == ["主板", "创业板", "科创板"]
+    assert "北交所" not in universe["boards"]
+
+
+def test_the_backtest_command_can_name_the_brick_rule(tmp_path):
+    """回测那条路也能指名砖型，且同样不需要 ``--cw-root``。
+
+    两条路（选股与回测）必须认同一批规则名——``--screen`` 的取值表在两处各有一份，
+    漂开之后会出现「选股能跑、回测说没有这条规则」这种只在一条路上才发现的怪事。
+    """
+    import json
+
+    from mbt.cli import run_backtest_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    args = make_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+    )
+    out, err = capture()
+
+    code = run_backtest_command(args, stdout=out, stderr=err)
+
+    assert code == 0, err.getvalue()
+    run_dir = next((tmp_path / "runs").iterdir())
+    meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert meta["screen"]["label"] == "brick"
+    # 板块范围跟着规则走，回测这条路上也一样（它建的是同一个 `UniverseRules`）。
+    assert meta["universe"]["boards"] == ["主板", "创业板", "科创板"]
+
+
+def test_an_explicit_boards_switch_overrides_the_rules_own_scope(tmp_path):
+    """``--boards`` 是**调用方在那个当下的显式选择**，优先级高于规则的声明。
+
+    两条路都留着才说得通：规则声明的是默认（不然每台机器都要手填），``--boards`` 是覆盖
+    （不然想临时加回北交所就无路可走）。
+    """
+    import json
+
+    from mbt.cli import run_screen_command
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    args = screen_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        boards="主板,创业板,科创板,北交所",
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "screens").iterdir())
+    universe = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["universe"]
+
+    assert universe["boards"] == ["主板", "创业板", "北交所", "科创板"]
+
+
 def make_ex_dividend_dataroot(tmp_path, periods=140):
     """两只标的：只有 ``sh600000`` 在窗口内除权（2024-07-18 每 10 股派 3.21 元）。
 
