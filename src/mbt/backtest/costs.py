@@ -144,6 +144,11 @@ class _LivePositions(collections.defaultdict):
             yield self[data]
 
 
+#: 「买单只给一次成交机会」的拒单理由。写成常量而不是在 :meth:`AStockBroker._try_exec` 里
+#: 抄两遍：两处（本日不可成交、撮合试过仍活着）是同一件事，理由也该是同一句。
+_ONE_SHOT_REASON = "买单只给一次成交机会：第一个成交时点没成交，拒单"
+
+
 class AStockBroker(bt.brokers.BackBroker):
     """撮合侧的 A 股硬约束，以及把成交日与标的注入费用对象。
 
@@ -160,6 +165,9 @@ class AStockBroker(bt.brokers.BackBroker):
       是执行现实（同一根上两笔买单只有先到的那笔能占名额）。
     - **长期无 K 线**：标的停牌超过 ``order_expiry_ticks`` 个交易日即 ``reject()``。
       「保留至下一可交易日」在单标的下是「下一天」，停牌数月时就变成「另一笔交易」。
+    - **买单只给一次成交机会**（``one_shot_buys``，默认关着）：开着时，买单在它**下单后的
+      第一个成交时点**没成交即 ``reject()``。关着时它照旧逐根重试到成交或上面那条失效。
+      判据落在**成交那一根**（「此刻买进了没有」是执行现实），**卖单不受此限**。
 
     ## 「股票池 / 选股」按**下单那根**判，不按成交那根
 
@@ -207,6 +215,24 @@ class AStockBroker(bt.brokers.BackBroker):
         ("signals", None),
         #: 标的连续多少个交易日无 K 线后，挂单失效。默认 5。
         ("order_expiry_ticks", 5),
+        #: 买单是否**只有一次成交机会**。默认 ``False``（关着），此时既有行为逐位不变。
+        #:
+        #: 关着时：买单买不进就一直挂着、逐根重试，直到某天真的成交（或标的长期无 K 线而
+        #: 失效）。这对**条件跨天仍成立**的入场规则是合理的。
+        #:
+        #: 开着时：买单在它**下单后的第一个成交时点**没成交即**拒单**（``Rejected``）。它是为
+        #: **条件逐日重算**的规则准备的——T 日算出的信号拖到 T+3 才成交，那时它早已不是当日
+        #: 那个信号了，而「它仍然成交了」不会报错、只会让回测与真实时序对不上。
+        #:
+        #: **卖单不受此限**：跌停时卖不出去要继续等，拒掉它等于把一笔已经决定要卖的丢掉。
+        #: 这也与 A 股的不对称一致——涨停一字买不进但卖得出，跌停一字卖不出但买得到——
+        #: 故这条开关**只**动买单那一侧。
+        ("one_shot_buys", False),
+        #:
+        #: **卖单不受此限**：跌停时卖不出去要继续等，撤掉等于把一笔已经决定要卖的丢掉。而
+        #: 「买不进」与「卖不出」在 A 股是不对称的（涨停一字买不进但卖得出，跌停一字卖不出
+        #: 但买得到），故这条开关**只**动买单这一侧。
+        ("one_shot_buys", False),
         #: 最大持仓**标的数**。``None`` 表示不限。
         ("max_positions", None),
     )
@@ -327,10 +353,23 @@ class AStockBroker(bt.brokers.BackBroker):
             # 因为那不会增加持仓的标的数。
             return self._reject(order, "已达最大持仓只数")
 
-        if not self._tradeable_today(order):
+        # **本日是否具备成交条件**只问一次：这个判定有副作用（计数挂单失效、清掉计数），
+        # 问两次会把停牌天数数成两倍。
+        tradeable = self._tradeable_today(order)
+        one_shot = self.p.one_shot_buys and order.isbuy() and order.alive()
+
+        if not tradeable:
+            if one_shot:
+                # 第一个成交时点就不具备成交条件（涨停一字挡住、当日无 K 线）：机会用掉了。
+                return self._reject(order, _ONE_SHOT_REASON)
             return  # 保留挂单：仍 alive 的订单会被引擎放回队列，下一根再试
 
-        return super()._try_exec(order)
+        outcome = super()._try_exec(order)
+        if one_shot and order.alive():
+            # 本日可成交、撮合也试过了，而订单**仍然活着**——即这一次没成交（价格没到、
+            # 钱不够、或别的撮合原因）。机会用掉了：当场拒单，不留到下一根。
+            return self._reject(order, _ONE_SHOT_REASON)
+        return outcome
 
     def _at_position_limit(self, order) -> bool:
         """本笔买入是否会让持仓的**标的数**超过上限。"""
