@@ -266,11 +266,16 @@ def sample_loop(interval: float, started: float, stop: threading.Event, stream):
             pass
 
 
-def screen_argv(top_n: str, out_dir: Path, panel_bars: int, stream) -> list[str]:
+def screen_argv(
+    top_n: str, out_dir: Path, panel_bars: int, stream, screen: str = "b1"
+) -> list[str]:
     """与 ``b1_daily.bat`` 同一条命令——路径同样**只从环境变量取、指错就报错退出**。
 
     ``--panel-bars`` 是**真开关**（ADR-0014），不是猴子补丁：夹具要走的就是生产那条路，
     否则「夹具绿了」证明不了「生产绿了」。
+
+    ``screen`` 默认 ``b1``（与那支脚本一致），给 ``brick`` 就量砖型那一条——两条规则的深度
+    差一个数量级（100 对 1000），故同一个上限下它们能用的面板窗口完全不同。
 
     ``stream`` 是那份 ``Tee``：提示必须**同时进控制台与日志**——日志才是留下判据现场的那份，
     一次跑的日志里若看不出「这次到底用没用前瞻」，那个数字就没法解释。
@@ -285,7 +290,7 @@ def screen_argv(top_n: str, out_dir: Path, panel_bars: int, stream) -> list[str]
     argv = [
         "screen",
         "--screen",
-        "b1",
+        screen,
         "--top-n",
         top_n,
         "--tdx-root",
@@ -357,6 +362,12 @@ def main(argv=None) -> int:
         help="面板日历截到评估日往前 N 根（ADR-0014）；默认 1301 与 b1_daily.bat 一致，"
         "给 0 就是切之前的对照",
     )
+    parser.add_argument(
+        "--screen",
+        default="b1",
+        help="跑哪条规则（默认 b1，与 b1_daily.bat 一致）。砖型给 brick——它自己声明只看 "
+        "100 根，故同一个提交上限下面板窗口能降到 200。",
+    )
     args = parser.parse_args(argv)
 
     limit = int(args.cap_gb * 1024**3)
@@ -402,7 +413,7 @@ def main(argv=None) -> int:
 
         try:
             parsed = build_parser().parse_args(
-                screen_argv(args.top_n, out_dir, args.panel_bars, tee)
+                screen_argv(args.top_n, out_dir, args.panel_bars, tee, args.screen)
             )
             code = run_screen_command(parsed, stdout=tee, stderr=tee)
         except BaseException as exc:  # noqa: BLE001 — 夹具的职责是把现场留下来
