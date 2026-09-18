@@ -310,6 +310,7 @@ def run_portfolio_backtest(
     commission_mode=None,
     slippage=0.0,
     order_expiry_ticks=5,
+    one_shot_buys=False,
     progress=None,
     **strategy_params,
 ):
@@ -343,6 +344,13 @@ def run_portfolio_backtest(
             ``bt.sizers.FixedSize``。        sizer_options: 传给 ``sizer`` 的关键字参数。
         commission: 手续费率。``commission_mode`` 的约定同 :func:`run_backtest`。
         order_expiry_ticks: 标的连续多少个交易日无 K 线后挂单失效。
+        one_shot_buys: 买单是否**只有一次成交机会**。默认 ``False``，此时买单买不进就一直
+            挂着、逐根重试，直到成交或标的长期无 K 线而失效。``True`` 时，买单在它下单后的
+            **第一个成交时点**没成交即拒单（留可读的理由）。
+
+            它是为**入场条件逐日重算**的规则准备的：T 日算出的信号到 T+3 才成交，那时它早已
+            不是当日那个信号了，而「它仍然成交了」不会报错、只让回测与真实时序对不上。
+            卖单**不受此限**（见 :class:`~mbt.backtest.costs.AStockBroker` 的约束清单）。
         progress: 进度上报的接收端（:class:`~mbt.progress.ProgressReporter`）。``None``
             （默认）时**没有任何输出、也没有额外开销**。
 
@@ -477,6 +485,7 @@ def run_portfolio_backtest(
         commission_mode=commission_mode,
         slippage=slippage,
         order_expiry_ticks=order_expiry_ticks,
+        one_shot_buys=one_shot_buys,
         strategy_params=strategy_params,
         progress=progress,
     )
@@ -703,6 +712,7 @@ def _drive_engine(
     commission_mode,
     slippage,
     order_expiry_ticks,
+    one_shot_buys,
     strategy_params,
     progress=None,
 ):
@@ -773,6 +783,7 @@ def _drive_engine(
         signals=signals,
         max_positions=max_positions,
         order_expiry_ticks=order_expiry_ticks,
+        one_shot_buys=one_shot_buys,
     )
     broker.setcash(cash)
     for market in markets:
@@ -930,5 +941,7 @@ def run_backtest(
         commission_mode=commission_mode,
         slippage=slippage,
         order_expiry_ticks=5,
+        # 单标的入口**不开**这条开关：它的签名与行为要维持既有调用方与黄金值不变。
+        one_shot_buys=False,
         strategy_params=strategy_params,
     )
