@@ -1566,6 +1566,74 @@ def test_panel_bars_below_the_deepest_lookback_refuses_to_run(tmp_path):
     assert not (tmp_path / "screens").exists(), "拒绝运行就不该留下产物目录"
 
 
+def test_a_rule_that_declares_its_own_depth_is_gated_on_that_depth(tmp_path):
+    """规则**自己声明**的深度说了算：砖型声明 100，故 200 根放行、99 根拒绝（票据 #86）。
+
+    这条是「闸门按规则的声明比」的直接证据。它必须成对看下一条：不声明的规则仍按 1000 要求，
+    否则这里放行的可能是「闸门被整个取消了」而不是「换成按声明比」。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=1200)
+
+    accepted = screen_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "ok"),
+        as_of=None,
+        panel_bars=200,
+    )
+    out, err = capture()
+    assert run_screen_command(accepted, stdout=out, stderr=err) == 0, err.getvalue()
+
+    rejected = screen_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "no"),
+        as_of=None,
+        panel_bars=99,
+    )
+    out, err = capture()
+    assert run_screen_command(rejected, stdout=out, stderr=err) == 1
+    assert "100" in err.getvalue(), "报错要写明这条规则要看的那个数"
+    assert "这条规则自己声明的" in err.getvalue(), "报错要说清那个数是谁定的"
+    assert not (tmp_path / "no").exists(), "拒绝运行就不该留下产物目录"
+
+
+def test_a_rule_that_declares_nothing_still_needs_the_deepest_lookback(tmp_path):
+    """不声明的规则**行为不变**：仍按所有规则里最深的那处（1000）要求。
+
+    这条与上一条合起来才说明白「改的是闸门的判据，不是把闸门拆了」——只有上一条时，看着像
+    「随便多浅都放行」。
+    """
+    root, gbbq = make_dataroot(tmp_path, periods=1200)
+    args = screen_args(
+        screen="momentum",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        as_of=None,
+        panel_bars=PANEL_WARMUP_BARS - 1,
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 1
+    assert "规则没声明" in err.getvalue(), "报错要说清这个数是回退来的"
+
+
+def test_the_declared_depth_is_the_one_the_reasoning_produced():
+    """砖型声明的深度是 100，且它比回退值浅一个数量级——那正是本票要省下来的空间。
+
+    数值本身有 ``BRICK_LOOKBACK_BARS`` 里那份实测表作依据（50 根上末位读数已与全长逐位
+    相同，取 100 是留一倍余量）；这条只钉住「声明了、且声明的是那个值」，免得它被顺手改成
+    一个没人解释过的数。
+    """
+    from mbt.screen import BRICK_LOOKBACK_BARS, brick_screen
+
+    assert brick_screen().lookback_bars == BRICK_LOOKBACK_BARS == 100
+    assert brick_screen().lookback_bars < PANEL_WARMUP_BARS
+
+
 def test_the_gate_also_fires_when_the_data_is_too_short_to_cut(tmp_path):
     """**闸门看的是「实际会用到多少历史」，不是「请求了多少」。**
 

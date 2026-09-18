@@ -81,7 +81,7 @@ DEFAULT_QUALITY_BARS = 1300
 #: 那一节），故由**每日脚本**显式打开，不把一次证据规格很重的改动塞进所有人的默认路径。
 DEFAULT_PANEL_BARS = 0
 
-#: ``--panel-bars`` 的**下限**：面板窗口必须盖过规则最深的那处回看。
+#: ``--panel-bars`` 的**回退下限**：规则**没声明**自己要看多深时的那个数。
 #:
 #: ``pe_percentile`` 在历史不足窗口时照常给值（``min_periods=1``），只是那个值算在更短的
 #: 窗口上——**不报错，只让名单悄悄变**。实测面板取 1000 行时评估日的读数与全长逐位相同，
@@ -89,9 +89,30 @@ DEFAULT_PANEL_BARS = 0
 #: **闸门**，不是一句警告：请求的根数、与「实际能拿到多少历史」两者取小，小于它即拒绝运行。
 #:
 #: 取 ``DEFAULT_WINDOW`` 而不是另写一个 1000：最深回看就是它，写死两份迟早对不上。
-#: 注意它按**所有规则里最深的那处**取，故对动量那类不看 PE 的规则是偏严的——这是有意的：
-#: 宁可让一个不需要长历史的规则多要一点，也不要为每条规则维护一份「它最深看多远」的表。
+#:
+#: **它现在只是回退值，不再是所有人共同的下限**（票据 #86 改的口径）：哪条规则知道自己看得浅
+#: （如砖型，递推记忆约百根）就在 `Screen.lookback_bars` 里声明，闸门按**它的**深度比。
+#: 当初刻意做成全局常量是「不要为每条规则维护一张深度表」的取舍，而那张表的维护成本最终
+#: 由**规则自己带这个数**消掉了——数就写在规则旁边，不会与它漂开。见 ADR-0014 的补记。
 PANEL_WARMUP_BARS = DEFAULT_WINDOW
+
+
+def _required_history(screen) -> int:
+    """这道闸门要比的深度：规则自己声明的优先，没声明就按 :data:`PANEL_WARMUP_BARS`。
+
+    ``getattr`` 而不是直接取 ``screen.lookback_bars``：``screen`` 也可能是 ``None``
+    （``--screen none``），而那时确实没有规则可问。
+    """
+    declared = getattr(screen, "lookback_bars", None)
+    return declared if declared else PANEL_WARMUP_BARS
+
+
+def _history_source(screen) -> str:
+    """那个深度**是谁定的**——报错里要写清，否则读者不知道 100 这个数从哪来。"""
+    declared = getattr(screen, "lookback_bars", None)
+    if declared:
+        return "这条规则自己声明的"
+    return "规则没声明，故按所有规则里最深的那处取"
 
 
 #: ``--top-n all`` 的取值：**不截断**（每个合格标的都留，即规则自己的默认）。
@@ -1009,13 +1030,13 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             # 身后本来就只有那么几行（短历史 + 大 N）。两者的后果相同——``pe_percentile``
             # 会在一个比它自己窗口更短的历史上给值，**不报错、只让名单悄悄变**。
             effective = min(panel_bars, window.available)
-            if effective < PANEL_WARMUP_BARS:
+            required = _required_history(screen)
+            if effective < required:
                 print(
                     f"错误：面板窗口只有 {effective} 行（评估日身后 {window.available} 行，"
-                    f"请求 {panel_bars} 行），短于收盘价百分位要看的 {PANEL_WARMUP_BARS} 个"
-                    "交易日。窗口比它短时那个读数是按更短的历史算出来的，名单会跟着变却不"
-                    f"报错（ADR-0014）。请取 {PANEL_WARMUP_BARS} 以上，或先补深数据；"
-                    "B1 的每日脚本用 1301",
+                    f"请求 {panel_bars} 行），短于这条规则要看的 {required} 个交易日"
+                    f"（{_history_source(screen)}）。窗口比它短时那个读数是按更短的历史算出来的，"
+                    f"名单会跟着变却不报错（ADR-0014）。请取 {required} 以上，或先补深数据。",
                     file=stderr,
                 )
                 return 1
