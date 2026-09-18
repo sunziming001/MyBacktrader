@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from mbt.data import MarketDataError, Panel, assemble_panel
-from mbt.data.panel import coverage, latest_complete_day
+from mbt.data.panel import coverage, latest_complete_day, panel_window
 
 
 def test_assemble_panel_uses_symbols_as_columns_and_keeps_their_order(make_prices, make_market):
@@ -220,3 +220,77 @@ def test_asking_for_a_field_the_panel_lacks_names_what_is_declared():
 
     with pytest.raises(KeyError, match="面板没有字段 'volume'"):
         latest_complete_day(got, field="volume")
+
+
+# --- 末端窗口（``--panel-bars``，ADR-0014）--------------------------------------
+
+
+def test_a_computed_window_starts_on_a_panel_row(make_prices, make_market):
+    """窗口起点必须是**面板真有的那一行**。
+
+    这是本函数与 :func:`assemble_panel` 之间的全部契约：切的是面板的日历，故窗口算出来的
+    那一天必须能在面板的行索引里找到。它挡的是「两处各自算并集、结果悄悄不一致」——那种错
+    不会报错，只会让「切到哪里」与「算的是哪一段」变成两件不相干的事。
+
+    夹具刻意让两只标的的交易日**错开**（一只从中间开始），否则两处都会退化成「就是那一串
+    相同的日期」，测了等于没测。
+    """
+    long_one = make_market("sh600000", make_prices([10.0] * 40))
+    short_one = make_market("sz000001", make_prices([20.0] * 20))
+    markets = [long_one, short_one]
+    as_of = assemble_panel(markets, ["close"])["close"].index[-1]
+
+    window = panel_window(markets, as_of=as_of, bars=25)
+
+    panel_index = assemble_panel(markets, ["close"])["close"].index
+    assert window.start in panel_index, "窗口起点不在面板的行里——两处算的并集不是同一个"
+    assert window.start == panel_index[-25]
+    assert (window.available, window.rows) == (40, 25)
+
+
+def test_the_window_counts_the_evaluation_day_itself(make_prices, make_market):
+    """``bars`` 是**窗口的总行数、含评估日自己**，故起点是倒数第 ``bars`` 行。
+
+    off-by-one 就落在这里：起点写成倒数第 ``bars + 1`` 行会让窗口多一行，而多出来的那一行
+    恰好在 ``pe_percentile`` 的窗口边界**之外**——读数就跟着变（ADR-0014 那道闸门正是为此）。
+    """
+    market = make_market("sh600000", make_prices([10.0] * 1000))
+    as_of = assemble_panel([market], ["close"])["close"].index[-1]
+
+    assert panel_window([market], as_of=as_of, bars=1000).start is None, "刚好够就不该切"
+
+    window = panel_window([market], as_of=as_of, bars=999)
+
+    assert (window.available, window.rows) == (1000, 999)
+
+
+def test_the_window_drops_the_rows_after_the_evaluation_day(make_prices, make_market):
+    """评估日之后的行没有消费者（``Screen`` 内部本来也会切掉），留着只是白占内存。"""
+    market = make_market("sh600000", make_prices([10.0] * 300))
+    index = assemble_panel([market], ["close"])["close"].index
+
+    window = panel_window([market], as_of=index[199], bars=150)
+
+    assert window.available == 200, "评估日之后的行不该算进「身后有多少历史」"
+    assert (window.start, window.rows) == (index[50], 150)
+
+
+def test_a_history_shorter_than_the_request_is_left_alone(make_prices, make_market):
+    """请求的根数比可得历史还多 → 不切，并如实说「身后只有这么多」。
+
+    库这一层只回答事实（``start=None``、``available``），拦不拦由调用方定——「多深才算够」
+    是选股规则的属性，不是数据层的属性（见 ``cli.PANEL_WARMUP_BARS``）。
+    """
+    market = make_market("sh600000", make_prices([10.0] * 60))
+    as_of = assemble_panel([market], ["close"])["close"].index[-1]
+
+    window = panel_window([market], as_of=as_of, bars=1301)
+
+    assert window.start is None
+    assert (window.available, window.rows) == (60, 60)
+
+
+def test_a_window_of_zero_or_less_is_rejected():
+    """``0`` 是「不切」，由调用方自己判断——故它不是这一个函数的合法入参。"""
+    with pytest.raises(ValueError, match="窗口至少为 1 根"):
+        panel_window([], as_of=None, bars=0)

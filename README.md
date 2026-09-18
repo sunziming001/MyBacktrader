@@ -632,3 +632,19 @@ $env:MBT_TDX_GPONE = "D:\Tools\new_tdx\T0002\hq_cache"   # 一致预期，只有
 后复权因此凭空插入约 +22% 的假跳空，见
 [#20](https://github.com/sunziming001/MyBacktrader/issues/20)）。修好后它会由红转绿并提示
 改成正向断言。
+
+### 内存判据夹具（`tools/`）
+
+`tools/` 放**不进测试套件**的诊断工具——它们依赖本机数据或 Windows 专有接口，换机器就未必
+跑得动，故手动跑。第一个是 `tools/oom_loop.py`（票据
+[#78](https://github.com/sunziming001/MyBacktrader/issues/78)）：给进程钉一个提交上限，跑与
+`b1_daily.bat` 同一条命令，把「偶发跑挂」变成每次都在同一个地方死。
+
+```powershell
+.venv\Scripts\python.exe tools\oom_loop.py --selftest --cap-gb 4      # 先验上限真的生效
+.venv\Scripts\python.exe tools\oom_loop.py --cap-gb 12 --sampled      # 判据：应绿，峰值约 4.7 GB
+.venv\Scripts\python.exe tools\oom_loop.py --cap-gb 12 --panel-bars 0 # 对照：应红（撞上限）
+```
+
+`--selftest` **不是可选的**：上限没设上时它会一路吃满内存而不报错，而「没红」会被读成
+「修好了」（细节见 ADR-0014 末节）。

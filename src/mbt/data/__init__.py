@@ -58,7 +58,7 @@ from .loader import (
 )
 from .market import MarketData, backward_adjusted_markets, load_market_data
 from .master import SecurityInfo, SecurityMasterDataSource, load_listing_dates
-from .panel import Panel, assemble_panel
+from .panel import Panel, PanelWindow, assemble_panel, panel_window
 from .tdx import TdxDataSource
 from .updates import (
     GapReport,
@@ -100,6 +100,7 @@ __all__ = [
     "TdxDataSource",
     "UniverseLoad",
     "UpdateReport",
+    "PanelWindow",
     "adjustment_factors",
     "assemble_panel",
     "backward_adjusted",
@@ -121,6 +122,7 @@ __all__ = [
     "load_market_data",
     "load_universe_data",
     "non_loss_mask",
+    "panel_window",
     "pe_forward",
     "pe_growth_ratio",
     "reading",
@@ -131,5 +133,6 @@ __all__ = [
     "slice_markets",
     "snapshot_admissible",
     "stock_symbols",
+    "union_calendar",
     "uses_forward",
 ]
