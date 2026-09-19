@@ -141,23 +141,34 @@ def universe_mask(panel, markets, *, listing_dates=None) -> pd.DataFrame:
 def picks_per_day(result, *, top_n: int) -> dict[pd.Timestamp, tuple[str, ...]]:
     """逐日的「取前 N」，**按分数从优到劣**。
 
-    刻意不复用 ``ScreenResult.candidates``：那一个是给单日用的，而这里要扫过整段日历。
-    排序口径与它一致（分数降序、同分按代码升序），故两者不会给出不同的清单。
+    排序口径与 ``ScreenResult.candidates`` 一致（分数降序、同分按代码升序），故两者不会给出
+    不同的清单。
+
+    实现上**按行取索引**（``flatnonzero``）而不是逐列判断：逐列那版每天要扫过全部标的
+    （``days × symbols`` ≈ 8,800 × 5,200 ≈ 4,600 万次），而每天真正入选的只有个位数——
+    实测那版在全市场上要跑小时级，改为取索引之后是秒级。判据没变。
     """
     selected = result.selected
     scores = result.scores
+    flags = selected.to_numpy(dtype=bool)
+    columns = selected.columns.to_numpy()
+    values = None if scores.empty else scores.to_numpy(dtype=float)
+    scores_columns = None if scores.empty else scores.columns.to_numpy()
+
     out: dict[pd.Timestamp, tuple[str, ...]] = {}
-    for day in selected.index:
-        picked = [name for name in selected.columns if bool(selected.at[day, name])]
-        if not picked:
+    for row, day in enumerate(selected.index):
+        picked = columns[np.flatnonzero(flags[row])]
+        if picked.size == 0:
             out[day] = ()
             continue
-        row = scores.loc[day] if not scores.empty else None
-        if row is None:
-            picked.sort()
-        else:
-            picked.sort(key=lambda name: (-row[name] if row[name] == row[name] else np.inf, name))
-        out[day] = tuple(picked[:top_n])
+        if values is None:
+            out[day] = tuple(sorted(picked))
+            continue
+        # 分数表与选股表**同形**（`Screen.apply` 保证），但列序可能不同——按名字对齐一次。
+        row_scores = pd.Series(values[row], index=scores_columns).reindex(picked)
+        # 缺失的名次记最差（排到最后），而不是排除：是否合格已由选股掩码回答。
+        order = np.argsort(-row_scores.fillna(-np.inf).to_numpy(), kind="stable")
+        out[day] = tuple(picked[order][:top_n])
     return out
 
 
@@ -241,27 +252,36 @@ def gate_report(*, relaxed, gated, returns: dict[int, pd.DataFrame]) -> pd.DataF
     与 :func:`paired_report` 的区别是配对的两个集合不是「两套规则的前 N」，而是「同一条规则
     加不加这道门」——被挡掉的那些**本来就是候选**（砖型三条判据都成立），故这是对这道门本身
     的检验：它挡掉的是好票还是坏票。
+
+    与 :func:`picks_per_day` 一样**按行取索引**而不是逐列判断（那版在全市场上要跑小时级）。
     """
+    flags = relaxed.selected.to_numpy(dtype=bool)
+    gated_flags = gated.selected.to_numpy(dtype=bool)
+    columns = relaxed.selected.columns.to_numpy()
+
     rows = []
-    for day in relaxed.selected.index:
-        kept = [name for name in relaxed.selected.columns if bool(gated.selected.at[day, name])]
-        dropped = [
-            name
-            for name in relaxed.selected.columns
-            if bool(relaxed.selected.at[day, name]) and not bool(gated.selected.at[day, name])
-        ]
-        if not dropped:
+    for row, day in enumerate(relaxed.selected.index):
+        candidates = columns[np.flatnonzero(flags[row])]
+        if candidates.size == 0:
             continue
-        row: dict[str, object] = {"date": day, "kept": len(kept), "dropped": len(dropped)}
+        kept_mask = gated_flags[row][np.flatnonzero(flags[row])]
+        kept = candidates[kept_mask]
+        dropped = candidates[~kept_mask]
+        if dropped.size == 0:
+            continue
+        entry: dict[str, object] = {
+            "date": day,
+            "kept": int(kept.size),
+            "dropped": int(dropped.size),
+        }
         for k, frame in returns.items():
             if day not in frame.index:
                 continue
             values = frame.loc[day]
             for label, names in (("kept", kept), ("dropped", dropped)):
-                picked = [values[name] for name in names if name in values.index]
-                picked = [v for v in picked if v == v]
-                row[f"{label}_{k}"] = float(np.mean(picked)) if picked else np.nan
-        rows.append(row)
+                picked = values.reindex(names).dropna().to_numpy()
+                entry[f"{label}_{k}"] = float(picked.mean()) if picked.size else np.nan
+        rows.append(entry)
     return pd.DataFrame(rows)
 
 
