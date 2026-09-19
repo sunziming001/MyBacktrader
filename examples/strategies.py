@@ -3,6 +3,7 @@
 ```
 mbt backtest --strategy examples.strategies:BuyAndHold ...          # 从仓库根跑
 mbt backtest --strategy examples.strategies:CloseCrossesAboveMA ... # 均线上穿
+mbt backtest --strategy mbt.strategy:Brick ...                      # 砖型（住在库里）
 mbt backtest --strategy mypkg.strategies:MyStrategy ...             # 你自己的包
 ```
 
@@ -10,7 +11,9 @@ mbt backtest --strategy mypkg.strategies:MyStrategy ...             # 你自己�
 
 - 类继承 ``backtrader.Strategy``（ADR-0001：策略用 Python 表达，不造声明式中间层）；
 - 参数用 ``--param name=value`` 传入，会作为关键字参数转给策略类；
-- **先把下面 :class:`EngineClock` 抄走**——多标的回测里取「今天」比看上去难（见它的说明）；
+- **先把库里的** :class:`mbt.strategy.EngineClock` **带上**——多标的回测里取「今天」比看上去
+  难（见它的说明）。它原先抄在这里，每个使用者都得重新推导一次，而第一个版本就写错了；
+  现已在库里，这里改为从库里导入（票据 #87）；
 - 读价格前**必须**查 ``self.broker.tradability_mask``：停牌日是**陈旧价**，而**尚未上市**的标的
   给的是它**最后一根**的价格（即未来价）——两者都不报错，只让结论失真（ADR-0006）。
 
@@ -27,60 +30,19 @@ mbt backtest --strategy mypkg.strategies:MyStrategy ...             # 你自己�
 ``universe_mask``     当天是否在**股票池**内                    单标的入口下为 ``None``
 ``selection_mask``    当天是否被**选股规则**选中                没给选股规则时为 ``None``
 ===================  ========================================  ====================
+
+``self.broker.signals`` 里还有**选股分数**（``mbt.screen.SCREEN_SCORE_FIELD``），给了选股规则
+且那条规则有排序因子时才有——按名次买先翻它，**不要照着重算**。
 """
 
 from __future__ import annotations
 
 import backtrader as bt
 import numpy as np
-import pandas as pd
 
-
-class EngineClock:
-    """取**引擎主时钟**：各标的当前日期里的**最大者**。这就是「今天」。
-
-    **不要用 ``self.data0.datetime.date(0)``。** 若第一个标的的历史比回测区间短（次新股、
-    北交所早期、或 ``--limit`` 随手选中的任意一只），它的日期会**一直停在末根**，于是掩码
-    查到的是**另一天**——不报错，只是结果错。引擎内部记账时踩过同一个坑（见
-    ``mbt.backtest.engine._EngineClock``，本类与它同源）。
-
-    **但这个值不必自己扫**：backtrader 每 tick 已经把它写进了**策略自己的** ``datetime`` 线
-    ——runonce 走 ``Strategy._oncepost(dt)``（``dt`` 是 cerebro 取的「各标的下一根日期的最小
-    者」，而它已把所有 ``advance_peek() <= dt`` 的标的推进过，推完之后那个最小者恰好就是各
-    标的当前日期的最大者），runnext 走 ``Strategy._clk_update``（直接写
-    ``max(d.datetime[0] for d in self.datas if len(d))``）。两条路径都在调用 ``next()`` 之前
-    把值写好，故读 ``self.datetime.date(0)`` 与扫一遍 ``self.datas`` 是同一个结果。
-
-    差别只在代价上：扫一遍是每 tick × 每标的，全市场是 4752 × 2701 = 1280 万次
-    ``len()`` + ``date()``。**注意是 ``self.datetime``（策略自己的时钟线），不是
-    ``self.data0.datetime``**——后者正是上面那个坑。
-
-    .. note::
-
-        这个类其实是**库该提供的东西**——每个多标的策略都需要它，抄在示例里意味着每人都得
-        重新推导一次（而第一个版本就写错了）。把它提升进 ``mbt`` 是对的方向，但那是一次
-        库 API 变更，故此处先按示例给出。
-    """
-
-    def today(self) -> pd.Timestamp:
-        return pd.Timestamp(self.datetime.date(0))
-
-
-def signal_value(signals, field, today, name) -> float:
-    """从 ``broker.signals`` 取一个标量信号；缺失、越界、或没给信号时一律返回 ``NaN``。
-
-    **一律返回 NaN 是刻意的**：``NaN`` 的比较全部为假，故「不知道」天然表现为「不动作」。
-    若这里改成抛异常或返回 0，调用方就得自己分辨「没数据」与「数据是 0」，而漏掉一处就会
-    在无数据的日子凭空下单或凭空卖出。
-    """
-    if signals is None:
-        return float("nan")
-    frame = signals.get(field) if hasattr(signals, "get") else None
-    if frame is None or name not in frame.columns:
-        return float("nan")
-    if today not in frame.index:
-        return float("nan")
-    return float(frame.at[today, name])
+# 这两个都是**库**的东西，从库里导入而不是在本文件重抄一份（票据 #87）。
+# `EngineClock` 原先就抄在这里，注释里已经写着「它其实是库该提供的东西」。
+from mbt.strategy import EngineClock, signal_value  # noqa: F401  对外再导出
 
 
 class UndervaluedGrowth(bt.Strategy, EngineClock):

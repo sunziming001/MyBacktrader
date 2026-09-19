@@ -82,6 +82,13 @@ SCREEN_FIELDS = ("open", "high", "low", "close", "volume")
 #: ``SCREEN_SCORE_FIELD in signals`` 正是策略分辨这一点的依据，塞一个空帧进去会让它说谎。
 SCREEN_SCORE_FIELD = "screen_score"
 
+#: **绿砖**信号（0.0 / 1.0）在信号里的字段名——由 :func:`brick_signals` 产出，
+#: 由 ``mbt.strategy.Brick`` 读来决定何时清仓。
+#:
+#: 常量定义在**产出方**（这里）而不是消费方：名字只有一个来源，改一处不会让另一处静默读不到
+#: （读不到一律是缺失，而缺失在策略里表现为「不动作」——一笔该卖的持仓就那样留着）。
+GREEN_BRICK_FIELD = "green_brick"
+
 #: 「低估成长」策略用的跌幅信号字段名。
 #:
 #: 由 :func:`drawdown_fields` 产出，与 :func:`undervalued_growth_screen` 同在本模块——两者的
@@ -229,6 +236,15 @@ class Screen:
     #:
     #: 声明的是**读数稳定所需的最小深度**，不是「推荐值」。调用方要留余量自己留。
     lookback_bars: int | None = None
+    #: 这条规则的**买单是否只给一次成交机会**（交付给回测的 ``one_shot_buys``）。
+    #:
+    #: 默认 ``False``：买单买不进就一直挂着、逐根重试。那对**入场条件跨天仍成立**的规则是
+    #: 合理的（今天入选、明天还入选，晚一天买到也还是那个理由）。
+    #:
+    #: 但对**条件逐日重算**的规则，留着它会让一笔单在几天后成交，而那笔成交用的早已不是当日
+    #: 那个信号——且**不会报错**。砖型就是这一类（票据 #86 之后它自己声明深度，理由同源：
+    #: 「这条规则的时间性质」是规则的属性）。判据与理由见 ``mbt.backtest.costs.AStockBroker``。
+    one_shot_buys: bool = False
 
     @property
     def given_factors(self) -> tuple[FrameTransform, ...]:
@@ -1073,7 +1089,54 @@ def brick_screen(*, top_n=None, progress=None) -> Screen:
         top_n=top_n,
         boards=BRICK_BOARDS,
         lookback_bars=BRICK_LOOKBACK_BARS,
+        # 买入条件逐日重算，故买单只有次根那一次机会——见 `Screen.one_shot_buys`。
+        one_shot_buys=True,
     )
+
+
+def brick_signals(markets, *, align_to=None) -> dict[str, pd.DataFrame]:
+    """算出卖点要读的信号（**标的宽表**），供 ``run_portfolio_backtest(signals=...)``。
+
+    砖型只有一条卖出规则——「当天是**绿砖**」——故这里只给一个字段。它是**状态**而不是
+    事件：答的是「今天这根是不是比昨天低」，不是「今天是不是刚从红转绿」。两者在持有期里
+    分岔得很多（绿砖可以连出好几根），而需求说的是前者。
+
+    在**完整历史**上算，再截到回测区间——这正是「先算后截」的口径（:func:`mbt.data.panel.clip_fields`
+    的说明）。砖型图的递推记忆约百根，若先截再算，区间开头那一段的读数会算在更短的历史上，
+    于是同一段行情在两个区间里结论不同。
+
+    参数:
+        markets: 一组已质检行情。**必须是完整历史**（``load_market_data`` 的返回值），
+            不是切过窗口的那些——否则「先算后截」就反了。
+        align_to: 一组行情；给了就把结果的**标的集合与交易日范围**对齐到它。
+            **回测时必须给**，且必须传**切过窗口的**那一组行情：引擎要求信号与行情面板
+            逐日同列对齐，而完整历史的信号比切过的行情长、也可能多出被跳过的标的，
+            不对齐就会以「index / columns 不一致」报错。
+
+            刻意接受一个「行情组」而不是 ``(start, end)`` 两个值：那两个值若与实际切片
+            不一致，结果仍是错的，而**行情的边界就在行情里**——从它推出来不会漂移。
+
+    返回:
+        ``{GREEN_BRICK_FIELD: 标的宽表}``，取值 0.0 / 1.0（**浮点**）：消费方是策略侧的
+        :func:`~mbt.strategy.signal_value`，它读标量，而浮点省掉一处类型分支
+        （与 :func:`b1_signals` 同一处置）。
+
+        与 :func:`brick_screen` 一样走 :func:`~mbt.signals.indicators.brick_line`，故
+        「绿砖怎么算」只有一处定义——选股与卖出读的是同一条线（ADR-0001）。
+    """
+    from mbt.data.panel import assemble_panel, clip_fields
+    from mbt.signals import brick_line, green_brick
+
+    panel = assemble_panel(markets, ("high", "low", "close"))
+    fields = {GREEN_BRICK_FIELD: green_brick(brick_line(panel).line).astype(float)}
+
+    if align_to is None:
+        return fields
+
+    bounds = [market.prices.index for market in align_to]
+    lower = min(index.min() for index in bounds)
+    upper = max(index.max() for index in bounds)
+    return clip_fields(fields, align_to, start=lower, end=upper)
 
 
 def _combine(

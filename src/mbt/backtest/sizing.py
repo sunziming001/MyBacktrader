@@ -45,18 +45,19 @@ from __future__ import annotations
 import backtrader as bt
 
 
-class EqualWeightSizer(bt.Sizer):
-    """等权 sizer：把可用资金摊给剩余的持仓名额（见模块说明）。
+class AStockSizer(bt.Sizer):
+    """本项目两个 sizer 的公共底座：**挂单占用**、**最坏成交价**、**买得起的股数**。
 
-    每个持仓名额的目标**仓位**相同（``1/M``），故依次买入时自然把可用资金摊开。
+    抽出来是因为它们与「每个名额分多少钱」无关——那是唯一的差别（见 :class:`EqualWeightSizer`
+    与 :class:`FixedAmountSizer`，两个子类各自只裁决 :meth:`_slots` 与 :meth:`_budget`）。
+    而这三段每一段都是踩出来的（下面各自有实测记录），分成两份必然漂开，且漂开时**两边都不会
+    报错**。
 
-    参数:
-        max_positions: 最大持仓**标的数**。``None`` 表示不限——此时每个名额的目标仓位无从
-            谈起，故本次买入用尽可用资金。那会让后续买入因资金不足被拒，而那些拒单会记进
-            ``BacktestResult.rejected``，不会悄无声息地发生。
+    它同时是一个**标记**：引擎据此知道这个 sizer 接受 ``rules`` 参数，于是把规则表递进来。
+    别的 sizer（如 ``bt.sizers.FixedSize``）不认这个参数，递进去会当场报错。
     """
 
-    params = (("max_positions", None), ("rules", None), ("headroom", None), ("equal_weight", True))
+    params = (("rules", None), ("headroom", None))
 
     def _getsizing(self, comminfo, cash, data, isbuy):
         if not isbuy:
@@ -81,12 +82,9 @@ class EqualWeightSizer(bt.Sizer):
             pending += 1
             committed += self._pending_spend(order)
 
-        if self.p.max_positions is None:
-            slots = 1
-        else:
-            slots = self.p.max_positions - held - pending
-            if slots <= 0:
-                return 0
+        slots = self._slots(held, pending)
+        if slots <= 0:
+            return 0
 
         price = data.close[0]
         if price <= 0:
@@ -100,24 +98,13 @@ class EqualWeightSizer(bt.Sizer):
         worst = price * (1.0 + self._headroom(data))
         return self._affordable(comminfo, budget, worst)
 
+    def _slots(self, held: int, pending: int) -> int:
+        """本单还有几个名额可占——子类各按自己的口径回答。"""
+        raise NotImplementedError
+
     def _budget(self, cash: float, committed: float, slots: int, already: int) -> float:
-        """本单该投多少钱——**等权**，见模块文档的「口径」一节。
-
-        默认口径（``equal_weight=True``）按**组合总值 ÷ 名额总数**算：每个持仓名额分到等额
-        一份，本单可花的不超过「本名额的那一份」，且不超过「可用现金 − 已挂单占用」。
-
-        另一种口径（``equal_weight=False``）是 `可用资金 ÷ 剩余名额`——它**只在同一 tick
-        一次买满时**才等于等权，分次建仓时会把全部现金压给最后一个名额（实测单只占到组合的
-        **36.8%**，而等权应为 20%）。保留它是为了让「改口径」这件事可被对照。
-        """
-        free = max(cash - committed, 0.0)
-        if not self.p.equal_weight:
-            return free / slots
-
-        total_value = float(self.broker.getvalue())
-        unit = total_value / self.p.max_positions if self.p.max_positions else total_value
-        # 「已占用的名额」= 已成交持仓 + 挂单中的买单（口径与 `slots` 同一处）。
-        return max(min(unit, free), 0.0)
+        """本单该投多少钱——子类各按自己的口径回答。"""
+        raise NotImplementedError
 
     def _pending_spend(self, order) -> float:
         """一笔挂单中的买单预计占用多少现金（按它自己的**最坏成交价**估）。
@@ -194,3 +181,86 @@ class EqualWeightSizer(bt.Sizer):
             else:
                 high = mid - 1
         return low
+
+
+class EqualWeightSizer(AStockSizer):
+    """等权 sizer：把可用资金摊给剩余的持仓名额（见模块说明）。
+
+    每个持仓名额的目标**仓位**相同（``1/M``），故依次买入时自然把可用资金摊开。
+
+    参数:
+        max_positions: 最大持仓**标的数**。``None`` 表示不限——此时每个名额的目标仓位无从
+            谈起，故本次买入用尽可用资金。那会让后续买入因资金不足被拒，而那些拒单会记进
+            ``BacktestResult.rejected``，不会悄无声息地发生。
+    """
+
+    params = (("max_positions", None), ("equal_weight", True))
+
+    def _slots(self, held: int, pending: int) -> int:
+        if self.p.max_positions is None:
+            return 1
+        return self.p.max_positions - held - pending
+
+    def _budget(self, cash: float, committed: float, slots: int, already: int) -> float:
+        """本单该投多少钱——**等权**，见模块文档的「口径」一节。
+
+        默认口径（``equal_weight=True``）按**组合总值 ÷ 名额总数**算：每个持仓名额分到等额
+        一份，本单可花的不超过「本名额的那一份」，且不超过「可用现金 − 已挂单占用」。
+
+        另一种口径（``equal_weight=False``）是 `可用资金 ÷ 剩余名额`——它**只在同一 tick
+        一次买满时**才等于等权，分次建仓时会把全部现金压给最后一个名额（实测单只占到组合的
+        **36.8%**，而等权应为 20%）。保留它是为了让「改口径」这件事可被对照。
+        """
+        free = max(cash - committed, 0.0)
+        if not self.p.equal_weight:
+            return free / slots
+
+        total_value = float(self.broker.getvalue())
+        unit = total_value / self.p.max_positions if self.p.max_positions else total_value
+        # 「已占用的名额」= 已成交持仓 + 挂单中的买单（口径与 `slots` 同一处）。
+        return max(min(unit, free), 0.0)
+
+
+class FixedAmountSizer(AStockSizer):
+    """**每笔固定金额**的 sizer：每个持仓名额投入 ``amount`` 元，而不是「组合总值的一份」。
+
+    与 :class:`EqualWeightSizer` 只差 ``_budget`` 与 ``_slots`` 两处裁决（见
+    :class:`AStockSizer`），外加一个「必须给正金额」的构造守卫：那三段踩出来的账（挂单占用、
+    最坏成交价、含费定量）完全共用。
+
+    什么时候要它：策略的仓位大小**不随净值漂移**时。等权口径按「组合总值 ÷ 名额」算，跑赢之后
+    一笔就是 20 万往上；而需求写的是「每笔 20 万」，那是**固定金额**。
+
+    **资金不够时少买，不跳过**：``min(amount, 可用现金 − 挂单占用)``。空着的名额比买不足更浪费。
+
+    参数:
+        amount: 每个名额的目标**金额**（元）。**必须为正**——负值是「卖空」或「不买」，
+            两种意图都与本类无关，故报错而不是猜。
+        max_positions: 最大持仓**标的数**。``None`` 表示不限名额，此时只受 ``amount`` 与
+            可用现金约束。
+    """
+
+    params = (("amount", None), ("max_positions", None))
+
+    def __init__(self):
+        super().__init__()
+        if self.p.amount is None or self.p.amount <= 0:
+            raise ValueError(
+                f"FixedAmountSizer 需要一个正的 amount（每笔的目标金额），收到 {self.p.amount!r}。"
+                "不设默认值是刻意的：「每笔多少钱」是策略的属性，藏进默认值里就没人看得见它。"
+            )
+
+    def _slots(self, held: int, pending: int) -> int:
+        if self.p.max_positions is None:
+            return 1
+        return self.p.max_positions - held - pending
+
+    def _budget(self, cash: float, committed: float, slots: int, already: int) -> float:
+        """本单该投多少钱：``min(amount, 可用现金)``——**与已有几笔无关**。
+
+        这是本类与等权口径的**唯一**实质差别：等权要按「已占用名额」摊，而固定金额每一笔都
+        是同一个数，故 ``slots`` 与 ``already`` 在这里不参与（名额的上限仍由 :meth:`_slots`
+        管，那一步在 ``_getsizing`` 里已经判过）。
+        """
+        free = max(cash - committed, 0.0)
+        return max(min(float(self.p.amount), free), 0.0)

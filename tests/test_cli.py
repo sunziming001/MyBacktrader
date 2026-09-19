@@ -1028,6 +1028,93 @@ def test_the_backtest_command_can_name_the_brick_rule(tmp_path):
     assert meta["universe"]["boards"] == ["主板", "创业板", "科创板"]
 
 
+def brick_wave_series(bars=110, leg=10):
+    """一段**走出一段段涨跌**的收盘价（单位：分）——砖型因此真的选出过标的。
+
+    恒定价格选不出任何东西（砖型图是平的，既无红砖也无绿砖），故这条路上必须用会涨跌的行情。
+    每段的**单日**涨跌都不超过 3%，远在 10% 的限幅之内——否则会被行情异常检测当成坏数据
+    （实测踩过：把两遍波形直接拼起来，接缝处 +42% 的跳空让整只标的被跳过）。
+    """
+    slopes = (0.03, -0.03, 0.02, -0.02)
+    closes = [10.0]
+    for i in range(bars - 1):
+        closes.append(closes[-1] * (1.0 + slopes[(i // leg) % len(slopes)]))
+    return [int(round(value * 100)) for value in closes]
+
+
+def test_the_backtest_command_runs_brick_and_both_buys_and_sells(tmp_path):
+    """**端到端走一遍生产那条路**：``mbt backtest --screen brick`` 既买也卖。
+
+    这条是本票最要紧的一条：卖出判据读的是 ``brick_signals`` 那个字段，而它必须由 CLI 接上。
+    没接的时候策略**只买不卖**——读不到字段一律是缺失，而缺失表现为「不动作」，一声不响。
+    """
+    from mbt.cli import run_backtest_command
+
+    closes = brick_wave_series()
+    root, gbbq = make_dataroot(tmp_path, periods=len(closes), closes=closes)
+    args = make_args(
+        strategy="mbt.strategy:Brick",
+        start="2024-01-01",
+        screen="brick",
+        cash=2_000_000.0,
+        max_positions=5,
+        fixed_amount=200_000.0,
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "runs"),
+    )
+    out, err = capture()
+
+    assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+    run_dir = next((tmp_path / "runs").iterdir())
+    trades = pd.read_csv(run_dir / "trades.csv")
+
+    buys = trades[trades["size"] > 0]
+    sells = trades[trades["size"] < 0]
+    assert len(buys) >= 1, "一笔都没买到——那这条测试没验到卖出"
+    assert len(sells) >= 1, "只买不卖：卖出判据的那个信号没接上"
+
+
+def test_the_fixed_amount_switch_decides_how_much_each_position_gets(tmp_path):
+    """``--fixed-amount`` 真的换掉了持仓分配：每笔 20 万，**不随净值或名额漂移**。
+
+    对照刻意取 ``--cash 200 万`` 配 5 个名额——等权口径下每笔会拿到 40 万，故两种口径在这份
+    数据上给出的股数**差一倍**，一测就分得出。
+    """
+    import math
+
+    from mbt.cli import run_backtest_command
+
+    closes = brick_wave_series()
+    root, gbbq = make_dataroot(tmp_path, periods=len(closes), closes=closes)
+
+    def first_buy(fixed_amount):
+        args = make_args(
+            strategy="mbt.strategy:Brick",
+            start="2024-01-01",
+            screen="brick",
+            cash=2_000_000.0,
+            max_positions=5,
+            fixed_amount=fixed_amount,
+            tdx_root=str(root),
+            gbbq=str(gbbq),
+            output_dir=str(tmp_path / f"runs-{fixed_amount}"),
+        )
+        out, err = capture()
+        assert run_backtest_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+        run_dir = next((tmp_path / f"runs-{fixed_amount}").iterdir())
+        trades = pd.read_csv(run_dir / "trades.csv")
+        return trades[trades["size"] > 0].iloc[0]
+
+    fixed = first_buy(200_000.0)
+    bigger = first_buy(400_000.0)
+
+    # 每笔金额翻倍 ⇒ 股数翻倍（向上取整到整数股，故允许一格误差）
+    assert math.isclose(
+        bigger["size"], fixed["size"] * 2, rel_tol=1e-9
+    ), "改 --fixed-amount 没改到每笔股数"
+
+
 def test_an_explicit_boards_switch_overrides_the_rules_own_scope(tmp_path):
     """``--boards`` 是**调用方在那个当下的显式选择**，优先级高于规则的声明。
 

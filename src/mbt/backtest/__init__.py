@@ -10,11 +10,13 @@ from .engine import (
     run_backtest,
     run_portfolio_backtest,
 )
-from .sizing import EqualWeightSizer
+from .sizing import AStockSizer, EqualWeightSizer, FixedAmountSizer
 
 __all__ = [
+    "AStockSizer",
     "BacktestResult",
     "EqualWeightSizer",
+    "FixedAmountSizer",
     "build_tradability",
     "run_backtest",
     "run_portfolio_backtest",
