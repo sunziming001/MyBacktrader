@@ -287,9 +287,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--watchlist-dir",
         default=None,
         metavar="DIR",
-        help=f"把候选另写一份**通达信自选股文件**到 DIR 里（固定名 {WATCHLIST_NAME}，"
+        help=f"把候选另写一份**通达信自选股文件**到 DIR 里（默认名 {WATCHLIST_NAME}，"
         "每行一个 6 位裸代码，从优到劣，直接覆盖）。收**目录**而不是文件名，是因为那个名字"
-        "是固定的——通达信按文件名认自选股。指向 `T0002\\blocknew` 即可被客户端直接读到",
+        "由**跑的规则**定（`mbt.report.watchlist_name_for`）——通达信按文件名认自选股，"
+        "两条规则共用一个名字会互相盖掉。指向 `T0002\\blocknew` 即可被客户端直接读到",
     )
     screen.add_argument(
         "--master",
@@ -1207,7 +1208,7 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
 
     if args.watchlist_dir:
         try:
-            _write_watchlist(candidates, args.watchlist_dir, stdout, stderr)
+            _write_watchlist(candidates, args.watchlist_dir, stdout, stderr, screen_label)
         except Exception as exc:  # noqa: BLE001
             # 同上：落盘失败以退出码收场。**不回滚** run 目录——那份产物本身是完好的。
             print(f"错误：写自选股文件失败——{type(exc).__name__}: {exc}", file=stderr)
@@ -1215,8 +1216,12 @@ def run_screen_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     return 0
 
 
-def _write_watchlist(candidates, directory, stdout, stderr) -> None:
+def _write_watchlist(candidates, directory, stdout, stderr, screen_label) -> None:
     """落一份通达信自选股文件到 ``directory`` 里，并在**空清单**时把后果嚷出来。
+
+    文件名按**规则**取（见 :func:`mbt.report.watchlist_name_for`）：这份文件是「固定名、
+    每天覆盖」的，而通达信按名字认板块，故两条规则共用一个名字时后跑的那条会**静默**盖掉
+    先跑的那条。
 
     空清单照样覆盖（理由见 :func:`mbt.report.write_watchlist`），而代价是通达信那边的自选股
     会被清空——这是唯一一处「每天跑一次」会**破坏既有状态**的地方，故它必须在日志里显眼。
@@ -1224,9 +1229,9 @@ def _write_watchlist(candidates, directory, stdout, stderr) -> None:
     """
     from pathlib import Path
 
-    from mbt.report import WATCHLIST_NAME, write_watchlist
+    from mbt.report import watchlist_name_for, write_watchlist
 
-    target = write_watchlist(candidates, Path(directory) / WATCHLIST_NAME)
+    target = write_watchlist(candidates, Path(directory) / watchlist_name_for(screen_label))
     print(f"\n自选股：{target}（{len(candidates)} 个，从优到劣）", file=stdout)
     if not candidates:
         print(

@@ -2338,8 +2338,54 @@ def test_an_empty_watchlist_is_written_but_the_loss_is_announced(tmp_path):
 
     out, err = capture()
 
-    _write_watchlist([], tmp_path, out, err)
+    _write_watchlist([], tmp_path, out, err, "b1")
 
     assert (tmp_path / WATCHLIST_NAME).read_text(encoding="utf-8") == ""
     assert "没有候选" in err.getvalue()
     assert "清空" in err.getvalue()
+
+
+def test_the_watchlist_file_name_follows_the_rule_that_was_run(tmp_path):
+    """自选股文件名跟着**跑的那条规则**走，而 B1 的名字不动。
+
+    通达信按文件名认板块，而这份文件固定名、每天覆盖——两条规则共用一个名字时，后跑的会把
+    先跑的静默盖掉（见 `mbt.report.WATCHLIST_NAMES`）。
+    """
+    from mbt.report import WATCHLIST_NAME
+
+    out, err = capture()
+
+    _write_watchlist([], tmp_path, out, err, "brick")
+
+    assert (tmp_path / WATCHLIST_NAME).exists() is False, "砖型不该写 B1 那一份的名字"
+    brick_file = next(tmp_path.iterdir())
+    assert brick_file.name.endswith(".EBK")
+    assert brick_file.name != WATCHLIST_NAME
+
+
+def test_the_screen_command_writes_the_brick_watchlist_name(tmp_path):
+    """**经命令行那一条路**也要落到砖型那个名字上。
+
+    上一条测的是记账函数本身，而「规则名」是从 `--screen` 一路传下来的：`) --screen` 的名字一旦
+    改了（或传丢了），这里就会静默退回**默认名**——那正是要防的那次覆盖，而客户端那边看不出
+    任何异样。故这条按真实的 `--screen brick` 走一遍，只看落下来的文件名。
+    """
+    from mbt.cli import run_screen_command
+    from mbt.report import WATCHLIST_NAME, watchlist_name_for
+
+    root, gbbq = make_dataroot(tmp_path, periods=80)
+    watchlist_dir = tmp_path / "watchlist"
+    args = screen_args(
+        screen="brick",
+        tdx_root=str(root),
+        gbbq=str(gbbq),
+        output_dir=str(tmp_path / "screens"),
+        watchlist_dir=str(watchlist_dir),
+    )
+    out, err = capture()
+
+    assert run_screen_command(args, stdout=out, stderr=err) == 0, err.getvalue()
+
+    written = {path.name for path in watchlist_dir.iterdir()}
+    assert written == {watchlist_name_for("brick")}
+    assert WATCHLIST_NAME not in written, "砖型写成了 B1 的名字——那两份会互相盖掉"

@@ -156,7 +156,27 @@ def describe_screen(screen, label: str | None = None) -> dict | None:
 #: 每日选股产出的自选股文件名。**固定**——通达信按文件名认自选股，名字一变，每天导入的
 #: 就成了另一个板块。它是产物契约的一部分（仓库根目录的 `b1_daily.bat` 与测试都指向它），
 #: 故写在这里当唯一出处，而不是散在命令行字符串里。
+#:
+#: 它是**默认名**：没登记的规则都用它。另起名字的规则见 :data:`WATCHLIST_NAMES`。
 WATCHLIST_NAME = "每日选股.EBK"
+
+#: 按**规则**另起的自选股文件名。
+#:
+#: 为什么要有这张表：这份文件是「固定名、每天覆盖」的（通达信按名字认板块），故两条规则共用
+#: 一个名字时，**后跑的那条会静默覆盖先跑的那条**——用户在同一个板块名底下看到的是另一条
+#: 规则的名单，而客户端那边毫无异样。
+#:
+#: B1 的名字**不动**：既有用户的自选股板块是按它建的，改名等于换板块。
+WATCHLIST_NAMES = {"brick": "砖型选股.EBK"}
+
+
+def watchlist_name_for(screen_label: str) -> str:
+    """某条规则该写哪一份自选股文件；没登记的规则用 :data:`WATCHLIST_NAME`。
+
+    收**规则名**而不是让调用方自己递名字：名字与规则的对应关系只住在上面那张表里，调用方
+    少一处能写错的地方（`mbt screen` 已经知道规则名了）。
+    """
+    return WATCHLIST_NAMES.get(screen_label, WATCHLIST_NAME)
 
 
 def write_watchlist(candidates, path):
@@ -168,8 +188,9 @@ def write_watchlist(candidates, path):
 
     返回落盘后的 :class:`~pathlib.Path`，便于调用方把它印进日志。
 
-    固定的文件名见 :data:`WATCHLIST_NAME`；本函数收**路径**而不是目录，为的是让「固定名」
-    这件事只住在 :data:`WATCHLIST_NAME` 一处，由调用方拼装，而不是在这里再写一遍。
+    固定的文件名见 :data:`WATCHLIST_NAME`（默认）与 :data:`WATCHLIST_NAMES`（按规则另起的
+    那些），由调用方经 :func:`watchlist_name_for` 拼装；本函数收**路径**而不是目录，为的是让
+    「叫什么名字」这件事只住在 :mod:`mbt.report` 里，而不是在调用处再写一遍。
 
     **与 run 目录那套约定刻意相反。** ``write_run_artifacts`` 用时间戳目录且**拒绝覆盖**
     （一次运行是一份不可变的证据）；而这一份是**固定名、每天覆盖**的——通达信按**文件名**
