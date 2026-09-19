@@ -990,9 +990,9 @@ def b1_screen(
     )
 
 
-def brick_screen(*, top_n=None, progress=None) -> Screen:
+def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
     """**砖型**的选股规则：前一天是**绿砖**、当天是**红砖**、且红砖**比那根绿砖大**，
-    按两个等权因子排序（需求方给定，见票据 #81）。
+    按四项排序（需求方给定，见票据 #81；后两项在 2026-09-19 加的）。
 
     三条过滤器读的是同一个**砖型图**（:func:`~mbt.signals.indicators.brick_line`）：
 
@@ -1004,14 +1004,36 @@ def brick_screen(*, top_n=None, progress=None) -> Screen:
     红砖比绿砖大        ``砖的大小之比 > 1``（**严格**大于，等于即不合格）
     ==================  ====================================================
 
-    排序因子两项**等权**，各自在**当日可交易池内**转成百分位再加权平均：
+    排序因子**四项**，前两项各占三分之一、后两项**合成**那第三个三分之一（各六分之一）：
 
     ==================  ====================================================
-    因子                读法（**越大越靠前**）
+    因子                读法（**越大越靠前**，故「越小越好」的那几条先取负）
     ==================  ====================================================
     砖的大小之比        红砖的大小 ÷ 绿砖的大小
     量能                当根成交量 ÷ **前一根**成交量
+    涨幅                当根相对**前收盘**的涨幅，**越小**越靠前
+    上影                当根的上影 ÷ ATR，**越短**越靠前
     ==================  ====================================================
+
+    后两条在需求方那边是「三点」——「砖的大小之比」「量比」「当天的形态（涨得越小、上影越
+    短）」——故第三点由两条读数对半构成。写进 ``weights`` 就是 ``(1, 1, 0.5, 0.5)``（``Screen``
+    会归一到和为 1）；这么写而不是写 ``(1/3, 1/3, 1/6, 1/6)``，是为了让「前两条各一份、后两条
+    各半份」这件事在代码里看得出来，也少一处除法。
+
+    .. warning::
+
+        **「涨幅越小越好」与「红砖比绿砖大」方向相反，这是刻意的。** 大砖通常出现在大阳日，
+        而这一项要求别追高——两条同时进排序，谁赢由上面的份额定。若将来发现这一项在名额不
+        紧张的日子里**等于没生效**（排序只影响取前 N 时谁排前面），那说明它的意图其实是
+        **一道门**（「今天涨太多就不买」）而不是排序，那是一次移除标的的动作，需要独立证据
+        ——见 ADR-0012 记下的那条纪律。
+
+    .. note::
+
+        **因子在 2026-09-19 变过，旧产物与新的不可比**（同一天同一份行情会因为排序不同而给出
+        不同名单）。之前那两份产物——667 只候选与那轮归零的全市场回测——用的是**两项等权**
+        的版本。对照数字出来之后再决定要不要立 ADR（ADR-0012 那条之所以够格，是因为它带了
+        全市场对照的读数）。
 
     两只过滤器保证「大小之比」在入选格上**就是**「红砖 ÷ 绿砖」；分母恒为正，因为绿砖是严格
     下降（见 :class:`~mbt.signals.indicators.BrickLine` 的那条不变量）。其余形态下同一个读数
@@ -1028,8 +1050,9 @@ def brick_screen(*, top_n=None, progress=None) -> Screen:
 
     .. note::
 
-        **两个因子等权，指的是「秩」等权**，不是数值等权。故一个极端放量的标的不会因为倍数
-        特别大而压过另一个；等比的是各自在池内的分位（``Screen`` 的 ``normalize="rank"``）。
+    **四项不是等权**：前两项各占三分之一，后两项**合成**那第三个三分之一（各六分之一）。
+    同样，「等权」指的是**秩**等权而不是数值等权——故一个极端放量的标的不会因为倍数特别大而
+    压过另一个；等比的是各自在池内的分位（``Screen`` 的 ``normalize="rank"``）。
 
     .. note::
 
@@ -1038,8 +1061,8 @@ def brick_screen(*, top_n=None, progress=None) -> Screen:
 
     .. note::
 
-        **这条规则只读行情**，不需要财务数据目录（``--cw-root``）——它的三个过滤器与两个因子
-        全部由开高低收与成交量算出，没有一项来自财报。
+        **这条规则只读行情**，不需要财务数据目录（``--cw-root``）——它的三个过滤器与四项读数
+        全部由开高低收与成交量算出，没有一项来自财报（故它比 B1 少一个必须配对的路径开关）。
 
     .. note::
 
@@ -1049,12 +1072,22 @@ def brick_screen(*, top_n=None, progress=None) -> Screen:
         逐位相同，声明值取 100 是留了一倍余量。
 
     参数:
+        atr_n: 「上影」那一项折算用的 ATR 窗口。默认 14，与 B1 的 ``top_shadow_atr`` 同口径
+            ——两条规则的这条读数才可比。它是砖型**唯一的读数参数**（三个砖型窗口仍写在公式里；
+            另有 ``top_n`` 与 ``progress``，那两个是通用旋钮，不是这条规则的口径）。
         top_n: 只取前 N 名。``None``（默认）表示不截断。
         progress: 进度上报的接收端。砖型图是三次递推平滑，三个过滤器与一个因子都要用它，故
             按面板对象**只算一次**并单独记时——否则它的代价会被算进第一个碰到它的那个部件名
             下（见 :func:`mbt.progress.timed`）。
     """
-    from mbt.signals import brick_line, green_brick, red_brick, volume_ratio
+    from mbt.signals import (
+        brick_line,
+        green_brick,
+        momentum,
+        red_brick,
+        upper_shadow_atr,
+        volume_ratio,
+    )
 
     readings = _panel_memo(
         brick_line,
@@ -1081,10 +1114,20 @@ def brick_screen(*, top_n=None, progress=None) -> Screen:
     def traded_volume_ratio(panel):
         return volume_ratio(panel["volume"], n=1)
 
+    def smaller_gain(panel):
+        # 当根相对**前收盘**的涨幅，取负（因子一律「越大越靠前」）。复用现成的动量取 n=1
+        # ——「涨幅」就是它，不另写一份。
+        return -momentum(panel["close"], 1)
+
+    def shorter_shadow(panel):
+        # 当根的上影 ÷ ATR，取负。上影取正值、越大越差，故必须翻符号（见 upper_shadow_atr）。
+        return -upper_shadow_atr(panel, atr_n)
+
     return Screen(
         filters=(previous_green, red_today, bigger_than_the_green),
-        factors=(size_ratio, traded_volume_ratio),
-        weights=(1.0, 1.0),
+        factors=(size_ratio, traded_volume_ratio, smaller_gain, shorter_shadow),
+        # (1,1,0.5,0.5) 归一之后 = 1/3、1/3、1/6、1/6：前两条各一份，后两条合成第三份。
+        weights=(1.0, 1.0, 0.5, 0.5),
         normalize="rank",
         top_n=top_n,
         boards=BRICK_BOARDS,

@@ -411,3 +411,66 @@ def atr(panel: Panel, n: int) -> pd.DataFrame:
     true_range = (high - low).where(reference_close.isna(), true_range)
 
     return true_range.apply(_wilder_smooth, n=n)
+
+
+def shadow_over_atr(high, open_, close, scale):
+    """``(高 − max(开, 收)) ÷ ATR``，逐格——**上影线**那一个定义式。
+
+    **它不是信号**，故不在 ``signals.__all__`` 里：收的是**数组**（或同形的表），返回数组，
+    没有「面板进、标的宽表出」那一层契约。存在的理由是**只有一处定义式**——本模块的
+    :func:`upper_shadow_atr`（读**当根**）与 :mod:`mbt.signals.volume` 里那条「顶部那根的上影」
+    读的是**不同的行**，但公式一样，而那正是最容易改一处忘一处的地方。
+
+    实体上沿取 ``max(开, 收)``——**不是** ``|收 − 开|``：后者是实体高度，量的不是同一件事，
+    在长实体的小影线上两者差很远。
+
+    ``scale``（ATR）非正时该格为**缺失**而不是 0 或无穷：分母无定义时那个比值的含义不存在。
+    """
+    body = np.maximum(open_, close)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(scale > 0, (high - body) / scale, np.nan)
+
+
+def upper_shadow_atr(panel: Panel, n: int) -> pd.DataFrame:
+    """**上影线**（当根），按 ATR 折算：``(高 − max(开, 收)) ÷ ATR``。
+
+    影取**正**值——所以这个数**越大，上影越长**。因子那边要「越小越好」，故用它的地方要取负
+    （``−影``）。写反成 ``max(开,收) − 高`` 会得到一个恒非正的数，方向整个反过来，而那不会
+    报错。
+
+    除以 ATR 是为了**跨标的可比**：单看「0.3 元的上影」在一只 60 元的票与一只 3 元的票上完全
+    不是一回事，而排序因子正是要在同日全池内横向比。除以收盘价便宜些，但低价股的百分比波动
+    天然更大，那个旁支会留在读数里；除以 ATR 是按**各自的噪声**折算，是同一族读数里最公道的
+    那个口径。
+
+    参数:
+        panel: 须含 ``high`` / ``low`` / ``close`` / ``open`` 四个字段，且同日对齐（由
+            :class:`~mbt.data.panel.Panel` 保证）。``open`` 是**必需**的：没有它就算不出实体
+            的上沿，而上影线量的正是「高过实体多少」。
+        n: ATR 的窗口，由调用方给出（**不设默认值**）——和 :func:`atr` 一样，默认值会让「用了
+            哪个口径」从调用处消失。
+
+    返回:
+        标的宽表。窗口不足、ATR 为 0（分母无定义）、以及缺口处一律**缺失**（ADR-0005）。
+
+    .. note::
+
+        **它与 ``volume_pattern`` 的 ``top_shadow_atr`` 同口径、不同指哪根**：那个指一段上涨的
+        **顶部那根**（要等峰值被确认之后才有值），这个指**当根**（窗口一满就有值）。故
+        ``top_shadow_atr`` 在一条单调下跌的行情上可以整段缺失，而本函数照常有值。两者的
+        定义式一样，改动其中一处时必须回头看另一处。
+    """
+    high = check_symbol_frame(panel["high"])
+    open_ = check_symbol_frame(panel["open"])
+    close = check_symbol_frame(panel["close"])
+    scale = atr(panel, n)
+
+    # 公式只有一处定义（`shadow_over_atr`），本函数只负责「取哪根」——取当根，故不需要任何
+    # 已确认的摆动点（那是 `volume.py` 那条顶部读数与它的唯一区别）。
+    values = shadow_over_atr(
+        high.to_numpy(dtype=float),
+        open_.to_numpy(dtype=float),
+        close.to_numpy(dtype=float),
+        scale.to_numpy(dtype=float),
+    )
+    return pd.DataFrame(values, index=high.index, columns=high.columns, dtype=float)

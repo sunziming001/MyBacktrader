@@ -1,6 +1,6 @@
-"""砖型规则的过滤器与排序因子（票据 #85）。
+"""砖型规则的过滤器与排序因子（票据 #85；后两项因子 2026-09-19 加）。
 
-**这条规则就是那三条判据加两个因子**，故这里测的是「它算的是不是那件事」，不是「它算得准不
+**这条规则就是那三条判据加四项读数**，故这里测的是「它算的是不是那件事」，不是「它算得准不
 准」——砖型图本身的数值在 ``tests/test_signal_brick.py`` 里另有手算常数与对拍钉住。
 
 各用例的证据各有来路，刻意不重复：
@@ -11,18 +11,24 @@
 - **0 底那一段**用一段定制行情：先阴跌到 0 底、再抬头、再小幅回落、最后猛抬头。它把
   ADR-0016 那个后果钉到规则这一层——底部连续为 0 意味着**没有绿砖**，故从 0 底抬起来的
   第一根红砖**永远选不中**，而那不是瑕疵，是截断照字面沿用的直接结果。
-- **等权**用「分数 = 两项百分位的平均」验——它同时钉住「用了哪两项」与「各占多少」。
+- **配权**分两层验：一条用**独立重算的算式**（``mean_percentile``）比全表，一条用**桩读数**
+  把其余三项钉死、只让一项在两只标的之间不同——后者才能把「某一项的方向与份额」分开验干净
+  （真实行情里四项同时变，涨得多的那天砖也更大、量也更高）。
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from mbt.data import Panel
 from mbt.screen import BRICK_BOARDS, Screen, brick_screen
-from mbt.signals import brick_line, volume_ratio
+from mbt.signals import brick_line, momentum, upper_shadow_atr, volume_ratio
 from mbt.universe import CHINEXT, MAIN_BOARD, STAR_MARKET
+
+#: 砖型那条上影读数用的 ATR 窗口——与 B1 那个 `top_shadow_atr` 同口径，故两条规则可比。
+BRICK_ATR_N = 14
 
 #: 一份长行情里落子的那一根（见 :func:`floor_panel`）——三条判据在此**同时**成立。
 FLOOR_SERIES_PICK = pd.Timestamp("2024-02-05")
@@ -44,7 +50,13 @@ def wave_panel(*, symbols=3, bars=600, seed=20260919) -> Panel:
     数字正是「这条测试没空转」的证据。
     """
     rng = np.random.default_rng(seed)
-    fields: dict[str, dict[str, np.ndarray]] = {"high": {}, "low": {}, "close": {}, "volume": {}}
+    fields: dict[str, dict[str, np.ndarray]] = {
+        "open": {},
+        "high": {},
+        "low": {},
+        "close": {},
+        "volume": {},
+    }
     for i in range(symbols):
         name = f"sh60{i:04d}"
         legs = []
@@ -54,6 +66,7 @@ def wave_panel(*, symbols=3, bars=600, seed=20260919) -> Panel:
             legs.append(np.exp(np.cumsum(np.full(span, drift) + rng.normal(0, 0.006, span))))
         close = np.concatenate(legs)[:bars] * 10.0
         fields["close"][name] = close
+        fields["open"][name] = close * (1.0 + rng.uniform(-0.01, 0.01, bars))
         fields["high"][name] = close * (1.0 + rng.uniform(0.0, 0.02, bars))
         fields["low"][name] = close * (1.0 - rng.uniform(0.0, 0.02, bars))
         fields["volume"][name] = 1000.0 * np.exp(rng.normal(0.0, 0.5, bars))
@@ -75,6 +88,7 @@ def floor_panel(*, symbol="sh600000") -> Panel:
         ]
     )
     fields = {
+        "open": {symbol: closes * 0.995},
         "high": {symbol: closes + 0.2},
         "low": {symbol: closes},
         "close": {symbol: closes},
@@ -88,15 +102,20 @@ def every_symbol(field: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(True, index=field.index, columns=field.columns)
 
 
-def mean_percentile(panel: Panel, pool: pd.DataFrame, *, volume_window: int) -> pd.DataFrame:
-    """照 ``Screen`` 的口径手算一遍分数：两项在池内各转百分位，再等权平均。
+def mean_percentile(panel: Panel, pool: pd.DataFrame, *, volume_window: int = 1) -> pd.DataFrame:
+    """照 ``Screen`` 的口径手算一遍砖型的分数。
 
-    这是**独立的第二份算式**（这里逐行写开，``Screen`` 那边另有实现），用来回答「喂进去的是
-    这两个数、各占一半吗」。两项都缺的格子留缺失——不是记 0 分。
+    这一版是**四项、权重 1/3 / 1/3 / 1/6 / 1/6**：砖的大小之比与量比各占三分之一，而「当根
+    涨幅」与「当根上影」两条**合成**那第三个三分之一，各占六分之一。等价于权重写
+    ``(1, 1, 0.5, 0.5)``（``Screen`` 会归一到和为 1）。
+
+    它是**独立的第二份算式**（这里逐行写开，``Screen`` 那边另有实现），用来回答「喂进去的是
+    这四个数、各占多少」。四项都缺的格子留缺失——不是记 0 分。
     """
     size_ratio = brick_line(panel).size_ratio
     volume = volume_ratio(panel["volume"], n=volume_window)
-    missing_both = size_ratio.isna() & volume.isna()
+    gain = momentum(panel["close"], 1)
+    shadow = upper_shadow_atr(panel, BRICK_ATR_N)
 
     def percentile_of(frame):
         pooled = frame.where(pool)
@@ -104,7 +123,21 @@ def mean_percentile(panel: Panel, pool: pd.DataFrame, *, volume_window: int) -> 
         counts = pooled.notna().sum(axis=1)
         return ranks.div(counts.replace(0, np.nan), axis=0).fillna(0.0)
 
-    return ((percentile_of(size_ratio) + percentile_of(volume)) / 2.0).where(~missing_both)
+    # 全部项都缺 → 留缺失；只缺一项的记 0 分外位（与 `Screen._combine` 同一处置）。
+    every = [size_ratio, volume, gain, shadow]
+    missing_all = every[0].isna()
+    for frame in every[1:]:
+        missing_all &= frame.isna()
+
+    # 四条读数都翻成「越大越靠前」：砖的大小之比与量比**本来就是这个方向**，而涨幅与上影
+    # 是「越小越好」，故那两条要取负。权重按上面的份额。
+    weighted = (
+        percentile_of(size_ratio) / 3.0
+        + percentile_of(volume) / 3.0
+        + percentile_of(-gain) / 6.0
+        + percentile_of(-shadow) / 6.0
+    )
+    return weighted.where(~missing_all)
 
 
 def conditions(panel: Panel):
@@ -218,7 +251,9 @@ def apply_stub(monkeypatch, values, symbol="sh600000"):
     """造一条手写的线、跑一遍规则，返回逐日的 ``selected``（一个 ``Series``）。"""
     index = pd.bdate_range("2024-01-02", periods=len(next(iter(values.values()))))
     frame = pd.DataFrame(values, index=index)
-    price_panel = Panel({field: frame.copy() for field in ("high", "low", "close", "volume")})
+    price_panel = Panel(
+        {field: frame.copy() for field in ("open", "high", "low", "close", "volume")}
+    )
     universe = every_symbol(price_panel["close"])
     return (
         stubbed_line(monkeypatch, values)
@@ -289,15 +324,18 @@ def test_the_pattern_is_selectable_once_the_series_is_off_the_floor():
     assert bool(result.selected.at[FLOOR_SERIES_PICK, "sh600000"]), "这一根本该被选中"
 
 
-# --- 两个因子等权 -------------------------------------------------------------
+# --- 配权：四项，前两项各 1/3、后两项各 1/6 ------------------------------------
 
 
-def test_the_score_is_the_average_of_the_two_percentiles():
-    """分数 = **砖的大小之比**与**量比**两项在池内百分位的平均。
+def test_the_score_is_the_weighted_average_of_the_four_readings():
+    """分数 = **四项**的池内百分位加权平均，权重 **1/3、1/3、1/6、1/6**。
 
-    这一条同时钉住两件事：用的是哪两项、以及各占一半。百分位与「两项都缺才留缺失」这两条
-    口径本身由 ``tests/test_screen.py`` 钉住（``normalize="rank"``），这里在它的基础上验
-    「喂进去的是这两个数」。
+    这一条同时钉住三件事：用的是哪四项、方向都翻正了、以及各占多少。百分位与「全都缺才留
+    缺失」这两条口径本身由 ``tests/test_screen.py`` 钉住（``normalize="rank"``），这里在它
+    的基础上验「喂进去的是这四个数、按这个份额相加」。
+
+    它与下面那条**桩读数**的用例分工不同：这条用真实读数跑全流程（证明四条真的接上了），
+    那条把其余三项钉死（证明**某一项**的方向与份额）。
     """
     price_panel = wave_panel()
     pool = every_symbol(price_panel["close"])
@@ -305,8 +343,136 @@ def test_the_score_is_the_average_of_the_two_percentiles():
 
     assert not result.scores.empty, "规则没有产出分数"
     pd.testing.assert_frame_equal(
-        result.scores, mean_percentile(price_panel, pool, volume_window=1), check_dtype=False
+        result.scores, mean_percentile(price_panel, pool), check_dtype=False
     )
+
+
+# --- 用**桩读数**把四项分开验 --------------------------------------------------
+#
+# 真实行情里四项同时变，故「某一项的方向」验不干净：涨得多的那天，砖也更大、量也更高。
+# 这里把四条读数换成手写的表，只让**一项**在两只标的之间不同，其余三项完全相同——于是分数
+# 的差只可能来自那一项。
+
+#: 桩读数用的两个标的。
+STUB_SYMBOLS = ("sh600000", "sh600001")
+
+#: 桩面板的日期数（够长即可，读数全是桩给的，值不重要）。
+STUB_BARS = 6
+
+
+def stub_panel() -> Panel:
+    """桩用例用的面板：形状对就行，四条读数全由 :func:`stubbed_screen` 顶掉。"""
+    index = pd.bdate_range("2024-01-02", periods=STUB_BARS)
+    values = {symbol: [10.0] * STUB_BARS for symbol in STUB_SYMBOLS}
+    return Panel(
+        {
+            field: pd.DataFrame(values, index=index)
+            for field in ("open", "high", "low", "close", "volume")
+        }
+    )
+
+
+def stubbed_screen(monkeypatch, **readings):
+    """把四条读数换成手写的表，造出砖型规则。
+
+    必须在 ``brick_screen()`` **之前**换：规则把这几个函数收进闭包，造好之后再换就晚了。
+    每个关键字给一张「日期 × 标的」的表（或一对逐标的的序列）。
+    """
+    import mbt.signals as signals_module
+    from mbt.signals import BrickLine
+
+    index = pd.bdate_range("2024-01-02", periods=STUB_BARS)
+
+    def as_frame(value):
+        """``{标的: 序列}`` 直接变表；一对 ``(基准值, 被改的值)`` 摊成两只标的的逐日表。
+
+        后者是 :func:`score_for` 给的形状：前 ``STUB_BARS - 1`` 天两只**完全相同**，只有
+        最后一天分开——于是分数差只可能来自那一项。
+        """
+        if isinstance(value, pd.DataFrame):
+            return value
+        if isinstance(value, dict):
+            return pd.DataFrame(value, index=index)
+        first, last = value[0], value[-1]
+        return pd.DataFrame(
+            {
+                STUB_SYMBOLS[0]: [first] * STUB_BARS,
+                STUB_SYMBOLS[1]: [first] * (STUB_BARS - 1) + [last],
+            },
+            index=index,
+        )
+
+    size_ratio = as_frame(readings["size_ratio"])
+    line = as_frame(readings.get("line", {s: [10.0] * STUB_BARS for s in STUB_SYMBOLS}))
+
+    monkeypatch.setattr(
+        signals_module,
+        "brick_line",
+        lambda panel: BrickLine(line=line, size=line.diff().abs(), size_ratio=size_ratio),
+    )
+    monkeypatch.setattr(
+        signals_module, "volume_ratio", lambda volumes, n: as_frame(readings["volume"])
+    )
+    monkeypatch.setattr(signals_module, "momentum", lambda prices, n: as_frame(readings["gain"]))
+    monkeypatch.setattr(
+        signals_module, "upper_shadow_atr", lambda panel, n: as_frame(readings["shadow"])
+    )
+    return brick_screen()
+
+
+#: 四个读数在「基准」那只标的上都给中间值。
+BASELINE = {"size_ratio": 1.0, "volume": 1.0, "gain": 0.0, "shadow": 0.0}
+
+
+def score_for(monkeypatch, **changed):
+    """跑一次桩读数，返回最后一天两只标的的分数 ``(基准那只, 被改的那只)``。
+
+    每一项都是 ``(基准值, 被改的值)``：两只标的在前 ``STUB_BARS - 1`` 天完全相同，只有
+    **最后一天**在那一项上分开——于是分数差只可能来自那一项。
+    """
+    readings = {name: [value] * STUB_BARS for name, value in BASELINE.items()}
+    for name, value in changed.items():
+        readings[name] = [value[0]] * (STUB_BARS - 1) + [value[1]]
+
+    panel = stub_panel()
+    rule = stubbed_screen(monkeypatch, **readings)
+    pool = every_symbol(panel["close"])
+    scores = rule.apply(panel, universe_mask=pool).scores
+    last = scores.index[-1]
+    return scores.at[last, STUB_SYMBOLS[0]], scores.at[last, STUB_SYMBOLS[1]]
+
+
+def test_a_smaller_gain_ranks_higher(monkeypatch):
+    """**当根涨幅越小越靠前**——其余三项完全相同，故分数的差只可能来自涨幅。"""
+    quiet, hot = score_for(monkeypatch, gain=(0.0, 0.09))
+
+    assert quiet > hot, "涨得多的那只反而排在前面——涨幅那一项的方向写反了"
+
+
+def test_a_shorter_upper_shadow_ranks_higher(monkeypatch):
+    """**当根上影越短越靠前**——上影取正值，故因子那边必须取负。"""
+    quiet, spiky = score_for(monkeypatch, shadow=(0.0, 2.0))
+
+    assert quiet > spiky, "上影长的那只反而排在前面——上影那一项的方向写反了"
+
+
+def test_the_gain_and_the_shadow_each_carry_one_sixth(monkeypatch):
+    """两条新读数各占 **1/6**：三项各 1/3，而那第三项由这两条对半构成。
+
+    验法是**同一对标的、只改一项的值**，比较「两只之间的分差」。只有两只标的时，池内百分位
+    必是 0.5 与 1.0，故某一项的份额 ``s`` 给出的分差恰是 ``s ÷ 2``：砖那一项（1/3）应当正好
+    是新的两条各自（1/6）的**两倍**——份额写错这条立刻红。
+    """
+    brick_quiet, brick_big = score_for(monkeypatch, size_ratio=(1.0, 2.0))
+    gain_quiet, gain_big = score_for(monkeypatch, gain=(0.0, 1.0))
+    shadow_quiet, shadow_big = score_for(monkeypatch, shadow=(0.0, 1.0))
+
+    brick_gap = abs(brick_big - brick_quiet)
+    gain_gap = abs(gain_big - gain_quiet)
+    shadow_gap = abs(shadow_big - shadow_quiet)
+
+    assert gain_gap == pytest.approx(shadow_gap), "两条新读数的份额该相同"
+    assert brick_gap == pytest.approx(2 * gain_gap), "砖那一项该是新的两条各自的两倍"
 
 
 def test_the_volume_factor_divides_by_the_previous_bar_only():
@@ -322,6 +488,25 @@ def test_the_volume_factor_divides_by_the_previous_bar_only():
     assert not scores.equals(
         mean_percentile(price_panel, pool, volume_window=3)
     ), "把量那一项换成前 3 根，分数却一点没变——它没在算量"
+
+
+def test_the_atr_window_actually_reaches_the_shadow_reading(monkeypatch):
+    """``atr_n`` 是**真的要传下去**的——别让它变成一个没人读的旋钮。
+
+    桩读数认不出窗口，故这条走**真实读数**：同一份行情、两个不同的 ATR 窗口，上影那一项
+    必须给出不同的值；若一样，说明窗口根本没传进去。
+    """
+    price_panel = wave_panel()
+    pool = every_symbol(price_panel["close"])
+
+    short_window = upper_shadow_atr(price_panel, 5)
+    long_window = upper_shadow_atr(price_panel, 30)
+    assert not short_window.equals(long_window), "样品里两个窗口给出同一张表，这条测试将空转"
+
+    # 分数表同样是窗口的函数：换了窗口，那一项变了，分数就该跟着变。
+    default_scores = brick_screen().apply(price_panel, universe_mask=pool).scores
+    wider_scores = brick_screen(atr_n=5).apply(price_panel, universe_mask=pool).scores
+    assert not default_scores.equals(wider_scores), "改了 atr_n 分数却一格没变——窗口没传下去"
 
 
 def test_top_n_keeps_the_highest_scores():

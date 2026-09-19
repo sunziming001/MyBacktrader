@@ -17,6 +17,7 @@ from mbt.signals import (
     rolling_max,
     rolling_min,
     sma,
+    upper_shadow_atr,
     volume_ratio,
     white_line,
     yellow_line,
@@ -574,3 +575,117 @@ def test_rolling_min_is_not_the_min_of_the_closes(symbol_frame):
 
     assert rolling_min(lows, n=3)["sh600000"].iloc[3] == pytest.approx(7.0)
     assert rolling_min(closes, n=3)["sh600000"].iloc[3] == pytest.approx(8.5)
+
+
+# --- 上影线（当根，除以 ATR） --------------------------------------------------
+#
+# 与 ``mbt.signals.volume`` 的 ``top_shadow_atr`` 同**口径**、不同**指哪根**：那个指一段上涨的
+# 顶部那根，这个指**当根**。故两者都取 ``high − max(开, 收)`` 再除以 ATR——这个定义只此一处，
+# 两边的差别只在取哪一行。
+
+#: 上影线那一组 K 线：`影 = 高 − max(开, 收)` 恰为 [0.0, 1.0, 0.0, 2.0, 0.5]。
+SHADOW_BARS = {
+    "open": [10.0, 10.0, 11.0, 10.0, 12.0],
+    "high": [10.0, 11.0, 11.0, 12.5, 12.5],
+    "low": [9.0, 9.5, 10.0, 10.0, 11.0],
+    "close": [9.5, 10.5, 11.0, 10.5, 12.0],
+}
+
+
+def shadow_panel(panel):
+    return panel({field: {"sh600000": values} for field, values in SHADOW_BARS.items()})
+
+
+def test_the_upper_shadow_is_the_high_above_the_body_over_atr(panel):
+    """``(高 − max(开, 收)) ÷ ATR``——上面那组 K 线的影恰为 [0.0, 1.0, 0.0, 2.0, 0.5]。
+
+    期望值用**现成的** :func:`atr` 算出来再除：ATR 本身另有手算常数钉住（见下），故这里测的是
+    那条**公式**与「除的是哪一根的 ATR」，而不是把 ATR 重算一遍。
+    """
+    prices = shadow_panel(panel)
+    shadows = [0.0, 1.0, 0.0, 2.0, 0.5]
+
+    got = upper_shadow_atr(prices, n=3)["sh600000"]
+    denominator = atr(prices, n=3)["sh600000"]
+
+    for i, shadow in enumerate(shadows):
+        expected = shadow / denominator.iloc[i] if denominator.iloc[i] > 0 else float("nan")
+        if expected != expected:
+            assert pd.isna(got.iloc[i]), f"第 {i} 根该缺失"
+        else:
+            assert got.iloc[i] == pytest.approx(expected), f"第 {i} 根算错了"
+
+
+def test_a_longer_upper_shadow_gives_a_bigger_number(panel):
+    """**越大越长**——方向不能写反（写成 ``max(开,收) − 高`` 会得到一个恒非正数）。
+
+    只看 ATR 有值的那几根（``n=3`` 时从第 3 根起）：第 3 根影 2.0、第 4 根影 0.5、
+    第 2 根影 0.0，故顺序是 3 > 4 > 2。
+    """
+    got = upper_shadow_atr(shadow_panel(panel), n=3)["sh600000"]
+
+    assert got.iloc[3] > got.iloc[4] > got.iloc[2]
+    assert (got.dropna() >= 0).all(), "影取正值，不该出现负数"
+
+
+def test_no_upper_shadow_gives_exactly_zero(panel):
+    """收在当日最高价（或无上影）时为**恰好 0**，而不是缺失——0 是「没有上影」这个事实。"""
+    got = upper_shadow_atr(shadow_panel(panel), n=3)["sh600000"]
+
+    assert got.iloc[2] == pytest.approx(0.0), "高 = max(开,收) 的那一根，影就是 0"
+
+
+def test_a_zero_atr_yields_missing_not_a_division_by_zero(panel):
+    """ATR 为 0（长期停牌复牌、一字板连着走）时**缺失**——不是 0，也不是无穷。"""
+    flat = panel(
+        {
+            "open": {"sh600000": [10.0] * 6},
+            "high": {"sh600000": [10.0] * 6},
+            "low": {"sh600000": [10.0] * 6},
+            "close": {"sh600000": [10.0] * 6},
+        }
+    )
+
+    assert upper_shadow_atr(flat, n=3)["sh600000"].isna().all()
+
+
+def test_it_reads_the_current_bar_so_it_needs_no_confirmed_swing(panel):
+    """指着**当根**，故不需要任何已确认的摆动点。
+
+    这条是它与 :func:`~mbt.signals.volume.volume_pattern` 的 ``top_shadow_atr`` 的实质差别：
+    那个要等一段上涨的峰值被确认之后才有值，这个从窗口一满就有——一条从头到尾单调下跌的
+    行情上，前者可以整段缺失，而后者照常有值。
+    """
+    falling = panel(
+        {
+            "open": {"sh600000": [20.0, 19.0, 18.0, 17.0, 16.0, 15.0]},
+            "high": {"sh600000": [20.5, 19.5, 18.5, 17.5, 16.5, 15.5]},
+            "low": {"sh600000": [19.0, 18.0, 17.0, 16.0, 15.0, 14.0]},
+            "close": {"sh600000": [19.0, 18.0, 17.0, 16.0, 15.0, 14.0]},
+        }
+    )
+
+    assert upper_shadow_atr(falling, n=3)["sh600000"].notna().any(), "整段下跌时也该有值"
+
+
+def test_the_upper_shadow_keeps_the_symbol_frame_shape_and_float_dtype(panel):
+    """跨字段的信号**返回标的宽表**（ADR-0009）：消费方向与其余指标一致。"""
+    got = upper_shadow_atr(shadow_panel(panel), n=3)
+
+    assert list(got.columns) == ["sh600000"]
+    assert got.index.equals(pd.bdate_range("2024-01-02", periods=5))
+    assert all(dtype.kind == "f" for dtype in got.dtypes)
+
+
+def test_the_upper_shadow_rejects_a_missing_field_by_name(panel):
+    """少一个字段要**报错并说出缺哪个**——不是悄悄按 NaN 算（那会两边都缺失、看着像没数据）。"""
+    incomplete = panel(
+        {
+            "high": {"sh600000": [10.0, 11.0, 12.0]},
+            "low": {"sh600000": [9.0, 10.0, 11.0]},
+            "close": {"sh600000": [9.5, 10.5, 11.5]},
+        }
+    )
+
+    with pytest.raises(KeyError, match="open"):
+        upper_shadow_atr(incomplete, n=3)
