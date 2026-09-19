@@ -66,7 +66,7 @@ import numpy as np
 import pandas as pd
 
 from mbt.data.panel import Panel
-from mbt.signals.indicators import atr
+from mbt.signals.indicators import atr, shadow_over_atr
 from mbt.signals.swings import Swings
 
 
@@ -439,6 +439,10 @@ class VolumePattern(NamedTuple):
     单独 −7.53 pt，且它没有独立证据——故已退回 :func:`volume_contraction`。本字段保留，
     它仍是 ② 的读数口径，`probe_form_score.py` 要用。）
 
+    ``top_shadow_atr`` 的定义式只有一处（:func:`~mbt.signals.indicators.shadow_over_atr`）；
+    本函数负责的是**取哪一根**。同一族里另有一条读**当根**的
+    :func:`~mbt.signals.indicators.upper_shadow_atr`——改这处公式时两处一起看。
+
     ``top_after_peak`` 是给「收盘价峰值不是最高价」这件事留的账：实测**候选形态**里
     有 **31.2%** 的最高价落在 ``P`` 之后（``probe_b1_top_late.py``），即冲高被砸回来的
     「假突破」占比不低。上涨段的右端因此取 ``max(P, 顶部那根)``，让上涨段与回调段
@@ -651,12 +655,17 @@ def volume_pattern(
     top_cols = np.nonzero(valid)[1]
     with np.errstate(invalid="ignore", divide="ignore"):
         top_high = high[top_rows, top_cols]
-        body = np.maximum(open_[top_rows, top_cols], close[top_rows, top_cols])
         top_atr = atr_frame[top_rows, top_cols]
         top_shadow = np.full((rows, columns), math.nan)
-        # 影取**正**值（`high − max(开, 收)`），故「越小越好」——长上影是扣分项。别写成
-        # `max(开,收) − high`：那会得到一个恒非正的数，方向整个反过来。
-        top_shadow[valid] = np.where(top_atr > 0.0, (top_high - body) / top_atr, math.nan)
+        # **公式只有一处定义**（`mbt.signals.indicators.shadow_over_atr`）：本处只负责「取哪根」
+        # ——取一段上涨的**顶部那根**。影取**正**值（`高 − max(开,收)`），故「越小越好」；
+        # 别写成 `max(开,收) − 高`，那会得到一个恒非正的数，方向整个反过来。
+        top_shadow[valid] = shadow_over_atr(
+            top_high,
+            open_[top_rows, top_cols],
+            close[top_rows, top_cols],
+            top_atr,
+        )
         top_volume = np.full((rows, columns), math.nan)
         top_volume[valid] = vol[top_rows, top_cols]
     top_after = np.where(valid, top.astype(float) - peak_pos, math.nan)
