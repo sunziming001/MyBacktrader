@@ -167,6 +167,14 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--end", default=None, help="结束日（默认到数据末根）")
     backtest.add_argument("--cash", type=float, default=100_000.0, help="期初资金")
     backtest.add_argument("--max-positions", type=int, default=None, help="最大持仓只数")
+    backtest.add_argument(
+        "--fixed-amount",
+        type=float,
+        default=None,
+        metavar="YUAN",
+        help="每个持仓名额投入**固定金额**（元），而不是按组合总值等权分配。不给则用等权"
+        "（那会让每笔金额随净值漂移）。资金不够时少买，不跳过",
+    )
     backtest.add_argument("--commission", type=float, default=0.0, help="手续费率")
     backtest.add_argument(
         "--commission-mode",
@@ -477,11 +485,14 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
     try:
         screen, signals = _screen_and_signals(args, loaded, full_markets, stdout, progress)
         universe_rules = UniverseRules(boards=_boards(args, rule=screen), extra_mask=extra_mask)
+        sizer, sizer_options = _sizer(args, screen)
         result = run_portfolio_backtest(
             list(loaded.markets),
             strategy,
             cash=args.cash,
             max_positions=args.max_positions,
+            sizer=sizer,
+            sizer_options=sizer_options,
             commission=args.commission,
             commission_min=args.commission_min,
             commission_mode=args.commission_mode,
@@ -490,6 +501,9 @@ def run_backtest_command(args, *, stdout=sys.stdout, stderr=sys.stderr) -> int:
             listing_dates=listing_dates,
             screen=screen,
             signals=signals,
+            # 「买单只给一次成交机会」由**规则自己声明**（见 `Screen.one_shot_buys`）：对条件
+            # 逐日重算的规则，一笔单留到几天后成交用的早已不是当日那个信号，而它不会报错。
+            one_shot_buys=getattr(screen, "one_shot_buys", False),
             progress=progress,
             **params,
         )
@@ -583,6 +597,24 @@ def _requested_panel_bars(args) -> int:
     ``getattr`` 兜底：有测试手工搭 args 桩，回测那条路也没有这一项。
     """
     return getattr(args, "panel_bars", 0) or 0
+
+
+def _sizer(args, screen) -> tuple[object, dict | None]:
+    """持仓分配：``--fixed-amount`` 给了就用固定金额，否则 ``None``（让引擎用等权默认）。
+
+    返回 ``(sizer 类, sizer_options)``——``None`` 表示「用引擎的默认」，而那条路上引擎会把
+    ``max_positions`` 与规则表一并递过去。
+
+    **``max_positions`` 两处都要给**（撮合层与 sizer）：前者拦掉超出的买入、后者决定每笔
+    分多少钱，两处口径不一致时「名额满了」会有两种互相矛盾的读法。
+    """
+    amount = getattr(args, "fixed_amount", None)
+    if amount is None:
+        return None, None
+
+    from mbt.backtest import FixedAmountSizer
+
+    return FixedAmountSizer, {"amount": amount, "max_positions": args.max_positions}
 
 
 def _describe_universe(rules, args, listing_dates, *, considered: int, loaded: int) -> dict:
@@ -701,7 +733,19 @@ def _screen_and_signals(args, loaded, raw_markets, stdout, progress=None, screen
 
     if screen is _UNSET:
         screen = _named_screen(args, progress=progress)
-    if name in ("momentum", "brick"):
+
+    if name == "brick":
+        from mbt.screen import brick_signals
+
+        # **卖点信号就在这里接**。砖型的买入条件是规则给的（经 `selection_mask`），而卖出判据
+        # 是「当天是不是绿砖」——那是策略读的信号，规则那边不产出它。不接这一步的话，策略
+        # 会**只买不卖**：读不到字段一律是缺失，而缺失表现为「不动作」。
+        #
+        # **先算后截**：在完整历史上算，再对到这次运行的那批标的上（`align_to`），否则区间
+        # 开头那一段的读数会算在更短的历史上——与 b1 那条路的 `clip_fields` 同一口径。
+        return screen, brick_signals(raw_markets, align_to=loaded.markets)
+
+    if name == "momentum":
         return screen, None
 
     if name not in ("undervalued_growth", "valuation", "b1"):

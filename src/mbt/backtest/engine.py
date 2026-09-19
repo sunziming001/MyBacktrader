@@ -28,7 +28,7 @@ from mbt.screen import SCREEN_FIELDS, SCREEN_SCORE_FIELD
 from mbt.universe import build_universe
 
 from .costs import AStockBroker, AStockCommissionInfo
-from .sizing import EqualWeightSizer
+from .sizing import AStockSizer, EqualWeightSizer
 
 #: 出厂规则表路径。定义在规则层（``mbt.rules.SHIPPED_RULES_PATH``），此处转出以保持
 #: 既有引用可用；「出厂表在哪」只有那一处定义。
@@ -766,14 +766,23 @@ def _drive_engine(
         cerebro.adddata(data)
 
     cerebro.addstrategy(_always_next(strategy), **strategy_params)
+    options = dict(sizer_options or {})
     if sizer is None:
         # `sizer_options` 在这里也要生效：默认 sizer 的 `headroom`（留余地比例）是 AC 要求
         # **可配置**的那一项，只在自定义 sizer 那条路径生效会让它不可达。
-        cerebro.addsizer(
-            EqualWeightSizer, max_positions=max_positions, rules=table, **(sizer_options or {})
-        )
+        options.setdefault("max_positions", max_positions)
+        options.setdefault("rules", table)
+        cerebro.addsizer(EqualWeightSizer, **options)
     else:
-        cerebro.addsizer(sizer, **(sizer_options or {}))
+        # **自定义 sizer 也要拿到规则表**：`rules` 是「按当日涨跌幅留余地」那把尺子，而它
+        # 「未给则不留余地」——只给默认 sizer 递的话，任何自定义 sizer 都会**静默**少留一截
+        # （实测：本应 18,181 股的那一笔会变成 20,000 股，即按收盘价定量、不留余地）。
+        #
+        # 只递给本项目的 sizer（它们声明了 `rules`）：别的 sizer 不认这个参数，递进去会当场
+        # 报错。判据是 `AStockSizer` 这个公共底座，而不是去内省参数表。
+        if issubclass(sizer, AStockSizer):
+            options.setdefault("rules", table)
+        cerebro.addsizer(sizer, **options)
 
     broker = AStockBroker(
         rules=table,
