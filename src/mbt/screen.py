@@ -1000,7 +1000,9 @@ def b1_screen(
 def brick_screen(
     *,
     atr_n: int = 14,
+    white_n: int = 10,
     yellow_windows: tuple[int, ...] | None = DEFAULT_YELLOW_WINDOWS,
+    max_gain: float | None = 0.058,
     top_n=None,
     progress=None,
 ) -> Screen:
@@ -1016,19 +1018,31 @@ def brick_screen(
     前一天是绿砖        ``砖型图[t−1] < 砖型图[t−2]``
     当天是红砖          ``砖型图[t] > 砖型图[t−1]``
     红砖比绿砖大        ``砖的大小之比 > 1``（**严格**大于，等于即不合格）
-    收在黄线之上        收盘 > **黄线**（见 :func:`~mbt.signals.filters.above_yellow`）
+    白线在黄线上        白线 > 黄线（见 :func:`~mbt.signals.filters.white_above_yellow`）
+    收在黄线之上        收盘 > 黄线（见 :func:`~mbt.signals.filters.above_yellow`）
+    涨幅没有太大        当根涨幅 < ``max_gain``（默认 0.058，**严格**小于）
     ==================  ====================================================
 
     .. warning::
 
-        **最后一条与「前一天绿砖」在方向上相冲**，这是需求方的设计，但代价要写明：绿砖那一族
-        条件找的是「一波回调之后的转折向上」，而「收在黄线之上」要求价格已经站回慢线——
-        **回调正深时收盘通常在黄线下方**。故两者同一天同时成立的格不多：合成行情上量到它把
-        候选压到约**四成**（133 → 59 格）。
+        **``max_gain`` 是一个不分类别的固定百分比，故它在各板块的效果不同。** 涨跌幅限幅按
+        板块取：**主板 10%**、创业板与科创板 **20%**。于是「涨幅 < 5.8%」在主板**约等于排除
+        涨停**，而在创业板/科创板它砍掉的只是「涨得比较多的正常日子」——那里 +10% 远不是涨停。
 
-        （此前这一条曾是「收在前若干根的``最高价``之上」，那个更狠——只剩 **6%**
-        （133 → 8 格），且「红砖比绿砖大」在那里几乎不可能成立：价格贴着 4 日高点走时砖型图
-        会顶在天花板，任何回调都砸出一个很大的绿砖。现已换成黄线门，理由见票。）
+        精确的「是不是涨停」在本项目里做得到（:func:`mbt.rules.limit_price` 按板块与 ST 取
+        限幅，撮合与质检共用同一个算法），但那是**换判据**，不是换参数。这一条是需求方给的
+        **固定百分比**口径，故照录；要改成按板块自适应的涨停判定，得单独决定。
+
+    .. warning::
+
+        最后两条都属**趋势**那一族，与「前一天绿砖」**方向相冲**，这是需求方的设计，但代价要
+        写明：绿砖那一族条件找的是「一波回调之后的转折向上」，而「白线在黄线上」「收在黄线
+        之上」要求趋势向上、价格已站回慢线——**回调正深时这两条都不成立**。合成行情上量到
+        三条都留只剩约**四分之一**（133 → 34 格）。
+
+        这两条**互不蕴含**（`white_above_yellow` 的 docstring 里就写着这一点）：价格可以从
+        上方双双跌破，那时白线仍在黄线上、而收盘已在黄线下方。实测同一个样本上「白线上但收盘
+        不在上」267 格、「收盘在上但白线不在」285 格——两道门各挡各的。
 
     排序因子**四项**，前两项各占三分之一、后两项**合成**那第三个三分之一（各六分之一）：
 
@@ -1105,14 +1119,22 @@ def brick_screen(
     参数:
         atr_n: 「上影」那一项折算用的 ATR 窗口。默认 14，与 B1 的 ``top_shadow_atr`` 同口径
             ——两条规则的这条读数才可比。
+        white_n: 白线的双重 EMA 窗口（「白线在黄线上」那道门用）。默认 10，与 B1 同。
         yellow_windows: 黄线各条均线的窗口。默认 :data:`DEFAULT_YELLOW_WINDOWS`，与 B1 **同一个
             常量**——``CONTEXT.md`` 把黄线定义成一个概念，两处取不同窗口就等于造了第二条黄线。
-            给 ``None`` 就**不设这道门**，那是给**对照与测量**用的（「加这道门之前之后差多少」
-            必须能一次跑出来），不是给策略调的旋钮：真要用那条规则，就用它本来的样子。
+            给 ``None`` 就**不设黄线族的那两道门**（`trend` 与 `above_the_yellow`），那是给
+            **对照与测量**用的（「加这两道门之前之后差多少」必须能一次跑出来），不是给策略调的
+            旋钮：真要用那条规则，就用它本来的样子。
 
             注意它与 :data:`BRICK_LOOKBACK_BARS` 的关系：声明深度取的是**这个窗口与递推记忆
             之大**，故传一组更长的窗口时要一并把声明深度提上去，否则闸门会放行一个太短的
             面板，而那道门在短面板上会因黄线整段缺失而**静默地筛掉所有标的**。
+        max_gain: 当根涨幅的**上限**（**严格**小于才算合格）。默认 ``0.058``，即需求方给的
+            「涨幅 < 5.8%」。给 ``None`` 就**不设这道门**——那是给**对照与测量**用的。
+
+            它是**可调参数**而不是写死的常数（需求方 2026-09-19 明确要「写成可调的」），但
+            **不分类别**：主板涨停是 +10%，而创业板/科创板是 +20%，故这个固定百分比在两处的
+            含义不同——详见上面那条告警。
         top_n: 只取前 N 名。``None``（默认）表示不截断。
         progress: 进度上报的接收端。砖型图是三次递推平滑，**三个读它的部件**都要用它，故
             按面板对象**只算一次**并单独记时——否则它的代价会被算进第一个碰到它的那个部件名
@@ -1126,6 +1148,7 @@ def brick_screen(
         red_brick,
         upper_shadow_atr,
         volume_ratio,
+        white_above_yellow,
     )
 
     readings = _panel_memo(
@@ -1151,9 +1174,21 @@ def brick_screen(
         # 状态而非事件：今天**收在黄线上方**（`above_yellow` 与 B1 用的是同一个口径）。
         return above_yellow(panel["close"], yellow_windows)
 
+    def trend(panel):
+        # 也是状态：白线在黄线上方（与 B1 的 trend 门同一个函数）。
+        return white_above_yellow(panel["close"], white_n, yellow_windows)
+
+    def not_too_hot(panel):
+        # 当根涨幅**严格**小于门槛（`momentum(n=1)` 就是「相对前收盘的涨幅」）。
+        # 它与排序里那条 `smaller_gain` 读的是同一个量，职责不同：这条**排除**太强的，
+        # 那条在其余里排「谁更温和」。
+        return momentum(panel["close"], 1) < max_gain
+
     filters = (previous_green, red_today, bigger_than_the_green)
     if yellow_windows is not None:
-        filters = (*filters, above_the_yellow)
+        filters = (*filters, trend, above_the_yellow)
+    if max_gain is not None:
+        filters = (*filters, not_too_hot)
 
     def size_ratio(panel):
         return readings(panel).size_ratio

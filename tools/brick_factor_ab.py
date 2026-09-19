@@ -334,10 +334,11 @@ def main() -> int:
     parser.add_argument("--top-n", type=int, default=5, help="每天取前几名（差异只出现在这里）")
     parser.add_argument(
         "--mode",
-        choices=("picks", "gate"),
+        choices=("picks", "gate", "gain"),
         default="picks",
-        help="picks（默认）= 两套因子的前 N 名对比；gate = 同一条规则**不挂**「收在黄线之上」"
-        "那道门的对比（会报筛掉多少、以及被挡掉的那批之后怎么走）",
+        help="picks（默认）= 两套因子的前 N 名对比；gate = 同一条规则**不挂**黄线族那两道门的"
+        "对比；gain = **不挂**「涨幅 < max_gain」那道门的对比（会报筛掉多少、以及被挡掉的那批"
+        "之后怎么走）",
     )
     parser.add_argument(
         "--compare",
@@ -366,10 +367,13 @@ def main() -> int:
 
     returns = forward_returns(panel)
 
-    if args.mode == "gate":
-        # 出厂那条（带黄线门）对 **不挂那道门**的同一条规则（`yellow_windows=None`）。
+    if args.mode in ("gate", "gain"):
+        # 出厂那条 对 **不挂某一道门**的同一条规则。两道门各自独立开关，故各有一个模式。
+        relaxed_options = (
+            {"yellow_windows": None} if args.mode == "gate" else {"max_gain": None}
+        )
         gated = brick_screen(top_n=args.top_n).apply(panel, universe_mask=pool)
-        relaxed = brick_screen(top_n=args.top_n, yellow_windows=None).apply(
+        relaxed = brick_screen(top_n=args.top_n, **relaxed_options).apply(
             panel, universe_mask=pool
         )
         table = gate_report(relaxed=relaxed, gated=gated, returns=returns)

@@ -23,7 +23,7 @@ import pytest
 from mbt.backtest import FixedAmountSizer, run_portfolio_backtest
 from mbt.data import Panel
 from mbt.screen import ScreenResult, brick_screen, brick_signals
-from mbt.signals import above_yellow
+from mbt.signals import above_yellow, white_above_yellow
 from mbt.strategy import Brick
 from mbt.universe import UniverseRules
 
@@ -240,17 +240,22 @@ def test_the_whole_pipeline_buys_then_sells_on_the_right_bars(make_market, zero_
         Brick,
         rules=zero_cost_rules,
         signals=brick_signals([frame]),
-        # **这道门收紧到窗口 2 根**：这条用例验的是**策略**（何时买、何时卖、按哪个价成交），
-        # 而这段行情的落点是按砖型那三条判据选的——出厂默认的黄线窗口（最长那条均线要 114 根）
-        # 在这段 46 根的历史上根本不满，它会一格都不选（两族条件结构性地相冲，见
-        # `brick_screen` 的 docstring）。故这里把门收紧、并当场断言它确实放行，免得测试变成
-        # 在测门。
-        screen=brick_screen(yellow_windows=(2,)),
+        # **黄线族的门收到 ``(2,)``、涨幅门关掉**：这条用例验的是**策略**（何时买、何时卖、
+        # 按哪个价成交），而这段行情的落点是按砖型那三条判据选的——出厂默认下它会少选一天
+        # （第二个入选日涨幅 +8.35%，被「涨幅 < 5.8%」挡掉；而黄线要 114 根，这段只有 46 根）。
+        # 故这里把三道门都放宽、并当场断言它们确实放行，免得测试变成在测门。
+        screen=brick_screen(yellow_windows=(2,), max_gain=None),
     )
 
-    gate = above_yellow(gate_panel(frame)["close"], (2,))[MAIN]
-    for bar in FILL_BARS[::2]:  # 那两个**下单日**（成交在它们的次根）
-        assert bool(gate.iloc[bar - 1]), f"第 {bar - 1} 根没通过那道门"
+    # 三道门都要断言：它们互不蕴含（见 `white_above_yellow` 的 docstring），故「门放行了」
+    # 这件事得逐道确认，否则测试可能在测另一道门。
+    closes = gate_panel(frame)["close"]
+    for label, gate in (
+        ("白线在黄线上", white_above_yellow(closes, 10, (2,))[MAIN]),
+        ("收在黄线之上", above_yellow(closes, (2,))[MAIN]),
+    ):
+        for bar in FILL_BARS[::2]:  # 那两个**下单日**（成交在它们的次根）
+            assert bool(gate.iloc[bar - 1]), f"第 {bar - 1} 根没通过「{label}」那道门"
 
     fills = result.trades.sort_values("date").reset_index(drop=True)
     assert len(fills) == 4, f"两轮买卖各一笔，实际成交 {len(fills)} 笔"

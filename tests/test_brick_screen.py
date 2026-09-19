@@ -24,11 +24,24 @@ import pytest
 
 from mbt.data import Panel
 from mbt.screen import BRICK_BOARDS, Screen, brick_screen
-from mbt.signals import above_yellow, brick_line, momentum, upper_shadow_atr, volume_ratio
+from mbt.signals import (
+    above_yellow,
+    brick_line,
+    momentum,
+    upper_shadow_atr,
+    volume_ratio,
+    white_above_yellow,
+)
 from mbt.universe import CHINEXT, MAIN_BOARD, STAR_MARKET
 
 #: 砖型那条上影读数用的 ATR 窗口——与 B1 那个 `top_shadow_atr` 同口径，故两条规则可比。
 BRICK_ATR_N = 14
+
+#: 白线的双重 EMA 窗口，与规则默认一致（也与 B1 同）。
+WHITE_N = 10
+
+#: 「涨幅没有太大」那道门的门槛，与规则默认一致。
+MAX_GAIN = 0.058
 
 #: 「收在黄线之上」那道门用的窗口。与 B1 **同一组**——`CONTEXT.md` 把黄线定义成一个概念，
 #: 两处取不同窗口就等于造了第二条黄线。
@@ -144,67 +157,127 @@ def mean_percentile(panel: Panel, pool: pd.DataFrame, *, volume_window: int = 1)
     return weighted.where(~missing_all)
 
 
-def conditions(panel: Panel):
-    """**照需求直接写**的四条判据（不经过 ``Screen`` 的机制）。
+def conditions(panel: Panel) -> dict[str, pd.DataFrame]:
+    """**照需求直接写**的六条判据（不经过 ``Screen`` 的机制）。
+
+    返回一个 **dict** 而不是元组：这份清单已经扩过两次（三条 → 四条 → 五条 → 六条），而每次
+    扩都要改五处解包，且顺序一错就是静默的**错位**（两项都是布尔框，拿来对比不会报错）。
+    名字取代位置之后，加一条就不必动任何调用处。
 
     前三条刻意用**下标错位**来写「前一根是绿砖」，而不是复用过滤器里的 ``shift``——两条路各写
     一遍，对上了才说明规则的组合没写错。第三条同样照需求写「大小之比 > 1」，而不是复用 ``size``
-    的相邻比较。第四条照需求写「收盘 > 黄线」。
+    的相邻比较。后三条照需求各写一句。
     """
     readings = brick_line(panel)
     line, size_ratio = readings.line, readings.size_ratio
-    previous_is_green = (line.shift(1) < line.shift(2)).fillna(False)
-    today_is_red = (line > line.shift(1)).fillna(False)
-    this_red_is_bigger = (size_ratio > 1.0).fillna(False)
-    above_the_yellow = above_yellow(panel["close"], YELLOW_WINDOWS).fillna(False)
-    return previous_is_green, today_is_red, this_red_is_bigger, above_the_yellow
+    return {
+        "previous_green": (line.shift(1) < line.shift(2)).fillna(False),
+        "red_today": (line > line.shift(1)).fillna(False),
+        "bigger_than_green": (size_ratio > 1.0).fillna(False),
+        "white_above_yellow": white_above_yellow(
+            panel["close"], WHITE_N, YELLOW_WINDOWS
+        ).fillna(False),
+        "above_yellow": above_yellow(panel["close"], YELLOW_WINDOWS).fillna(False),
+        "not_too_hot": (momentum(panel["close"], 1) < MAX_GAIN).fillna(False),
+    }
 
 
 # --- 四条判据：规则的选定集就是它们的交 ---------------------------------------
 
 
-def test_the_selection_is_exactly_the_four_conditions():
-    """``selected`` 与四条判据的交**逐格相同**——规则没有多一条、也没有少一条。"""
+def test_the_selection_is_exactly_the_six_conditions():
+    """``selected`` 与六条判据的交**逐格相同**——规则没有多一条、也没有少一条。"""
     price_panel = wave_panel()
     result = brick_screen().apply(price_panel, universe_mask=every_symbol(price_panel["close"]))
 
-    previous_is_green, today_is_red, bigger, above_the_yellow = conditions(price_panel)
-    expected = previous_is_green & today_is_red & bigger & above_the_yellow
+    c = conditions(price_panel)
+    expected = c["previous_green"] & c["red_today"] & c["bigger_than_green"]
+    expected &= c["white_above_yellow"] & c["above_yellow"] & c["not_too_hot"]
 
-    # 守卫：四类落点都真的存在，否则「逐格相同」可能只是在比对两张全假的表。
-    assert int(previous_is_green.to_numpy().sum()) > 100, "样本里几乎没有绿砖"
-    assert int((previous_is_green & today_is_red).to_numpy().sum()) > 100, "样本里几乎没有绿转红"
+    # 守卫：每一类落点都真的存在，否则「逐格相同」可能只是在比对两张全假的表。
+    assert int(c["previous_green"].to_numpy().sum()) > 100, "样本里几乎没有绿砖"
+    assert int((c["previous_green"] & c["red_today"]).to_numpy().sum()) > 100, "没几处绿转红"
     assert int(expected.to_numpy().sum()) > 3, "样本里几乎没有选中格"
     assert (
-        int((previous_is_green & today_is_red & ~bigger).to_numpy().sum()) > 50
+        int((c["previous_green"] & c["red_today"] & ~c["bigger_than_green"]).to_numpy().sum()) > 50
     ), "样本里没有「绿转红但红砖更小」的格子——第三条判据就没被验到"
-    assert int(above_the_yellow.to_numpy().sum()) > 100, "样本里几乎没有「收在黄线之上」的格子"
+    assert int(c["white_above_yellow"].to_numpy().sum()) > 100, "没几处「白线在黄线上」"
+    assert int(c["above_yellow"].to_numpy().sum()) > 100, "没几处「收在黄线之上」"
+    assert int(c["not_too_hot"].to_numpy().sum()) > 100, "没几处「涨幅未满 5.8%」"
 
     np.testing.assert_array_equal(result.selected.to_numpy(), expected.to_numpy())
 
 
-def test_a_bar_that_passes_the_brick_conditions_but_not_the_yellow_gate_is_rejected():
-    """前三条都成立，只差「收在黄线之上」——被第四条挡掉。
+def test_a_hot_bar_that_passes_everything_else_is_rejected():
+    """前五条都成立，只差「涨幅 < 5.8%」——被那道门挡掉。
 
-    这一条单独在筛人，而它恰恰是最容易「顺手去掉」的那一条（它看着像多余的确认）。没有这条
-    测试，改坏了不会有人发现——因为前三条的测试全都还在绿。
+    这道门的实质约等于「排除涨停」（主板涨停就是 +10%）——它砍掉的那批往往是排序里分数很高的
+    那几只（涨停日的砖比与量比都极大，见 ADR-0019）。故它**不是**「顺手去掉也不影响」的那类。
     """
     price_panel = wave_panel()
     pool = every_symbol(price_panel["close"])
     result = brick_screen().apply(price_panel, universe_mask=pool)
 
-    previous_is_green, today_is_red, bigger, above_the_yellow = conditions(price_panel)
-    brick_only = previous_is_green & today_is_red & bigger
-    bite = brick_only & ~above_the_yellow
+    c = conditions(price_panel)
+    others = (
+        c["previous_green"]
+        & c["red_today"]
+        & c["bigger_than_green"]
+        & c["white_above_yellow"]
+        & c["above_yellow"]
+    )
+    bite = others & ~c["not_too_hot"]
+
+    assert int(bite.to_numpy().sum()) > 0, "样本里没有「只差涨幅那一门」的格子，这条将空转"
+    assert not (result.selected.to_numpy() & bite.to_numpy()).any(), "涨幅超了却被选中了"
+
+    # 放宽这道门之后，**这些格子**应当被选中——否则上面那句可能是别的原因造成的。
+    relaxed = brick_screen(max_gain=None).apply(price_panel, universe_mask=pool)
+    assert (relaxed.selected.to_numpy() & bite.to_numpy()).any(), (
+        "放宽这道门之后照样选不中——那说明挡掉它的不是这道门"
+    )
+
+
+def test_a_bar_that_passes_the_brick_conditions_but_not_the_white_gate_is_rejected():
+    """前三条都成立、也收在黄线之上，只差「**白线**在黄线上」——被那道门挡掉。
+
+    它与下一条**必须分开测**：两道门互不蕴含（``white_above_yellow`` 的 docstring 里就写着
+    这一点，实测同一份样本上「白线上但收盘不在上」与「收盘在上但白线不在」各有几百格），
+    故去掉任一道都该让**对应**的那条测试单独变红。
+    """
+    price_panel = wave_panel()
+    pool = every_symbol(price_panel["close"])
+    result = brick_screen().apply(price_panel, universe_mask=pool)
+
+    c = conditions(price_panel)
+    brick_only = c["previous_green"] & c["red_today"] & c["bigger_than_green"]
+    bite = brick_only & ~c["white_above_yellow"] & c["above_yellow"]
+
+    assert int(bite.to_numpy().sum()) > 3, "样本里没有「只差白线那一门」的格子，这条将空转"
+    assert not (result.selected.to_numpy() & bite.to_numpy()).any(), "白线不在黄线上却被选中了"
+
+
+def test_a_bar_that_passes_the_brick_conditions_but_not_the_yellow_gate_is_rejected():
+    """前三条都成立、白线也在黄线上，只差「**收盘**在黄线之上」——被那道门挡掉。
+
+    这一条单独在筛人，而它恰恰是最容易「顺手去掉」的那一条（它看着像多余的确认）。
+    """
+    price_panel = wave_panel()
+    pool = every_symbol(price_panel["close"])
+    result = brick_screen().apply(price_panel, universe_mask=pool)
+
+    c = conditions(price_panel)
+    brick_only = c["previous_green"] & c["red_today"] & c["bigger_than_green"]
+    bite = brick_only & c["white_above_yellow"] & ~c["above_yellow"]
 
     assert int(bite.to_numpy().sum()) > 3, "样本里没有这一类格子，这条测试将空转"
     assert not (result.selected.to_numpy() & bite.to_numpy()).any(), "没站上黄线却被选中了"
 
-    # 而放宽这道门之后，那些格子**应当**被选中——否则上面那句可能是别的原因造成的。
-    relaxed = brick_screen(yellow_windows=(2,)).apply(price_panel, universe_mask=pool)
-    assert (
-        relaxed.selected.to_numpy() & bite.to_numpy()
-    ).any(), "放宽这道门之后照样选不中——那说明挡掉它的不是这道门"
+    # 而放宽黄线族那两道门之后，**这些格子**应当被选中——否则上面那句可能是别的原因造成的。
+    relaxed = brick_screen(yellow_windows=None).apply(price_panel, universe_mask=pool)
+    assert (relaxed.selected.to_numpy() & bite.to_numpy()).any(), (
+        "放宽那两道门之后照样选不中——那说明挡掉它的不是这两道门"
+    )
 
 
 def test_a_green_to_red_whose_red_is_not_bigger_is_rejected():
@@ -212,8 +285,8 @@ def test_a_green_to_red_whose_red_is_not_bigger_is_rejected():
     price_panel = wave_panel()
     result = brick_screen().apply(price_panel, universe_mask=every_symbol(price_panel["close"]))
 
-    previous_is_green, today_is_red, bigger, _ = conditions(price_panel)
-    bite = previous_is_green & today_is_red & ~bigger
+    c = conditions(price_panel)
+    bite = c["previous_green"] & c["red_today"] & ~c["bigger_than_green"]
 
     assert int(bite.to_numpy().sum()) > 50, "样本里没有这一类格子，这条测试将空转"
     assert not (result.selected.to_numpy() & bite.to_numpy()).any(), "红砖更小却被选中了"
@@ -224,8 +297,8 @@ def test_a_green_brick_not_followed_by_a_red_one_is_rejected():
     price_panel = wave_panel()
     result = brick_screen().apply(price_panel, universe_mask=every_symbol(price_panel["close"]))
 
-    previous_is_green, today_is_red, _, _ = conditions(price_panel)
-    bite = previous_is_green & ~today_is_red
+    c = conditions(price_panel)
+    bite = c["previous_green"] & ~c["red_today"]
 
     assert int(bite.to_numpy().sum()) > 50, "样本里没有这一类格子，这条测试将空转"
     assert not (result.selected.to_numpy() & bite.to_numpy()).any()
@@ -239,8 +312,8 @@ def test_a_red_brick_whose_previous_bar_was_not_green_is_rejected():
     price_panel = wave_panel()
     result = brick_screen().apply(price_panel, universe_mask=every_symbol(price_panel["close"]))
 
-    previous_is_green, today_is_red, bigger, _ = conditions(price_panel)
-    bite = ~previous_is_green & today_is_red & bigger
+    c = conditions(price_panel)
+    bite = ~c["previous_green"] & c["red_today"] & c["bigger_than_green"]
 
     assert int(bite.to_numpy().sum()) > 50, "样本里没有这一类格子，这条测试将空转"
     assert not (result.selected.to_numpy() & bite.to_numpy()).any()
@@ -286,37 +359,51 @@ def apply_stub(
     symbol="sh600000",
     *,
     yellow_windows=(2,),
+    white_n=1,
     gate_passes=None,
 ):
     """造一条手写的线、跑一遍规则，返回逐日的 ``selected``（一个 ``Series``）。
 
-    ``yellow_windows`` 默认收到 **(2,)**：这些用例测的是砖型那三条判据，而它们手写的线都很短，
-    默认窗口（40 根）根本不满、会把每一格都筛掉——于是「红砖更小」那类断言会因为**门**而
-    通过，而不是因为判据。窗口 1 根时门只看「当根收盘 > 前一根最高价」，用一根价格单调
-    上升的线就能确定地放行。
+    ``yellow_windows`` 与 ``white_n`` 默认收到 **(2,) / 1**：这些用例测的是砖型那三条判据，
+    而它们手写的线都很短——出厂默认的黄线（最长那条均线要 114 根）在这几根上根本不满，
+    那道门会把每一格都筛掉，于是「红砖更小」那类断言会因为**门**而通过，而不是因为判据。
 
-    ``gate_passes`` 给出**应当**通过这道门的行号；给了就当场断言，免得上面那件事悄悄反过来
+    取 ``(2,) / 1`` 时两道门都**确定放行**：白线在 ``n=1`` 时就是收盘价本身（α=1 的 EMA），
+    而黄线是最近 2 根的均值——在一根价格单调上升的线上，收盘总是高于它。故这两道门在这里
+    只是「确定成立」的背景，不参与要测的那件事。
+
+    ``gate_passes`` 给出**应当**通过那两道门的行号；给了就当场断言，免得上面那件事悄悄反过来
     （门把整条线都筛掉时，测试看着仍是绿的）。
     """
     index = pd.bdate_range("2024-01-02", periods=len(next(iter(values.values()))))
-    # 价格面板与手写的砖型线**互相独立**：线是桩给的，故价格只负责让那道门按预期放行。
-    # 取单调上升的收盘价（`close = 20 + i`），最高价与之相同——于是「当根收盘 > 前一根最高价」
-    # 在每一格都成立。
+    # 价格面板与手写的砖型线**互相独立**：线是桩给的，故价格只负责让那两道门按预期放行。
+    # 取单调上升的收盘价（`close = 20 + i`）——于是白线（=收盘）在黄线（=最近 2 根的均值）之上，
+    # 且收盘也在黄线之上，两道门每一格都成立。
     closes = [20.0 + i for i in range(len(index))]
     frame = pd.DataFrame({symbol: closes}, index=index)
     price_panel = Panel({field: frame.copy() for field in ("open", "high", "low", "close")})
     price_panel = Panel({**price_panel.fields, "volume": frame.copy()})
 
-    rule = stubbed_line(monkeypatch, values, yellow_windows=yellow_windows)
+    rule = stubbed_line(
+        monkeypatch, values, yellow_windows=yellow_windows, white_n=white_n
+    )
     universe = every_symbol(price_panel["close"])
     selected = rule.apply(price_panel, universe_mask=universe).selected[symbol]
 
     if gate_passes is not None:
-        gate = above_yellow(price_panel["close"], yellow_windows)[symbol]
-        for row in gate_passes:
-            assert bool(
-                gate.iloc[row]
-            ), f"第 {row} 行没通过「收在黄线之上」那道门——这条测试会变成在测门，不是在测砖型"
+        # **两道门都要断言**：它们互不蕴含，故「门放行了」这件事得逐道确认，否则测试可能在
+        # 测另一道门。
+        gates = {
+            "白线在黄线上": white_above_yellow(
+                price_panel["close"], white_n, yellow_windows
+            )[symbol],
+            "收在黄线之上": above_yellow(price_panel["close"], yellow_windows)[symbol],
+        }
+        for label, gate in gates.items():
+            for row in gate_passes:
+                assert bool(gate.iloc[row]), (
+                    f"第 {row} 行没通过「{label}」那道门——这条测试会变成在测门，不是在测砖型"
+                )
     return selected
 
 
@@ -342,7 +429,7 @@ def test_a_red_brick_one_cent_bigger_than_the_green_one_is_taken(monkeypatch):
     就变成在测门，而不是在测比值。
     """
     values = {"sh600000": [np.nan, np.nan, 10.0, 6.0, 10.01]}
-    selected = apply_stub(monkeypatch, values, yellow_windows=(2,), gate_passes=[4])
+    selected = apply_stub(monkeypatch, values, gate_passes=[4])
 
     assert bool(selected.iloc[4]), "只大一点点就该算「更大」"
 
