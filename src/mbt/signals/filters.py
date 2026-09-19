@@ -30,11 +30,61 @@ from mbt.signals.swings import swings
 
 
 def new_high(prices: pd.DataFrame, n: int) -> pd.DataFrame:
-    """创 n 日新高：当根收盘**严格高于**前 n 个交易日的最高收盘价。
+    """创 n 日新高：当根收盘**严格高于**前 n 个交易日的最高**收盘价**。
 
     用 ``>`` 而非 ``>=``：恰好等于前高不是「创」新高。
+
+    比的是**收盘价**。要比「前 n 根的**最高价**」（盘中摸到过的高点）请用
+    :func:`close_above_high`——那个更严，两者不可互相替代。
     """
     return check_symbol_frame(prices) > rolling_max(prices, n).shift(1)
+
+
+def close_above_high(panel: Panel, n: int) -> pd.DataFrame:
+    """收盘**高于前 n 根的``最高价``**（跨字段，取面板）。这是一个**状态**。
+
+    与 :func:`new_high` 的分水岭只有一处：**比的是哪个价**。
+
+    ==================  ======================================  ==================
+    函数                基准                                        严格比较
+    ==================  ======================================  ==================
+    ``new_high``        前 n 根的**最高收盘价**                     ``>``
+    ``close_above_high`` 前 n 根的**最高价**（``high`` 的最大值）    ``>``
+    ==================  ======================================  ==================
+
+    盘中摸到过的高点总是 ≥ 收出来过的高点，故**本条更严**：一只票可以收盘创了新高（高过任何
+    一根的收盘）而仍然没有高过前 n 根里的盘中高点。两者不可互相替代，也不该共用一个名字。
+
+    .. note::
+
+        **目前没有规则在用本条**。它曾被砖型的一条门取用，那条门后来换成了
+        :func:`above_yellow`（理由见 ``mbt.screen.brick_screen``），而本条与其余几条读数一样
+        留在信号层（公开、有测试）备用——与 :func:`~mbt.signals.factors.j_oversold`、
+        :func:`~mbt.signals.factors.yellow_proximity` 的处置相同。
+
+    **窗口不含当根**。写成含当根的 ``C > HHV(H, n)`` **永远为假**——``HHV`` 至少等于当根的
+    ``high``，而 ``close ≤ high`` 恒成立。这不是边界取舍，是恒假的废话；故窗口取前 n 根
+    （``REF(HHV(H, n), 1)`` 那个写法）。
+
+    **严格**大于：恰好等于前 n 根的最高价不算「高于」（与 :func:`new_high` 同一处置）。
+
+    参数:
+        panel: 须含 ``close`` 与 ``high`` 两个字段，且同日对齐（由 :class:`~mbt.data.panel.Panel`
+            保证）。
+        n: 窗口根数（自：前 n 根，不含当根）。
+
+    返回:
+        纯 ``bool`` 的标的宽表。**缺失一律取 ``False``**：窗口不满 n 根、或窗口里有任何一根
+        缺失，都不足以判定（缺口纪律，ADR-0005）。跳过缺失去凑一个最大值，会把停牌期当成
+        「没有更高的价」，从而凭空造出「高于前高」。
+    """
+    close = check_symbol_frame(panel["close"])
+    high = check_symbol_frame(panel["high"])
+
+    # 窗口取**前** n 根，故先 `shift(1)`。`rolling(n, min_periods=n)` 要求窗口里 n 根全有值
+    # ——缺失那几根因此进不了最大值，而是让整个窗口成为缺失，再由比较取假。
+    prior_high = rolling_max(high, n).shift(1)
+    return close > prior_high
 
 
 def above_ma(prices: pd.DataFrame, n: int) -> pd.DataFrame:

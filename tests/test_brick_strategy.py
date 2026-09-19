@@ -1,6 +1,6 @@
 """砖型策略：何时买、买多少、先买谁、何时卖（票据 #87）。
 
-**买入条件不在这里测**——它是 :func:`mbt.screen.brick_screen` 那三条过滤器的事，已由
+**买入条件不在这里测**——它是 :func:`mbt.screen.brick_screen` 那几条过滤器的事，已由
 ``tests/test_brick_screen.py`` 钉住。这里测的是策略那四件事，它们全都依赖**持仓与资金**，
 而选股规则按定义不管持仓。
 
@@ -21,7 +21,9 @@ import pandas as pd
 import pytest
 
 from mbt.backtest import FixedAmountSizer, run_portfolio_backtest
+from mbt.data import Panel
 from mbt.screen import ScreenResult, brick_screen, brick_signals
+from mbt.signals import above_yellow
 from mbt.strategy import Brick
 from mbt.universe import UniverseRules
 
@@ -158,9 +160,10 @@ def run(
 # --- 端到端：真实规则 + 真实信号走一遍 -----------------------------------------
 
 
-#: 端到端那条用的行情里，**成交那几根**的日期与下标（0 起）。
+#: 端到端那条用的行情里，**成交那几根**的下标（0 起）。
 #:
-#: 它们是「下单日的次一根」——入选日或绿砖日的**下一根**：
+#: 它们是「下单日的次一根」——入选日或绿砖日的**下一根**。这道门在下面那条用例里收到窗口
+#: ``(2,)``（理由见那里的注释），于是这段行情给出**两个完整回合**：
 #:
 #: ==============  ======  ==========================================
 #: 日期            下标    这一天是什么
@@ -211,6 +214,16 @@ def brick_prices():
     )
 
 
+def gate_panel(market) -> Panel:
+    """把一只标的的行情拼成 黄线门要的面板（它只用 close）。"""
+    return Panel(
+        {
+            field: market.prices[[field]].rename(columns={field: market.symbol})
+            for field in ("close", "high")
+        }
+    )
+
+
 def test_the_whole_pipeline_buys_then_sells_on_the_right_bars(make_market, zero_cost_rules):
     """端到端：下单在**当天收盘**、成交在**次一根开盘**，买卖各按它该有的那一根落。
 
@@ -227,8 +240,17 @@ def test_the_whole_pipeline_buys_then_sells_on_the_right_bars(make_market, zero_
         Brick,
         rules=zero_cost_rules,
         signals=brick_signals([frame]),
-        screen=brick_screen(),
+        # **这道门收紧到窗口 2 根**：这条用例验的是**策略**（何时买、何时卖、按哪个价成交），
+        # 而这段行情的落点是按砖型那三条判据选的——出厂默认的黄线窗口（最长那条均线要 114 根）
+        # 在这段 46 根的历史上根本不满，它会一格都不选（两族条件结构性地相冲，见
+        # `brick_screen` 的 docstring）。故这里把门收紧、并当场断言它确实放行，免得测试变成
+        # 在测门。
+        screen=brick_screen(yellow_windows=(2,)),
     )
+
+    gate = above_yellow(gate_panel(frame)["close"], (2,))[MAIN]
+    for bar in FILL_BARS[::2]:  # 那两个**下单日**（成交在它们的次根）
+        assert bool(gate.iloc[bar - 1]), f"第 {bar - 1} 根没通过那道门"
 
     fills = result.trades.sort_values("date").reset_index(drop=True)
     assert len(fills) == 4, f"两轮买卖各一笔，实际成交 {len(fills)} 笔"

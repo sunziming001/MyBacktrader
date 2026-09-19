@@ -9,14 +9,19 @@
 
     信号在 T 收盘算出 → 成交在 T+1 开盘（引擎的既有口径）→ 看 T+1+k 的收盘
 
-**为什么按天配对。** 两条过滤器没动，故两个因子集在**每一天选出的候选集合完全相同**，
-只有次序不同；又因为引擎按「取前 N」截断，差异只出现在那 N 个名额上。于是可比的量是：
+**为什么按天配对。** 砖型那三条读砖型图的判据没动，故两个因子集在**每一天选出的候选集合
+完全相同**，只有次序不同；又因为引擎按「取前 N」截断，差异只出现在那 N 个名额上。于是可比的
+量是：
 
 .. code-block:: text
 
     被换进来的那几只（new − old）  比上年      被换出去的那几只（old − new）
 
 同一个交易日、同一份市场环境、同一批候选，差别只在因子给出的次序——这是最干净的归因。
+
+（``--mode gate`` 量的是**另一件事**：同一条规则挂不挂「收在黄线之上」那道门。那里的两个集合
+不是「两套规则的前 N」，而是「同一条规则加不加这道门」——被挡掉的那些**本来就是候选**。
+故 ``--mode gate`` 下这条「候选集合完全相同」的论证不适用，它比的是「过门 vs 被挡」。）
 
 用法::
 
@@ -230,11 +235,90 @@ def summarise(table: pd.DataFrame) -> None:
     print("判读：均值/标准误只有 1 上下的是噪声。多个 k 同号且量级稳定，才值得再看。")
 
 
+def gate_report(*, relaxed, gated, returns: dict[int, pd.DataFrame]) -> pd.DataFrame:
+    """按天配对：**同一批候选里**，过门的那批 vs 被这道门挡掉的那批。
+
+    与 :func:`paired_report` 的区别是配对的两个集合不是「两套规则的前 N」，而是「同一条规则
+    加不加这道门」——被挡掉的那些**本来就是候选**（砖型三条判据都成立），故这是对这道门本身
+    的检验：它挡掉的是好票还是坏票。
+    """
+    rows = []
+    for day in relaxed.selected.index:
+        kept = [name for name in relaxed.selected.columns if bool(gated.selected.at[day, name])]
+        dropped = [
+            name
+            for name in relaxed.selected.columns
+            if bool(relaxed.selected.at[day, name]) and not bool(gated.selected.at[day, name])
+        ]
+        if not dropped:
+            continue
+        row: dict[str, object] = {"date": day, "kept": len(kept), "dropped": len(dropped)}
+        for k, frame in returns.items():
+            if day not in frame.index:
+                continue
+            values = frame.loc[day]
+            for label, names in (("kept", kept), ("dropped", dropped)):
+                picked = [values[name] for name in names if name in values.index]
+                picked = [v for v in picked if v == v]
+                row[f"{label}_{k}"] = float(np.mean(picked)) if picked else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def summarise_gate(table: pd.DataFrame) -> None:
+    """报这道门的效果：筛掉多少、以及两批各自的未来收益与配对差。"""
+    print()
+    print("这道门筛掉了多少")
+    print("=" * 74)
+    total_kept = int(table["kept"].sum())
+    total_dropped = int(table["dropped"].sum())
+    survivors = total_kept + total_dropped
+    print(f"{'有候选的交易日':>14}  {len(table):>8}")
+    print(f"{'过门':>14}  {total_kept:>8} 格")
+    print(f"{'被挡掉':>14}  {total_dropped:>8} 格（{total_dropped / survivors * 100:.1f}%）")
+    print()
+    print("两批各自的未来收益（百分点）与配对差（过门 减 被挡）")
+    print("=" * 74)
+    print(
+        f"{'k':>3}  {'天数':>6}  {'过门均值':>9}  {'被挡均值':>9}"
+        f"  {'差':>9}  {'标准误':>8}  {'差/标准误':>10}"
+    )
+    for k in HORIZONS:
+        if f"kept_{k}" not in table:
+            continue
+        kept = table[f"kept_{k}"]
+        dropped = table[f"dropped_{k}"]
+        difference = (kept - dropped).dropna()
+        if difference.empty:
+            continue
+        mean = float(difference.mean())
+        error = (
+            float(difference.std(ddof=1) / np.sqrt(len(difference)))
+            if len(difference) > 1
+            else float("nan")
+        )
+        ratio = mean / error if error and error == error and error > 0 else float("nan")
+        print(
+            f"{k:>3}  {len(difference):>6}  {kept.mean() * 100:>8.4f}%"
+            f"  {dropped.mean() * 100:>8.4f}%"
+            f"  {mean * 100:>8.4f}%  {error * 100:>7.4f}%  {ratio:>10.2f}"
+        )
+    print("=" * 74)
+    print("判读：差为正 = 这道门挡掉的**比过门的差**（该门有价值）；差为负 = 它挡掉了更好的那批。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--top-n", type=int, default=5, help="每天取前几名（差异只出现在这里）")
+    parser.add_argument(
+        "--mode",
+        choices=("picks", "gate"),
+        default="picks",
+        help="picks（默认）= 两套因子的前 N 名对比；gate = 同一条规则**不挂**「收在黄线之上」"
+        "那道门的对比（会报筛掉多少、以及被挡掉的那批之后怎么走）",
+    )
     parser.add_argument(
         "--compare",
         default=None,
@@ -260,6 +344,24 @@ def main() -> int:
     pool = universe_mask(panel, loaded.markets)
     print(f"池子：{int(pool.to_numpy().sum())} 个「标的 × 日」格")
 
+    returns = forward_returns(panel)
+
+    if args.mode == "gate":
+        # 出厂那条（带黄线门）对 **不挂那道门**的同一条规则（`yellow_windows=None`）。
+        gated = brick_screen(top_n=args.top_n).apply(panel, universe_mask=pool)
+        relaxed = brick_screen(top_n=args.top_n, yellow_windows=None).apply(
+            panel, universe_mask=pool
+        )
+        table = gate_report(relaxed=relaxed, gated=gated, returns=returns)
+        if table.empty:
+            print("这道门一格都没挡掉——没有可比的差。")
+            return 0
+        summarise_gate(table)
+        if args.out:
+            table.to_csv(args.out, index=False)
+            print(f"\n按天配对的表：{args.out}")
+        return 0
+
     new_rule = brick_screen(top_n=args.top_n)
     new_result = new_rule.apply(panel, universe_mask=pool)
     old_result = old_rule.apply(panel, universe_mask=pool)
@@ -271,7 +373,6 @@ def main() -> int:
     days = len(old)
     print(f"逐日名单完全相同的天数：{same}/{days}（{same / days * 100:.1f}%）")
 
-    returns = forward_returns(panel)
     table = paired_report(old=old, new=new, returns=returns)
     print(f"有换手的交易日：{len(table)}")
     if table.empty:

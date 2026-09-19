@@ -43,29 +43,36 @@ from mbt.universe import CHINEXT, MAIN_BOARD, STAR_MARKET
 #: 那是另一回事，见 :func:`mbt.universe.build_universe`）。故这里写三个名字就是需求里那三个。
 BRICK_BOARDS = frozenset({MAIN_BOARD, CHINEXT, STAR_MARKET})
 
-#: 砖型要看多深的历史才算得准（交易日）。
+#: 砖型要看多深的历史才算得准（交易日）。**取两者之大**：
 #:
-#: 依据是**量出来的**，不是拍的：砖型图那三层递推平滑里最慢的一层是 α=1/6，记忆按
-#: ``(5/6)^t`` 衰减。取真实日线切片逐次截到末端 N 根重算，末位读数与全长之差为：
+#: 1. **递推记忆**：砖型图那三层平滑里最慢的一层是 α=1/6，按 ``(5/6)^t`` 衰减。取真实日线
+#:    切片逐次截到末端 N 根重算，末位读数与全长之差为：
 #:
-#: =========  ================  ====================
-#: N 根        末位读数相对差    ``(5/6)^N``
-#: =========  ================  ====================
-#: 10         3.78e-01          1.6e-01
-#: 20         1.13e-01          2.6e-02
-#: 30         3.08e-02          4.2e-03
-#: 40         1.54e-03          6.8e-04
-#: **50**     **0（逐位相同）**  1.1e-04
-#: 100        0（逐位相同）      1.2e-08
-#: =========  ================  ====================
+#:    =========  ================  ====================
+#:    N 根        末位读数相对差    ``(5/6)^N``
+#:    =========  ================  ====================
+#:    10         3.78e-01          1.6e-01
+#:    20         1.13e-01          2.6e-02
+#:    30         3.08e-02          4.2e-03
+#:    40         1.54e-03          6.8e-04
+#:    **50**     **0（逐位相同）**  1.1e-04
+#:    100        0（逐位相同）      1.2e-08
+#:    =========  ================  ====================
 #:
-#: 故 50 根在实测样本上已经足够，取 **100** 是留了一倍余量——而它仍比「按最深的那条规则」
-#: （1000 根）小一个数量级，那才是这条规则在面板窗口上省下来的空间。
-BRICK_LOOKBACK_BARS = 100
+#:    故 50 根已经足够，取 100 是留一倍余量。
+#: 2. **黄线**：那道「收在黄线之上」的门，其最长一条均线要 **114 根**。窗口短于它就整段
+#:    缺失、这道门**静默地把所有标的筛掉**——而闸门本该拦住这种窗口。
+#:
+#: 114 > 100，故声明值取 **114**。日更脚本用的 ``--panel-bars 200`` 仍有余量。
+BRICK_LOOKBACK_BARS = 114
 
 #: 组面板时提供给选股规则的字段。刻意**不含** ``amount``：它与信号无关，没有理由被带进
 #: 计算（ADR-0009 的「字段显式声明」）。这是一份**固定声明**的集合，不是从数据里推断的。
 SCREEN_FIELDS = ("open", "high", "low", "close", "volume")
+
+#: 黄线各条均线的**默认**窗口。B1 与砖型共用这一个常量——``CONTEXT.md`` 把黄线定义成一个
+#: 概念，两处各写一份字面量就等于造了第二条黄线（「它们相等」会沦为一句注释）。
+DEFAULT_YELLOW_WINDOWS = (14, 28, 57, 114)
 
 #: **选股分数**（``CONTEXT.md``）在**策略可读信号**里的字段名。
 #:
@@ -638,7 +645,7 @@ def b1_signals(
     *,
     align_to=None,
     white_n=10,
-    yellow_windows=(14, 28, 57, 114),
+    yellow_windows=DEFAULT_YELLOW_WINDOWS,
     stop_days=2,
     retracement=0.08,
 ) -> dict[str, pd.DataFrame]:
@@ -731,7 +738,7 @@ def _valuation_field(panel, name: str):
 def b1_screen(
     *,
     white_n=10,
-    yellow_windows=(14, 28, 57, 114),
+    yellow_windows=DEFAULT_YELLOW_WINDOWS,
     kdj_n=9,
     kdj_m1=3,
     kdj_m2=3,
@@ -990,11 +997,18 @@ def b1_screen(
     )
 
 
-def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
+def brick_screen(
+    *,
+    atr_n: int = 14,
+    yellow_windows: tuple[int, ...] | None = DEFAULT_YELLOW_WINDOWS,
+    top_n=None,
+    progress=None,
+) -> Screen:
     """**砖型**的选股规则：前一天是**绿砖**、当天是**红砖**、且红砖**比那根绿砖大**，
     按四项排序（需求方给定，见票据 #81；后两项在 2026-09-19 加的）。
 
-    三条过滤器读的是同一个**砖型图**（:func:`~mbt.signals.indicators.brick_line`）：
+    四条过滤器。**前三条**读的是同一个**砖型图**
+    （:func:`~mbt.signals.indicators.brick_line`），第四条读黄线：
 
     ==================  ====================================================
     过滤器              判据
@@ -1002,7 +1016,19 @@ def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
     前一天是绿砖        ``砖型图[t−1] < 砖型图[t−2]``
     当天是红砖          ``砖型图[t] > 砖型图[t−1]``
     红砖比绿砖大        ``砖的大小之比 > 1``（**严格**大于，等于即不合格）
+    收在黄线之上        收盘 > **黄线**（见 :func:`~mbt.signals.filters.above_yellow`）
     ==================  ====================================================
+
+    .. warning::
+
+        **最后一条与「前一天绿砖」在方向上相冲**，这是需求方的设计，但代价要写明：绿砖那一族
+        条件找的是「一波回调之后的转折向上」，而「收在黄线之上」要求价格已经站回慢线——
+        **回调正深时收盘通常在黄线下方**。故两者同一天同时成立的格不多：合成行情上量到它把
+        候选压到约**四成**（133 → 59 格）。
+
+        （此前这一条曾是「收在前若干根的``最高价``之上」，那个更狠——只剩 **6%**
+        （133 → 8 格），且「红砖比绿砖大」在那里几乎不可能成立：价格贴着 4 日高点走时砖型图
+        会顶在天花板，任何回调都砸出一个很大的绿砖。现已换成黄线门，理由见票。）
 
     排序因子**四项**，前两项各占三分之一、后两项**合成**那第三个三分之一（各六分之一）：
 
@@ -1066,26 +1092,34 @@ def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
 
     .. note::
 
-        **这条规则只读行情**，不需要财务数据目录（``--cw-root``）——它的三个过滤器与四项读数
+        **这条规则只读行情**，不需要财务数据目录（``--cw-root``）——它的四条过滤器与四项读数
         全部由开高低收与成交量算出，没有一项来自财报（故它比 B1 少一个必须配对的路径开关）。
 
     .. note::
 
         砖型图那三层递推平滑的记忆按 ``(5/6)^t`` 衰减，故本规则**自己声明**要看多深的历史
-        （``lookback_bars``，见 ``BRICK_LOOKBACK_BARS`` 里那份实测表）——面板窗口短于它时
-        读数会**静默算在更短的历史上**，那道闸门据此拦住。实测末位读数在 50 根上已与全长
-        逐位相同，声明值取 100 是留了一倍余量。
+        （``lookback_bars``）——面板窗口短于它时读数会**静默算在更短的历史上**，那道闸门据此
+        拦住。实测末位读数在 50 根上已与全长逐位相同，而**黄线最长那条均线要 114 根**，故声明
+        值取**两者之大**（114），详见 ``BRICK_LOOKBACK_BARS`` 里那份账。
 
     参数:
         atr_n: 「上影」那一项折算用的 ATR 窗口。默认 14，与 B1 的 ``top_shadow_atr`` 同口径
-            ——两条规则的这条读数才可比。它是砖型**唯一的读数参数**（三个砖型窗口仍写在公式里；
-            另有 ``top_n`` 与 ``progress``，那两个是通用旋钮，不是这条规则的口径）。
+            ——两条规则的这条读数才可比。
+        yellow_windows: 黄线各条均线的窗口。默认 :data:`DEFAULT_YELLOW_WINDOWS`，与 B1 **同一个
+            常量**——``CONTEXT.md`` 把黄线定义成一个概念，两处取不同窗口就等于造了第二条黄线。
+            给 ``None`` 就**不设这道门**，那是给**对照与测量**用的（「加这道门之前之后差多少」
+            必须能一次跑出来），不是给策略调的旋钮：真要用那条规则，就用它本来的样子。
+
+            注意它与 :data:`BRICK_LOOKBACK_BARS` 的关系：声明深度取的是**这个窗口与递推记忆
+            之大**，故传一组更长的窗口时要一并把声明深度提上去，否则闸门会放行一个太短的
+            面板，而那道门在短面板上会因黄线整段缺失而**静默地筛掉所有标的**。
         top_n: 只取前 N 名。``None``（默认）表示不截断。
-        progress: 进度上报的接收端。砖型图是三次递推平滑，三个过滤器与一个因子都要用它，故
+        progress: 进度上报的接收端。砖型图是三次递推平滑，**三个读它的部件**都要用它，故
             按面板对象**只算一次**并单独记时——否则它的代价会被算进第一个碰到它的那个部件名
-            下（见 :func:`mbt.progress.timed`）。
+            下（见 :func:`mbt.progress.timed`，那里叫它「三个读砖型图的部件」）。
     """
     from mbt.signals import (
+        above_yellow,
         brick_line,
         green_brick,
         momentum,
@@ -1097,7 +1131,7 @@ def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
     readings = _panel_memo(
         brick_line,
         progress,
-        "brick（按面板缓存，三个过滤器与一个因子共用这一次）",
+        "brick（按面板缓存，三个读砖型图的部件共用这一次）",
     )
 
     def previous_green(panel):
@@ -1112,6 +1146,14 @@ def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
     def bigger_than_the_green(panel):
         # 比值缺失（分母为 0 或前一根没有砖）时比较恒为假 —— 正是「不合格」。
         return readings(panel).size_ratio > 1.0
+
+    def above_the_yellow(panel):
+        # 状态而非事件：今天**收在黄线上方**（`above_yellow` 与 B1 用的是同一个口径）。
+        return above_yellow(panel["close"], yellow_windows)
+
+    filters = (previous_green, red_today, bigger_than_the_green)
+    if yellow_windows is not None:
+        filters = (*filters, above_the_yellow)
 
     def size_ratio(panel):
         return readings(panel).size_ratio
@@ -1129,7 +1171,8 @@ def brick_screen(*, atr_n: int = 14, top_n=None, progress=None) -> Screen:
         return -upper_shadow_atr(panel, atr_n)
 
     return Screen(
-        filters=(previous_green, red_today, bigger_than_the_green),
+        # `yellow_windows=None` 时不挂「收在黄线之上」那道门（见 docstring：那是给对照与测量用的）。
+        filters=filters,
         factors=(size_ratio, traded_volume_ratio, smaller_gain, shorter_shadow),
         # (1,1,0.5,0.5) 归一之后 = 1/3、1/3、1/6、1/6：前两条各一份，后两条合成第三份。
         weights=(1.0, 1.0, 0.5, 0.5),

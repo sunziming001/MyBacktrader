@@ -19,6 +19,7 @@ from mbt.signals import (
     above_yellow,
     below_white,
     below_yellow_streak,
+    close_above_high,
     high_above_white,
     j_below,
     ma_cross_up,
@@ -814,3 +815,96 @@ def test_no_contained_run_rejects_a_panel_that_does_not_match_the_anchors(panel)
 
     with pytest.raises(ValueError, match="索引"):
         no_contained_run(short, anchors_with_peak(count=20), days=3)
+
+
+# --- 收盘高于前 n 根的**最高价**（跨字段） --------------------------------------
+#
+# 与 :func:`new_high` 的分水岭：那个比的是**最高收盘价**，这个比的是**最高价**（`high`）。
+# 两者的第一个把门宽度不同——盘中摸到过的高点总是 ≥ 收出来过的高点，故本条更严。
+
+
+def _high_close_panel(panel, highs, closes, symbol="sh600000"):
+    """只给 ``high`` 与 ``close`` 的最小面板；``low`` 由两者取下沿，免得越界。"""
+    return panel(
+        {
+            "high": {symbol: highs},
+            "low": {symbol: [min(h, c) * 0.99 for h, c in zip(highs, closes, strict=True)]},
+            "close": {symbol: closes},
+        }
+    )
+
+
+def test_close_above_high_uses_the_high_not_the_prior_high_close(panel):
+    """基准是**最高价**（`high`），不是最高收盘价——这条把它与 :func:`new_high` 分开。
+
+    六根：前五根的收盘都低于 10.0，但第四根的**最高价**摸到 12.0。第六根收盘 11.0：
+    它高于任何一根的**收盘**（故 ``new_high`` 为真），却低于前五根里的最高价 12.0
+    （故本条为**假**）。两者在同一个格子上给出相反答案，正是要分开的理由。
+    """
+    highs = [10.0, 10.5, 10.2, 12.0, 10.4, 11.0]
+    closes = [9.0, 9.5, 9.2, 9.8, 9.4, 11.0]
+    bars = _high_close_panel(panel, highs, closes)
+    close_frame = pd.DataFrame({"sh600000": closes}, index=bars["close"].index)
+
+    above_high = close_above_high(bars, n=5)["sh600000"]
+    makes_new_high = new_high(close_frame, n=5)["sh600000"]
+
+    assert bool(above_high.iloc[-1]) is False, "11.0 低于前五根的最高价 12.0，本条该为假"
+    assert bool(makes_new_high.iloc[-1]) is True, "11.0 高于前五根的最高收盘 9.8，那条该为真"
+
+
+def test_close_above_high_excludes_the_current_bar(panel):
+    """窗口取**前 n 根**（不含当根）——含了它就是一句恒假的废话。
+
+    ``HHV(H, n)`` 至少等于当根的 ``high``，而 ``close ≤ high`` 恒成立，故「收盘高于含当根的
+    n 日最高价」**永远为假**。含它写错不会报错，只会把每一只都筛掉。
+    """
+    # 当根自己就是最高价（收 20.0、高 20.5）；前两根的最高价只有 10.5。
+    bars = _high_close_panel(panel, [10.0, 10.5, 20.5], [9.5, 10.0, 20.0])
+
+    got = close_above_high(bars, n=2)["sh600000"]
+
+    assert bool(got.iloc[-1]) is True, "20.0 > 前两根的最高价 10.5——若把当根算进窗口就恒假了"
+
+
+def test_close_above_high_is_strict_at_the_prior_high(panel):
+    """**恰好等于**前 n 根的最高价不算「高于」——与 :func:`new_high` 的严格比较一致。"""
+    bars = _high_close_panel(panel, [10.0, 10.0, 10.0, 10.0], [9.0, 9.0, 10.0, 10.0])
+
+    got = close_above_high(bars, n=3)["sh600000"]
+
+    assert bool(got.iloc[3]) is False, "收盘恰好等于前高，不算高于"
+
+
+def test_close_above_high_stays_false_while_the_window_is_not_full(panel):
+    """窗口不满 n 根处取假——不足 n 根就无从谈「n 根内的最高价」。"""
+    bars = _high_close_panel(panel, [10.0, 11.0, 12.0, 13.0], [9.0, 10.0, 11.0, 12.5])
+
+    got = close_above_high(bars, n=3)["sh600000"]
+
+    assert got.tolist()[:3] == [False, False, False], "前 3 根窗口不满"
+    assert bool(got.iloc[3]) is True, "第 4 根：12.5 > 前三根的最高价 12.0"
+
+
+def test_close_above_high_takes_false_where_a_bar_in_the_window_is_missing(panel):
+    """窗口里**有一根**缺失即不足以判定，故不给信号（缺口纪律，与 :func:`new_high` 同）。
+
+    这条挡住「把缺失跳过、用其余几根凑一个最大值」那种写法——它会把停牌期当成「没有更高的
+    价」，从而凭空造出「高于前高」。
+    """
+    nan = float("nan")
+    bars = _high_close_panel(panel, [10.0, nan, nan, 20.0], [9.0, nan, nan, 20.0])
+
+    got = close_above_high(bars, n=3)["sh600000"]
+
+    assert got.tolist() == [False, False, False, False], "窗口里有两根缺失，不该给信号"
+
+
+def test_close_above_high_keeps_the_symbol_frame_shape_and_boolean_dtype(panel):
+    """跨字段的过滤信号**返回布尔标的宽表**（ADR-0009）：消费方向与其余过滤器一致。"""
+    bars = _high_close_panel(panel, [10.0, 11.0, 12.0, 13.0], [9.0, 10.0, 11.0, 12.5])
+
+    got = close_above_high(bars, n=3)
+
+    assert list(got.columns) == ["sh600000"]
+    assert all(dtype.kind == "b" for dtype in got.dtypes)

@@ -168,6 +168,7 @@ PANEL_SIGNALS = [
     ),
     ("drawdown_from_high", lambda panel: signals.drawdown_from_high(panel, n=3)),
     ("upper_shadow_atr", lambda panel: signals.upper_shadow_atr(panel, n=3)),
+    ("close_above_high", lambda panel: signals.close_above_high(panel, n=3)),
     ("brick_line", brick_columns),
     ("volume_pattern", pattern_columns),
 ]

@@ -10,10 +10,12 @@ AC 明令「测试可以直接调库而不靠 shell 命令硬凑」，故这里*
 
 from __future__ import annotations
 
+import inspect
 import io
 import struct
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from conftest import GBBQ_FIXTURE
@@ -1042,15 +1044,42 @@ def brick_wave_series(bars=110, leg=10):
     return [int(round(value * 100)) for value in closes]
 
 
+def brick_shippable_series(seed=2, bars=420):
+    """一段**出厂规则真能选出标的**的行情（单位：分）。
+
+    为什么不能用上面那段整齐的锯齿：那一段在出厂规则下选出 **0** 天，而原因是**结构性的**，
+    换哪道门都躲不掉——砖型买的是**回调之后的转折向上**，而那时价格通常还在慢线**下方**
+    （黄线是四条均线的均值，回调把收盘压到它下面）或者离前高很远。故「砖型判据」与「价格已经在
+    均线／前高之上」这两族条件本身就少同时成立。
+
+    实测（对照）：锯齿 420 根 → 0 天；「涨到前高 → 小回调 → 突破」→ 0 天；而**随机多段**的
+    行情（段长 8~26 根、每段一个随机斜率）在 420 根里有十几个入选日。故这里用后者，并把种子
+    写死——换种子会让入选日变，那正是下面两条用例所依赖的。
+
+    seed=2 的那一段：入选 13 天（首个 2024-06-10 前后），其后的绿砖有 90 多天，故「买进之后
+    总能卖出」。要换种子，先确认这两件事仍成立。
+    """
+    rng = np.random.default_rng(seed)
+    closes = [10.0]
+    while len(closes) < bars:
+        span = int(rng.integers(8, 26))
+        slope = rng.normal(0.0015, 0.012)
+        for _ in range(span):
+            closes.append(closes[-1] * (1 + slope + rng.normal(0, 0.004)))
+    return [int(round(value * 100)) for value in closes[:bars]]
+
+
 def test_the_backtest_command_runs_brick_and_both_buys_and_sells(tmp_path):
     """**端到端走一遍生产那条路**：``mbt backtest --screen brick`` 既买也卖。
 
     这条是本票最要紧的一条：卖出判据读的是 ``brick_signals`` 那个字段，而它必须由 CLI 接上。
     没接的时候策略**只买不卖**——读不到字段一律是缺失，而缺失表现为「不动作」，一声不响。
+
+    刻意走**出厂默认**（不传任何规则参数）：这条路的用意就是「生产那条命令能不能买卖」。
     """
     from mbt.cli import run_backtest_command
 
-    closes = brick_wave_series()
+    closes = brick_shippable_series()
     root, gbbq = make_dataroot(tmp_path, periods=len(closes), closes=closes)
     args = make_args(
         strategy="mbt.strategy:Brick",
@@ -1081,11 +1110,10 @@ def test_the_fixed_amount_switch_decides_how_much_each_position_gets(tmp_path):
     对照刻意取 ``--cash 200 万`` 配 5 个名额——等权口径下每笔会拿到 40 万，故两种口径在这份
     数据上给出的股数**差一倍**，一测就分得出。
     """
-    import math
 
     from mbt.cli import run_backtest_command
 
-    closes = brick_wave_series()
+    closes = brick_shippable_series()
     root, gbbq = make_dataroot(tmp_path, periods=len(closes), closes=closes)
 
     def first_buy(fixed_amount):
@@ -1109,9 +1137,11 @@ def test_the_fixed_amount_switch_decides_how_much_each_position_gets(tmp_path):
     fixed = first_buy(200_000.0)
     bigger = first_buy(400_000.0)
 
-    # 每笔金额翻倍 ⇒ 股数翻倍（向上取整到整数股，故允许一格误差）
-    assert math.isclose(
-        bigger["size"], fixed["size"] * 2, rel_tol=1e-9
+    # 每笔金额翻倍 ⇒ 股数翻倍。允许差 **1 股**：定量是带费用的二分（见
+    # `AStockSizer._affordable`），故预算翻倍时「能买的最大整数股」不一定正好翻倍
+    # （实测 9,665 → 19,331，而非 19,330）。
+    assert (
+        abs(int(bigger["size"]) - 2 * int(fixed["size"])) <= 1
     ), "改 --fixed-amount 没改到每笔股数"
 
 
@@ -1654,12 +1684,15 @@ def test_panel_bars_below_the_deepest_lookback_refuses_to_run(tmp_path):
 
 
 def test_a_rule_that_declares_its_own_depth_is_gated_on_that_depth(tmp_path):
-    """规则**自己声明**的深度说了算：砖型声明 100，故 200 根放行、99 根拒绝（票据 #86）。
+    """规则**自己声明**的深度说了算：砖型声明 114，故 250 根放行、113 根拒绝（票据 #86）。
 
     这条是「闸门按规则的声明比」的直接证据。它必须成对看下一条：不声明的规则仍按 1000 要求，
     否则这里放行的可能是「闸门被整个取消了」而不是「换成按声明比」。
     """
-    root, gbbq = make_dataroot(tmp_path, periods=1200)
+    from mbt.screen import brick_screen
+
+    declared = brick_screen().lookback_bars
+    root, gbbq = make_dataroot(tmp_path, periods=1400)
 
     accepted = screen_args(
         screen="brick",
@@ -1667,7 +1700,7 @@ def test_a_rule_that_declares_its_own_depth_is_gated_on_that_depth(tmp_path):
         gbbq=str(gbbq),
         output_dir=str(tmp_path / "ok"),
         as_of=None,
-        panel_bars=200,
+        panel_bars=2 * declared,
     )
     out, err = capture()
     assert run_screen_command(accepted, stdout=out, stderr=err) == 0, err.getvalue()
@@ -1678,11 +1711,11 @@ def test_a_rule_that_declares_its_own_depth_is_gated_on_that_depth(tmp_path):
         gbbq=str(gbbq),
         output_dir=str(tmp_path / "no"),
         as_of=None,
-        panel_bars=99,
+        panel_bars=declared - 1,
     )
     out, err = capture()
     assert run_screen_command(rejected, stdout=out, stderr=err) == 1
-    assert "100" in err.getvalue(), "报错要写明这条规则要看的那个数"
+    assert str(declared) in err.getvalue(), "报错要写明这条规则要看的那个数"
     assert "这条规则自己声明的" in err.getvalue(), "报错要说清那个数是谁定的"
     assert not (tmp_path / "no").exists(), "拒绝运行就不该留下产物目录"
 
@@ -1709,16 +1742,21 @@ def test_a_rule_that_declares_nothing_still_needs_the_deepest_lookback(tmp_path)
 
 
 def test_the_declared_depth_is_the_one_the_reasoning_produced():
-    """砖型声明的深度是 100，且它比回退值浅一个数量级——那正是本票要省下来的空间。
+    """砖型声明的深度是 **114**，且它比回退值浅一个数量级——那正是本票要省下来的空间。
 
-    数值本身有 ``BRICK_LOOKBACK_BARS`` 里那份实测表作依据（50 根上末位读数已与全长逐位
-    相同，取 100 是留一倍余量）；这条只钉住「声明了、且声明的是那个值」，免得它被顺手改成
+    114 取的是**两者之大**：递推记忆约 100 根（50 根上末位读数已与全长逐位相同，取 100 是留
+    一倍余量），而「收在黄线之上」那道门的最长均线要 114 根——窗口短于它时黄线整段缺失、
+    这道门会**静默地筛掉所有标的**。这条只钉住「声明了、且声明的是那个值」，免得它被顺手改成
     一个没人解释过的数。
     """
     from mbt.screen import BRICK_LOOKBACK_BARS, brick_screen
 
-    assert brick_screen().lookback_bars == BRICK_LOOKBACK_BARS == 100
+    assert brick_screen().lookback_bars == BRICK_LOOKBACK_BARS == 114
     assert brick_screen().lookback_bars < PANEL_WARMUP_BARS
+    # 它必须盖过黄线最长的那条均线，否则那道门会**静默**失效（整段黄线缺失 → 每格都不合格）。
+    # 黄线窗口是闭包里的参数，故从签名上读默认值——那正是要钉的那个数。
+    default_windows = inspect.signature(brick_screen).parameters["yellow_windows"].default
+    assert brick_screen().lookback_bars >= max(default_windows)
 
 
 def test_the_gate_also_fires_when_the_data_is_too_short_to_cut(tmp_path):

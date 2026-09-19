@@ -20,9 +20,11 @@ rem      stop the whole daily job for anyone who never downloaded that data --
 rem      for a file this rule does not read.
 rem    * NO --forward-root block. That is B1's forward-looking PE; brick does
 rem      not read PE at all, so the whole "optional, NOTE only" machinery goes.
-rem    * PANEL_BARS is 200, not 1301. The brick line's memory decays as
-rem      (5/6)^t, so the rule declares it only needs 100 bars (issue #86), and
-rem      the gate now compares against THAT. 200 is 100% headroom on top.
+rem    * PANEL_BARS is 250, not 1301. The brick rule declares its own depth as
+rem      the LARGER of two needs: the (5/6)^t memory of the brick line's
+rem      recursive smoothing (dead by ~50 bars), and the 114-bar longest
+rem      average of the yellow line that its "close above the yellow line"
+rem      gate reads. 250 is ~2.2x that declared 114 (issue #86).
 rem
 rem  Its watchlist FILE has a different name from B1's on purpose. TDX knows a
 rem  block by file name, and this file is fixed-name / overwritten-daily -- so
@@ -78,13 +80,15 @@ rem universe the same as the one those conclusions were drawn from.
 set "EXTRA="
 
 rem How many trading days of history the screen is computed on (see ADR-0014).
-rem 200 = 2 x the 100 bars the brick rule declares (issue #86), which is where
-rem the (5/6)^t memory of its recursive smoothing has died out. Below the
+rem 250 = ~2.2 x the 114 bars the brick rule declares (issue #86). That declared
+rem figure is the LARGER of two needs: the (5/6)^t memory of the brick line's
+rem recursive smoothing (dead by ~50 bars), and the 114-bar longest average of
+rem the yellow line that the "close above the yellow line" gate reads. Below the
 rem declared depth the screen REFUSES to run rather than quietly computing the
 rem readings on a shorter history.
 rem
 rem Set 0 to turn the cut off (that is the library default).
-set "PANEL_BARS=200"
+set "PANEL_BARS=250"
 rem ---------------------------------------------------------------------------
 
 set "ROOT=%~dp0"
